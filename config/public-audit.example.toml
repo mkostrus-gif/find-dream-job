@@ -1,0 +1,7 @@
+# Copy to config/public-audit.local.toml and replace these placeholders.
+# The local file is ignored by Git and lets the audit catch your own identifiers.
+deny_literals = [
+  "Your Full Name",
+  "you@example.com",
+  "/Users/your-account/",
+]

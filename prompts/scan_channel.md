@@ -1,0 +1,38 @@
+# Scan One Hiring Channel
+
+Read [`AGENTS.md`](../AGENTS.md) first. Execute this workflow against the exact
+authorized scope and checkpoint the coverage so another agent can resume
+without repeating the scan.
+
+## Inputs
+
+- company or market:
+- channel:
+- authorized source URL:
+- scope and date range:
+
+## Process
+
+1. Read local settings and all configured private profile/scoring files.
+2. Use the authorized official source. Expand scope only with user permission.
+3. Collect all in-scope roles and preserve source URLs.
+4. Deduplicate against SQLite and within the batch.
+5. Score the real mandate using `prompts/scoring.md`; record hard requirements,
+   evidence, practical risks, and open questions.
+6. Save normalized rows to ignored JSON and ingest them:
+
+   ```bash
+   python3 scripts/jobctl.py ingest-json tmp/channel_scan_YYYY-MM-DD.json \
+     --channel <channel> --source <source>
+   ```
+
+7. Rebuild and verify targeted rows and counts.
+
+Do not create channel-specific Markdown journals. Do not apply merely because a
+scan found a high score; application authorization comes from local settings
+and the current user request.
+
+## Report
+
+State source coverage, roles found, duplicates, score bands, strongest matches,
+hard rejects, needs-input questions, imported row count, and dashboard path.

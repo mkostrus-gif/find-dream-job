@@ -1,0 +1,42 @@
+# Agent: copy this template only through `jobctl.py init`, then edit the ignored
+# local copy. Never place a real candidate's facts or credentials in this file.
+
+[project]
+title = "My Job Search"
+# Language for agent communication and generated output where supported.
+locale = "en"
+
+[paths]
+database = "data/job_search.sqlite"
+dashboard = "dashboard/index.html"
+views = "views"
+reports = "reports"
+archive = "archive"
+
+[profile]
+# All paths are private inputs and resolve against the selected workspace.
+files = ["private/profile.md"]
+preferences_file = "private/preferences.md"
+scoring_file = "private/scoring.md"
+answers_file = "private/questions_and_answers.md"
+
+[automation]
+# Safe default: search, score, recommend, and draft, but do not submit.
+# Set true only after explicit user authorization for external submissions.
+auto_apply = false
+apply_threshold = 85
+# Keep true even when submission is authorized.
+require_visible_confirmation = true
+
+[follow_up]
+# Configuration limits what an agent may record. It does not authenticate a
+# connector or grant permission to send a message.
+limit = 3
+interval_business_days = 5
+primary_channel = "email"
+direct_channels = ["linkedin"]
+max_direct_messages_per_round = 1
+
+[channel_labels]
+email = "Email"
+linkedin = "LinkedIn"

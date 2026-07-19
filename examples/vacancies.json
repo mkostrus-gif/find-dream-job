@@ -1,0 +1,22 @@
+{
+  "vacancies": [
+    {
+      "date": "2026-01-15",
+      "channel": "company_site",
+      "source": "example_import",
+      "source_stream": "official_board",
+      "kind": "screening",
+      "title": "Head of Product Operations",
+      "company": "Example Labs",
+      "url": "https://example.com/careers/product-operations",
+      "status": "NEEDS_REVIEW",
+      "stage": "seen",
+      "score": 78,
+      "role_type": "Product Operations",
+      "reason": "Strong operating scope; team ownership is not yet clear",
+      "risks": "Compensation and location are not listed",
+      "open_questions": "Confirm reporting line, team size, and work format",
+      "next_action": "manual_review"
+    }
+  ]
+}
