@@ -23,6 +23,18 @@ external source -> normalized JSON -> jobctl -> SQLite
                                            `-> static dashboard
 ```
 
+Discovery has a second, fail-closed evidence path:
+
+```text
+configured streams -> generated source URLs -> page/lazy-load checkpoints
+                                             -> coverage validation -> SQLite
+```
+
+Vacancy identity first uses the source external ID. When a full description is
+available, a conservative normalized company/title/description fingerprint is
+also stored as an alias so exact reposts with new IDs converge on one canonical
+vacancy.
+
 External actions follow the reverse evidence flow:
 
 ```text

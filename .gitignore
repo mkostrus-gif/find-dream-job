@@ -43,6 +43,7 @@
 /scripts/*
 !/scripts/jobctl.py
 !/scripts/jobsearch_config.py
+!/scripts/search_coverage.py
 !/scripts/public_audit.py
 !/scripts/qa_dashboard.mjs
 

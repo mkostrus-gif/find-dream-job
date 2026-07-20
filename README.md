@@ -72,7 +72,9 @@ It provides:
 
 - non-destructive private-workspace initialization;
 - normalized JSON ingestion from any authorized source;
-- vacancy deduplication and source/evaluation history;
+- external-ID plus conservative semantic-repost deduplication and
+  source/evaluation history;
+- deterministic HH query plans and fail-closed stream/page/lazy-load coverage;
 - a compact application funnel and structured follow-up rounds;
 - evidence-backed recruiter and hiring-manager contacts;
 - generated `views/*.md`, `reports/*.md`, and `dashboard/index.html`;
@@ -179,6 +181,9 @@ init                      Create local settings, profile templates, and DB
 doctor --strict --json    Validate config, profile paths, and SQLite health
 ingest-json FILE          Import structured vacancy/evaluation rows
 ingest-gmail-json FILE    Import vacancy links extracted from a mail digest
+build-coverage-plan FILE  Generate deterministic HH URLs and manifest skeleton
+check-coverage FILE       Persist and fail-closed validate daily-run coverage
+migrate-schema            Back up and upgrade an existing SQLite workspace
 update-vacancy            Change one vacancy and optionally its application
 upsert-contact            Store an evidence-backed employer contact
 record-contact-search     Record a negative or ambiguous contact search

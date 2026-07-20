@@ -37,6 +37,13 @@ primary_channel = "email"
 direct_channels = ["linkedin"]
 max_direct_messages_per_round = 1
 
+[search]
+# A daily run is not complete until every configured stream has a validated
+# coverage checkpoint. Replace these generic names in the ignored local copy.
+required_streams = ["recommendations", "target_roles"]
+default_period_days = 3
+items_per_page = 100
+
 [channel_labels]
 email = "Email"
 linkedin = "LinkedIn"
