@@ -47,10 +47,31 @@ authorized scope.
 ## Discover and screen
 
 - Use search streams and exclusions from the private preferences/scoring files.
+- Treat `search.required_streams` from local settings as a mandatory manifest,
+  not a suggestion. Before an HH scan, create a private JSON query plan with one
+  entry per required stream and run:
+
+  ```bash
+  python3 scripts/jobctl.py build-coverage-plan tmp/search_plan_YYYY-MM-DD.json \
+    --output tmp/search_coverage_YYYY-MM-DD.json
+  ```
+
+  Use the generated URLs exactly. The builder supplies explicit `OR` groups,
+  `NAME`/`DESCRIPTION` scope, `search_period`, and the configured page size;
+  do not replace them with concatenated synonyms or the obsolete `period`
+  parameter.
 - Query all authorized sources; follow their terms and current access limits.
 - Use SQLite `external_id`, normalized URL, company/title, stage, and history as
   the skip list.
+- Exhaust every results page. When a source lazy-loads cards, keep scrolling
+  until the page contains exactly `min(page_size, remaining found results)`.
+  Record `found`, every zero-based page number, and the raw extracted-card count
+  in the coverage manifest. With `items_on_page=100`, a visible first batch such
+  as 20/100 is not a complete page.
 - Normalize each result into JSON and import it with `ingest-json`.
+- Include the source description or snippet when available. The engine uses a
+  conservative company/title/normalized-description fingerprint to merge exact
+  reposts that received a new external ID.
 - Separate mandate fit from practical risks such as location, compensation,
   language, work authorization, or schedule.
 - Apply explicit calibration caps. A title alone cannot override a hard
@@ -96,6 +117,18 @@ complete vacancy text.
 
 ## Close the run
 
+Finish the coverage manifest with per-stream `status`, page checkpoints,
+`unique`, `known`, and `new` counts plus de-duplicated run totals. Then run:
+
+```bash
+python3 scripts/jobctl.py check-coverage tmp/search_coverage_YYYY-MM-DD.json
+```
+
+This check is fail-closed. A missing or blocked required stream, wrong HH query
+parameters, absent page, partial lazy-load, or inconsistent totals means the run
+is incomplete. Preserve the checkpoint and report the exact blocker; never call
+the daily run complete until the command exits successfully.
+
 Run:
 
 ```bash
@@ -106,6 +139,6 @@ python3 scripts/jobctl.py doctor --strict --json
 
 Report verified counts for discovered, reviewed, needs-input, applied,
 follow-up, interviews, and rejections; list blockers and external actions with
-their evidence state. Include source coverage/checkpoints and the exact
-workspace used so another agent can resume. Zero strong applications is a valid
-result.
+their evidence state. Include the persisted source coverage/checkpoints from
+`reports/search_coverage.md` and the exact workspace used so another agent can
+resume. Zero strong applications is a valid result.

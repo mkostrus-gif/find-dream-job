@@ -24,10 +24,15 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from jobsearch_config import Settings, display_path, load_settings
+from search_coverage import (
+    build_coverage_plan,
+    semantic_vacancy_fingerprint,
+    validate_coverage_manifest,
+)
 
 
 CODE_ROOT = Path(__file__).resolve().parents[1]
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SETTINGS: Settings
 ROOT: Path
@@ -44,6 +49,9 @@ PRIMARY_OUTREACH_CHANNEL: str
 DIRECT_OUTREACH_CHANNELS: tuple[str, ...]
 FOLLOW_UP_CHANNELS: tuple[str, ...]
 MAX_DIRECT_MESSAGES_PER_ROUND: int
+REQUIRED_SEARCH_STREAMS: tuple[str, ...]
+DEFAULT_SEARCH_PERIOD_DAYS: int
+SEARCH_ITEMS_PER_PAGE: int
 CHANNEL_LABELS: dict[str, str]
 
 
@@ -54,7 +62,8 @@ def configure_runtime(config_path: Path | None = None) -> None:
     global ARCHIVE_DIR, PROJECT_TITLE, PROJECT_LOCALE, FOLLOW_UP_LIMIT
     global FOLLOW_UP_INTERVAL_BUSINESS_DAYS, PRIMARY_OUTREACH_CHANNEL
     global DIRECT_OUTREACH_CHANNELS, FOLLOW_UP_CHANNELS
-    global MAX_DIRECT_MESSAGES_PER_ROUND, CHANNEL_LABELS
+    global MAX_DIRECT_MESSAGES_PER_ROUND, REQUIRED_SEARCH_STREAMS
+    global DEFAULT_SEARCH_PERIOD_DAYS, SEARCH_ITEMS_PER_PAGE, CHANNEL_LABELS
 
     SETTINGS = load_settings(CODE_ROOT, config_path)
     ROOT = SETTINGS.workspace_root
@@ -71,6 +80,9 @@ def configure_runtime(config_path: Path | None = None) -> None:
     DIRECT_OUTREACH_CHANNELS = SETTINGS.follow_up.direct_channels
     FOLLOW_UP_CHANNELS = (PRIMARY_OUTREACH_CHANNEL,) + DIRECT_OUTREACH_CHANNELS
     MAX_DIRECT_MESSAGES_PER_ROUND = SETTINGS.follow_up.max_direct_messages_per_round
+    REQUIRED_SEARCH_STREAMS = SETTINGS.search.required_streams
+    DEFAULT_SEARCH_PERIOD_DAYS = SETTINGS.search.default_period_days
+    SEARCH_ITEMS_PER_PAGE = SETTINGS.search.items_per_page
     CHANNEL_LABELS = dict(SETTINGS.channel_labels)
 
 
@@ -107,8 +119,11 @@ EXPECTED_TABLES = {
     "interview_summaries",
     "outreach_messages",
     "source_hits",
+    "search_coverage",
+    "search_runs",
     "stage_events",
     "vacancies",
+    "vacancy_fingerprints",
 }
 
 STAGE_ALIASES = {
@@ -388,15 +403,17 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     if not exists:
         reset_schema(conn)
     else:
+        if version < SCHEMA_VERSION:
+            raise RuntimeError(
+                f"Database schema version {version} requires an explicit migration to "
+                f"{SCHEMA_VERSION}. Run: jobctl migrate-schema"
+            )
         ensure_auxiliary_schema(conn)
         missing = missing_schema_tables(conn)
         if missing:
             raise RuntimeError(
                 "Database is missing required tables: " + ", ".join(missing)
             )
-        if version < SCHEMA_VERSION:
-            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-            conn.commit()
 
 
 def reset_schema(conn: sqlite3.Connection) -> None:
@@ -406,12 +423,15 @@ def reset_schema(conn: sqlite3.Connection) -> None:
         DROP TABLE IF EXISTS followup_rounds;
         DROP TABLE IF EXISTS contact_searches;
         DROP TABLE IF EXISTS employer_contacts;
+        DROP TABLE IF EXISTS search_coverage;
+        DROP TABLE IF EXISTS search_runs;
         DROP TABLE IF EXISTS source_hits;
         DROP TABLE IF EXISTS evaluations;
         DROP TABLE IF EXISTS applications;
         DROP TABLE IF EXISTS stage_events;
         DROP TABLE IF EXISTS interview_summaries;
         DROP TABLE IF EXISTS import_issues;
+        DROP TABLE IF EXISTS vacancy_fingerprints;
         DROP TABLE IF EXISTS vacancies;
 
         CREATE TABLE vacancies (
@@ -453,6 +473,58 @@ def reset_schema(conn: sqlite3.Connection) -> None:
             line_no INTEGER,
             FOREIGN KEY (vacancy_id) REFERENCES vacancies(id)
         );
+
+        CREATE TABLE vacancy_fingerprints (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            vacancy_id INTEGER NOT NULL,
+            fingerprint TEXT NOT NULL UNIQUE,
+            created_at TEXT,
+            FOREIGN KEY (vacancy_id) REFERENCES vacancies(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX idx_vacancy_fingerprints_vacancy
+            ON vacancy_fingerprints(vacancy_id);
+
+        CREATE TABLE search_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_date TEXT NOT NULL,
+            source TEXT NOT NULL,
+            status TEXT NOT NULL,
+            required_streams TEXT NOT NULL,
+            total_unique INTEGER NOT NULL DEFAULT 0,
+            known_count INTEGER NOT NULL DEFAULT 0,
+            new_count INTEGER NOT NULL DEFAULT 0,
+            issue_count INTEGER NOT NULL DEFAULT 0,
+            manifest_file TEXT,
+            created_at TEXT,
+            updated_at TEXT,
+            UNIQUE(run_date, source)
+        );
+
+        CREATE TABLE search_coverage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            search_run_id INTEGER NOT NULL,
+            stream_key TEXT NOT NULL,
+            status TEXT NOT NULL,
+            query_url TEXT,
+            query_text TEXT,
+            search_period_days INTEGER,
+            page_size INTEGER,
+            found INTEGER,
+            pages_expected INTEGER,
+            pages_visited INTEGER,
+            extracted INTEGER,
+            unique_count INTEGER,
+            known_count INTEGER,
+            new_count INTEGER,
+            error TEXT,
+            issues TEXT,
+            FOREIGN KEY (search_run_id) REFERENCES search_runs(id) ON DELETE CASCADE,
+            UNIQUE(search_run_id, stream_key)
+        );
+
+        CREATE INDEX idx_search_coverage_run
+            ON search_coverage(search_run_id, stream_key);
 
         CREATE TABLE evaluations (
             id INTEGER PRIMARY KEY,
@@ -612,6 +684,58 @@ def reset_schema(conn: sqlite3.Connection) -> None:
 def ensure_auxiliary_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(
         """
+        CREATE TABLE IF NOT EXISTS vacancy_fingerprints (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            vacancy_id INTEGER NOT NULL,
+            fingerprint TEXT NOT NULL UNIQUE,
+            created_at TEXT,
+            FOREIGN KEY (vacancy_id) REFERENCES vacancies(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_vacancy_fingerprints_vacancy
+            ON vacancy_fingerprints(vacancy_id);
+
+        CREATE TABLE IF NOT EXISTS search_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_date TEXT NOT NULL,
+            source TEXT NOT NULL,
+            status TEXT NOT NULL,
+            required_streams TEXT NOT NULL,
+            total_unique INTEGER NOT NULL DEFAULT 0,
+            known_count INTEGER NOT NULL DEFAULT 0,
+            new_count INTEGER NOT NULL DEFAULT 0,
+            issue_count INTEGER NOT NULL DEFAULT 0,
+            manifest_file TEXT,
+            created_at TEXT,
+            updated_at TEXT,
+            UNIQUE(run_date, source)
+        );
+
+        CREATE TABLE IF NOT EXISTS search_coverage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            search_run_id INTEGER NOT NULL,
+            stream_key TEXT NOT NULL,
+            status TEXT NOT NULL,
+            query_url TEXT,
+            query_text TEXT,
+            search_period_days INTEGER,
+            page_size INTEGER,
+            found INTEGER,
+            pages_expected INTEGER,
+            pages_visited INTEGER,
+            extracted INTEGER,
+            unique_count INTEGER,
+            known_count INTEGER,
+            new_count INTEGER,
+            error TEXT,
+            issues TEXT,
+            FOREIGN KEY (search_run_id) REFERENCES search_runs(id) ON DELETE CASCADE,
+            UNIQUE(search_run_id, stream_key)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_search_coverage_run
+            ON search_coverage(search_run_id, stream_key);
+
         CREATE TABLE IF NOT EXISTS interview_summaries (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             vacancy_id INTEGER NOT NULL,
@@ -725,6 +849,7 @@ def upsert_vacancy(
     source: str,
     title: str,
     company: str,
+    description: str,
     url: str,
     seen_date: str,
     status: str,
@@ -743,7 +868,18 @@ def upsert_vacancy(
     norm_url = normalize_url(url)
     stage = canonical_stage(stage)
     external_id = vacancy_external_id(channel, norm_url, title, company)
+    semantic_fingerprint = semantic_vacancy_fingerprint(company, title, description)
     row = conn.execute("SELECT * FROM vacancies WHERE external_id = ?", (external_id,)).fetchone()
+    if not row and semantic_fingerprint:
+        row = conn.execute(
+            """
+            SELECT v.*
+            FROM vacancy_fingerprints f
+            JOIN vacancies v ON v.id = f.vacancy_id
+            WHERE f.fingerprint = ?
+            """,
+            (semantic_fingerprint,),
+        ).fetchone()
     now = now_iso()
     if not row:
         cur = conn.execute(
@@ -780,7 +916,17 @@ def upsert_vacancy(
                 now,
             ),
         )
-        return int(cur.lastrowid)
+        vacancy_id = int(cur.lastrowid)
+        if semantic_fingerprint:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO vacancy_fingerprints
+                    (vacancy_id, fingerprint, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (vacancy_id, semantic_fingerprint, now),
+            )
+        return vacancy_id
 
     vacancy_id = int(row["id"])
     first_seen = min(filter(None, [row["first_seen_date"], seen_date]), default=seen_date)
@@ -826,6 +972,15 @@ def upsert_vacancy(
             vacancy_id,
         ),
     )
+    if semantic_fingerprint:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO vacancy_fingerprints
+                (vacancy_id, fingerprint, created_at)
+            VALUES (?, ?, ?)
+            """,
+            (vacancy_id, semantic_fingerprint, now),
+        )
     return vacancy_id
 
 
@@ -1087,6 +1242,13 @@ def ingest_item(
     channel = infer_channel(item, default_channel)
     title = clean_cell(str(item.get("title") or item.get("vacancy_title") or item.get("name") or ""))
     company = clean_cell(str(item.get("company") or item.get("employer") or ""))
+    description = str(
+        item.get("description")
+        or item.get("description_html")
+        or item.get("snippet")
+        or item.get("summary")
+        or ""
+    )
     url = clean_cell(str(item.get("url") or item.get("href") or ""))
     if not title and not url:
         return None
@@ -1124,6 +1286,7 @@ def ingest_item(
         source=source,
         title=title,
         company=company,
+        description=description,
         url=url,
         seen_date=date,
         status=status,
@@ -1732,6 +1895,70 @@ def generate_views(
         ["source_stream", "seen", "signals", "signal_rate"],
         sources_rows,
         "Signal means POTENTIAL, NEEDS_REVIEW, SHORTLISTED, or APPLIED in screening rows.",
+    )
+
+    coverage_rows: list[list[Any]] = []
+    coverage_intro = "No search coverage manifest has been recorded."
+    with connect_db(db_path) as conn:
+        latest_run = conn.execute(
+            """
+            SELECT * FROM search_runs
+            ORDER BY run_date DESC, id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        if latest_run:
+            coverage_intro = (
+                f"Run {latest_run['run_date']} / {latest_run['source']}: "
+                f"{latest_run['status']}; unique={latest_run['total_unique']}, "
+                f"known={latest_run['known_count']}, new={latest_run['new_count']}, "
+                f"issues={latest_run['issue_count']}."
+            )
+            checkpoints = conn.execute(
+                """
+                SELECT stream_key, status, query_url, found, page_size,
+                       pages_visited, pages_expected, extracted, unique_count,
+                       known_count, new_count, error, issues
+                FROM search_coverage
+                WHERE search_run_id = ?
+                ORDER BY id
+                """,
+                (latest_run["id"],),
+            ).fetchall()
+            for item in checkpoints:
+                coverage_rows.append(
+                    [
+                        item["stream_key"],
+                        item["status"],
+                        md_link("query", item["query_url"] or ""),
+                        item["found"],
+                        item["page_size"],
+                        f"{item['pages_visited']}/{item['pages_expected']}",
+                        item["extracted"],
+                        item["unique_count"],
+                        item["known_count"],
+                        item["new_count"],
+                        item["error"] or item["issues"] or "",
+                    ]
+                )
+    write_markdown_table(
+        REPORTS_DIR / "search_coverage.md",
+        "Search Coverage",
+        [
+            "stream",
+            "status",
+            "query",
+            "found",
+            "page_size",
+            "pages",
+            "extracted",
+            "unique",
+            "known",
+            "new",
+            "error/issues",
+        ],
+        coverage_rows,
+        coverage_intro,
     )
 
     issue_rows = []
@@ -2755,6 +2982,162 @@ def print_stats(args: argparse.Namespace) -> None:
     print(json.dumps(snapshot["kpis"], ensure_ascii=False, indent=2))
 
 
+def migrate_schema(args: argparse.Namespace) -> None:
+    """Explicitly migrate an existing database with a recoverable backup."""
+
+    if not args.db.exists():
+        raise FileNotFoundError(f"Database not found: {args.db}")
+    with sqlite3.connect(args.db) as probe:
+        current_version = int(probe.execute("PRAGMA user_version").fetchone()[0])
+    if current_version == SCHEMA_VERSION:
+        print(f"Database schema is already at version {SCHEMA_VERSION}")
+        return
+    if current_version != 1:
+        raise RuntimeError(
+            f"Unsupported migration path: {current_version} -> {SCHEMA_VERSION}"
+        )
+
+    backup_path: Path | None = None
+    if not args.no_backup:
+        stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup_path = args.db.with_name(f"{args.db.name}.bak-schema-v{current_version}-{stamp}")
+        with sqlite3.connect(args.db) as source_conn, sqlite3.connect(backup_path) as backup_conn:
+            source_conn.backup(backup_conn)
+
+    with connect_db(args.db) as conn:
+        ensure_auxiliary_schema(conn)
+        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        conn.commit()
+
+    snapshot = render_outputs(args.db)
+    result = {
+        "from_version": current_version,
+        "to_version": SCHEMA_VERSION,
+        "backup": db_label(backup_path) if backup_path else "",
+        "kpis": snapshot["kpis"],
+    }
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print(f"Migrated database schema {current_version} -> {SCHEMA_VERSION}")
+        if backup_path:
+            print(f"  backup: {db_label(backup_path)}")
+
+
+def build_coverage_plan_command(args: argparse.Namespace) -> None:
+    plan_path = args.file if args.file.is_absolute() else ROOT / args.file
+    payload = json.loads(plan_path.read_text(encoding="utf-8"))
+    plan = build_coverage_plan(
+        payload,
+        REQUIRED_SEARCH_STREAMS,
+        default_period_days=DEFAULT_SEARCH_PERIOD_DAYS,
+        default_items_per_page=SEARCH_ITEMS_PER_PAGE,
+    )
+    rendered = json.dumps(plan, ensure_ascii=False, indent=2) + "\n"
+    if args.output:
+        output_path = args.output if args.output.is_absolute() else ROOT / args.output
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(rendered, encoding="utf-8")
+        print(f"Built coverage plan: {display_path(output_path.resolve(), ROOT)}")
+    else:
+        print(rendered, end="")
+
+
+def persist_coverage_result(
+    conn: sqlite3.Connection,
+    result: dict[str, Any],
+    manifest_file: str,
+) -> int:
+    now = now_iso()
+    status = "completed" if result["ok"] else "incomplete"
+    totals = result["totals"]
+    conn.execute(
+        """
+        INSERT INTO search_runs (
+            run_date, source, status, required_streams, total_unique,
+            known_count, new_count, issue_count, manifest_file, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(run_date, source) DO UPDATE SET
+            status = excluded.status,
+            required_streams = excluded.required_streams,
+            total_unique = excluded.total_unique,
+            known_count = excluded.known_count,
+            new_count = excluded.new_count,
+            issue_count = excluded.issue_count,
+            manifest_file = excluded.manifest_file,
+            updated_at = excluded.updated_at
+        """,
+        (
+            result["run_date"],
+            result["source"],
+            status,
+            json.dumps(result["required_streams"], ensure_ascii=False),
+            totals["unique"],
+            totals["known"],
+            totals["new"],
+            len(result["issues"]),
+            manifest_file,
+            now,
+            now,
+        ),
+    )
+    run_id = int(
+        conn.execute(
+            "SELECT id FROM search_runs WHERE run_date = ? AND source = ?",
+            (result["run_date"], result["source"]),
+        ).fetchone()[0]
+    )
+    conn.execute("DELETE FROM search_coverage WHERE search_run_id = ?", (run_id,))
+    for stream in result["streams"]:
+        conn.execute(
+            """
+            INSERT INTO search_coverage (
+                search_run_id, stream_key, status, query_url, query_text,
+                search_period_days, page_size, found, pages_expected,
+                pages_visited, extracted, unique_count, known_count, new_count,
+                error, issues
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                stream["key"],
+                stream["status"],
+                stream["query_url"],
+                stream["query_text"],
+                stream["search_period_days"],
+                stream["page_size"],
+                stream["found"],
+                stream["pages_expected"],
+                stream["pages_visited"],
+                stream["extracted"],
+                stream["unique"],
+                stream["known"],
+                stream["new"],
+                stream["error"],
+                json.dumps(stream["issues"], ensure_ascii=False),
+            ),
+        )
+    return run_id
+
+
+def check_coverage(args: argparse.Namespace) -> None:
+    manifest_path = args.file if args.file.is_absolute() else ROOT / args.file
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    result = validate_coverage_manifest(payload, REQUIRED_SEARCH_STREAMS)
+    if result.get("run_date") and result.get("source"):
+        with connect_db(args.db) as conn:
+            ensure_schema(conn)
+            run_id = persist_coverage_result(conn, result, origin_for(manifest_path))
+            conn.commit()
+        result["search_run_id"] = run_id
+        render_outputs(args.db)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    if not result["ok"]:
+        raise SystemExit(1)
+
+
 def migrate_stage_column(conn: sqlite3.Connection, table: str, column: str) -> int:
     changed = 0
     rows = conn.execute(f"SELECT rowid AS rid, {column} AS stage FROM {table}").fetchall()
@@ -2948,6 +3331,7 @@ def update_vacancy(args: argparse.Namespace) -> None:
                 source=args.source or "manual_update",
                 title=args.title or "",
                 company=args.company or "",
+                description="",
                 url=norm_url,
                 seen_date=date,
                 status=status,
@@ -3720,6 +4104,11 @@ def doctor(args: argparse.Namespace) -> None:
         if SETTINGS.automation.require_visible_confirmation
         else "visible confirmation disabled",
     )
+    add(
+        "search_streams",
+        bool(REQUIRED_SEARCH_STREAMS),
+        ", ".join(REQUIRED_SEARCH_STREAMS) or "none configured",
+    )
 
     failed = [check for check in checks if check["required"] and not check["ok"]]
     result = {
@@ -3810,6 +4199,31 @@ def build_parser() -> argparse.ArgumentParser:
     migrate_parser.add_argument("--db", type=Path, default=DB_PATH)
     migrate_parser.add_argument("--no-backup", action="store_true", help="Do not create a .bak copy before migration")
     migrate_parser.set_defaults(func=migrate_stages)
+
+    schema_parser = sub.add_parser(
+        "migrate-schema",
+        help="Back up and migrate an existing SQLite database to the current schema",
+    )
+    schema_parser.add_argument("--db", type=Path, default=DB_PATH)
+    schema_parser.add_argument("--no-backup", action="store_true")
+    schema_parser.add_argument("--json", action="store_true")
+    schema_parser.set_defaults(func=migrate_schema)
+
+    plan_parser = sub.add_parser(
+        "build-coverage-plan",
+        help="Build deterministic HH URLs and a coverage-manifest skeleton",
+    )
+    plan_parser.add_argument("file", type=Path, help="JSON plan with stream query specifications")
+    plan_parser.add_argument("--output", type=Path, default=None)
+    plan_parser.set_defaults(func=build_coverage_plan_command)
+
+    coverage_parser = sub.add_parser(
+        "check-coverage",
+        help="Persist and fail-closed validate a completed search coverage manifest",
+    )
+    coverage_parser.add_argument("file", type=Path, help="Completed coverage manifest JSON")
+    coverage_parser.add_argument("--db", type=Path, default=DB_PATH)
+    coverage_parser.set_defaults(func=check_coverage)
 
     watch_parser = sub.add_parser("watch", help="Regenerate views automatically when the SQLite database changes")
     watch_parser.add_argument("--db", type=Path, default=DB_PATH)

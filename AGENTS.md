@@ -142,6 +142,9 @@ Bootstrap is complete only when:
 A search run is complete only when:
 
 - inbound replies and existing state were reconciled before new outreach;
+- every locally configured search stream has a successful persisted coverage
+  checkpoint; missing streams, incomplete pagination, and partial lazy-loads
+  are fail-closed conditions;
 - discovered vacancies were deduplicated and written through `jobctl.py`;
 - scores cite verified evidence and hard constraints;
 - external actions distinguish drafted, attempted, visibly confirmed, and

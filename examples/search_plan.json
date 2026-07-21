@@ -1,0 +1,36 @@
+{
+  "run_date": "2026-01-15",
+  "source": "hh",
+  "required_streams": [
+    "recommendations",
+    "target_roles"
+  ],
+  "streams": [
+    {
+      "key": "recommendations",
+      "query": {
+        "any_terms": [
+          "general manager",
+          "business unit lead"
+        ],
+        "fields": [
+          "NAME",
+          "DESCRIPTION"
+        ]
+      }
+    },
+    {
+      "key": "target_roles",
+      "query": {
+        "any_terms": [
+          "head of product",
+          "product director"
+        ],
+        "fields": [
+          "NAME",
+          "DESCRIPTION"
+        ]
+      }
+    }
+  ]
+}

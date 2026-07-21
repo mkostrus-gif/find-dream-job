@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Added fail-closed daily search coverage with configured required streams,
+  deterministic HH OR/search-period query generation, page and lazy-load
+  checkpoints, SQLite history, and a generated coverage report.
+- Added conservative company/title/description fingerprints for exact vacancy
+  reposts with new external IDs and an explicit backed-up schema-v2 migration.
 - Made repository use agent-first with a canonical `AGENTS.md`, an executable
   first-time onboarding prompt, an operational runbook, copy-paste delegation
   prompts, completion contracts, and documentation consistency tests.

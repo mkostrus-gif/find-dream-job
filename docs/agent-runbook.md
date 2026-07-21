@@ -109,12 +109,13 @@ Use [`prompts/daily_run.md`](../prompts/daily_run.md) as the canonical order:
 1. load settings and private evidence;
 2. validate and rebuild existing state;
 3. reconcile inbound replies and external statuses;
-4. search authorized sources and deduplicate against SQLite;
+4. build the configured source-stream coverage plan, search every generated
+   query through its final fully loaded page, and deduplicate against SQLite;
 5. normalize results into ignored JSON and ingest them;
 6. score the real mandate, hard constraints, and open questions;
 7. prepare or perform only the external actions allowed by current policy;
 8. verify visible success before recording sent state;
-9. rebuild, validate, and report.
+9. run fail-closed `check-coverage`, rebuild, validate, and report.
 
 Use [`prompts/scan_channel.md`](../prompts/scan_channel.md) when the task is
 limited to one company or source. Use
@@ -135,6 +136,25 @@ python3 scripts/jobctl.py ingest-json tmp/scan_YYYY-MM-DD.json \
 Preserve source URL, source identity, discovery date, title, company, mandate
 evidence, score, risks, open questions, and next action. Do not manufacture a
 URL or employer identity to make a row importable.
+
+For HH, build queries from a private plan instead of hand-assembling URLs:
+
+```bash
+python3 scripts/jobctl.py build-coverage-plan tmp/search_plan_YYYY-MM-DD.json \
+  --output tmp/search_coverage_YYYY-MM-DD.json
+```
+
+After visiting all generated pages, record the raw card count for every page.
+With `items_per_page = 100`, an initial DOM count near 20 is an intermediate
+lazy-load state. Scroll until the page reaches 100 or the exact final-page
+remainder. Fill run-level de-duplicated totals and run:
+
+```bash
+python3 scripts/jobctl.py check-coverage tmp/search_coverage_YYYY-MM-DD.json
+```
+
+Do not claim a complete run after a non-zero exit. The SQLite checkpoint and
+`reports/search_coverage.md` preserve the resumable incomplete state.
 
 ## 7. Handle blockers
 
