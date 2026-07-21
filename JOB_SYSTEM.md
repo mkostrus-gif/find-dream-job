@@ -45,6 +45,10 @@ Use a disposable `JOB_SEARCH_HOME` for smoke tests.
 
 - `vacancies` — canonical vacancy and latest state;
 - `source_hits` — discovery events by source and stream;
+- `search_runs` / `search_coverage` — fail-closed daily-run manifests and
+  per-stream page/query checkpoints;
+- `vacancy_fingerprints` — conservative semantic repost aliases based on
+  company, title, and normalized description;
 - `evaluations` — screening/review decisions;
 - `applications` — application-level history;
 - `stage_events` — append-only stage/status evidence;
@@ -91,6 +95,42 @@ Accepted top-level JSON forms are an array or an object containing
 
 The command deduplicates, writes the appropriate history rows, and regenerates
 the read models.
+
+When a source provides a description or snippet, include it in the JSON row.
+The engine stores only its semantic fingerprint and can merge an exact repost
+even when the source assigns a new external ID.
+
+## Search coverage contract
+
+Prepare a private plan whose stream keys match local
+`search.required_streams`, then let the engine generate deterministic HH URLs:
+
+```bash
+python3 scripts/jobctl.py build-coverage-plan tmp/search_plan_2026-01-15.json \
+  --output tmp/search_coverage_2026-01-15.json
+```
+
+The generated manifest uses explicit OR groups, `NAME`/`DESCRIPTION`,
+`search_period`, and the configured page size. After the scan, fill every page
+checkpoint and de-duplicated total, then persist and validate it:
+
+```bash
+python3 scripts/jobctl.py check-coverage tmp/search_coverage_2026-01-15.json
+```
+
+The command exits non-zero for an omitted/blocked stream, a modified or stale
+query URL, incomplete pagination, a partially lazy-loaded page, or inconsistent
+known/new totals. Its durable read model is `reports/search_coverage.md`.
+
+## Schema upgrades
+
+Schema upgrades are explicit and create a timestamped backup by default:
+
+```bash
+python3 scripts/jobctl.py migrate-schema --json
+```
+
+Do not use `--no-backup` on a live candidate database.
 
 ## Exact state changes
 

@@ -76,6 +76,13 @@ class FollowUpSettings:
 
 
 @dataclass(frozen=True)
+class SearchSettings:
+    required_streams: tuple[str, ...]
+    default_period_days: int
+    items_per_page: int
+
+
+@dataclass(frozen=True)
 class Settings:
     code_root: Path
     workspace_root: Path
@@ -86,6 +93,7 @@ class Settings:
     profile: ProfileSettings
     automation: AutomationSettings
     follow_up: FollowUpSettings
+    search: SearchSettings
     channel_labels: dict[str, str]
 
 
@@ -125,6 +133,19 @@ def _strings(table: dict[str, Any], key: str, default: list[str]) -> tuple[str, 
     if not normalized:
         raise ValueError(f"{key} must contain at least one value")
     if len(normalized) != len(set(normalized)):
+        raise ValueError(f"{key} must not contain duplicates")
+    return tuple(normalized)
+
+
+def _stream_names(table: dict[str, Any], key: str, default: list[str]) -> tuple[str, ...]:
+    value = table.get(key, default)
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError(f"{key} must be an array of strings")
+    normalized = [item.strip() for item in value if item.strip()]
+    if not normalized:
+        raise ValueError(f"{key} must contain at least one value")
+    folded = [item.casefold() for item in normalized]
+    if len(folded) != len(set(folded)):
         raise ValueError(f"{key} must not contain duplicates")
     return tuple(normalized)
 
@@ -185,6 +206,7 @@ def load_settings(code_root: Path, config_path: Path | None = None) -> Settings:
     profile = _table(data, "profile")
     automation = _table(data, "automation")
     follow_up = _table(data, "follow_up")
+    search = _table(data, "search")
     labels = _table(data, "channel_labels")
 
     direct_channels = _strings(
@@ -249,11 +271,24 @@ def load_settings(code_root: Path, config_path: Path | None = None) -> Settings:
                 follow_up, "max_direct_messages_per_round", 1, 0
             ),
         ),
+        search=SearchSettings(
+            required_streams=_stream_names(
+                search,
+                "required_streams",
+                ["recommendations", "target_roles"],
+            ),
+            default_period_days=_integer(
+                search, "default_period_days", 3, 1
+            ),
+            items_per_page=_integer(search, "items_per_page", 100, 1),
+        ),
         channel_labels=channel_labels,
     )
 
     if settings.automation.apply_threshold > 100:
         raise ValueError("automation.apply_threshold must be between 0 and 100")
+    if settings.search.items_per_page > 100:
+        raise ValueError("search.items_per_page must be between 1 and 100")
     return settings
 
 

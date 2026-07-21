@@ -54,6 +54,22 @@ Only configured direct channels are accepted by contact and follow-up commands.
 Changing the list does not install or authenticate a messaging connector. It
 only changes validation and recording policy.
 
+## Search coverage
+
+`[search]` makes daily discovery completeness machine-checkable:
+
+- `required_streams` is the local, candidate-specific list that every daily run
+  must cover;
+- `default_period_days` becomes HH's `search_period` value;
+- `items_per_page` controls both generated HH URLs and lazy-load validation and
+  cannot exceed 100.
+
+Keep role names and candidate-specific stream definitions in the ignored local
+configuration and preferences. The public template contains generic examples.
+`build-coverage-plan` refuses plans that omit a configured stream, while
+`check-coverage` exits non-zero when a stream, page, or expected card count is
+missing.
+
 An agent should configure only channels both chosen by the candidate and
 available in the intended workflow. Configuration is policy, not proof of a
 working connector or permission to send.

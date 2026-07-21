@@ -84,6 +84,26 @@ class AgentDocumentationTests(unittest.TestCase):
             with self.subTest(path=relative):
                 self.assertIn("AGENTS.md", self.read(relative))
 
+    def test_daily_run_requires_fail_closed_coverage(self) -> None:
+        daily = self.read("prompts/daily_run.md")
+        required_text = (
+            "search.required_streams",
+            "build-coverage-plan",
+            "check-coverage",
+            "search_period",
+            "items_on_page=100",
+            "min(page_size, remaining found results)",
+            "fail-closed",
+            "reports/search_coverage.md",
+        )
+        for text in required_text:
+            with self.subTest(text=text):
+                self.assertIn(text, daily)
+
+        settings = self.read("config/settings.example.toml")
+        self.assertIn("[search]", settings)
+        self.assertIn("required_streams", settings)
+
     def test_relative_markdown_links_resolve(self) -> None:
         candidates = self.public_candidates()
         markdown_files = [ROOT / path for path in candidates if path.endswith(".md")]
