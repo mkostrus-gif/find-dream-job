@@ -72,8 +72,8 @@ It provides:
 
 - non-destructive private-workspace initialization;
 - normalized JSON ingestion from any authorized source;
-- external-ID plus conservative semantic-repost deduplication and
-  source/evaluation history;
+- canonical external-ID plus persisted repost aliases, conservative
+  semantic-repost deduplication, and source/evaluation history;
 - deterministic HH query plans and fail-closed stream/page/lazy-load coverage;
 - a compact application funnel and structured follow-up rounds;
 - evidence-backed recruiter and hiring-manager contacts;

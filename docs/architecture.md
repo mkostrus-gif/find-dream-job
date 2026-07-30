@@ -30,10 +30,19 @@ configured streams -> generated source URLs -> page/lazy-load checkpoints
                                              -> coverage validation -> SQLite
 ```
 
-Vacancy identity first uses the source external ID. When a full description is
-available, a conservative normalized company/title/description fingerprint is
-also stored as an alias so exact reposts with new IDs converge on one canonical
-vacancy.
+Vacancy identity first uses the canonical source external ID, then a persisted
+external-ID alias in the same channel. When a full description is available, a
+conservative normalized company/title/description fingerprint is checked next
+so exact reposts with new IDs converge on one canonical vacancy. Creation is
+the final fallback.
+
+Every successful resolution writes the incoming `(channel, external_id)` to
+`vacancy_external_aliases`. The table maps each observed source identity to one
+canonical `vacancies.id`, stores the URL attached to that identity, and tracks
+first/last observation dates. The canonical `vacancies.external_id` and
+`vacancies.url` remain paired and stable across semantic reposts; the newest
+alias by `last_seen_date` represents the latest observed repost URL. This
+preserves both semantic deduplication and complete scan-ID reconciliation.
 
 External actions follow the reverse evidence flow:
 
@@ -70,9 +79,12 @@ workspaces.
 
 ## SQLite lifecycle
 
-The schema has an explicit `PRAGMA user_version`. The CLI refuses databases
-newer than the supported schema. Connections enable foreign-key enforcement and
-a bounded busy timeout. Generated output is rebuilt from a consistent snapshot.
+The schema has an explicit `PRAGMA user_version`; schema v3 adds external-ID
+aliases. The CLI refuses databases newer than the supported schema. Connections
+enable foreign-key enforcement and a bounded busy timeout. Generated output is
+rebuilt from a consistent snapshot. Explicit migrations create a recoverable
+backup by default, create tables and indexes idempotently, and backfill only
+known canonical identities.
 
 The current code intentionally remains a single control-plane module plus a
 small configuration module. This keeps deployment dependency-free. If the CLI
