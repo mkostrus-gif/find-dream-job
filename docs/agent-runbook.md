@@ -102,6 +102,26 @@ JOB_SEARCH_HOME="$SMOKE_WORKSPACE" python3 scripts/jobctl.py doctor --strict --j
 The temporary database proves mechanics, not live source access or candidate
 fit. Do not report its vacancies as search results.
 
+### Upgrade an existing private workspace
+
+Run schema upgrades separately from development and keep the default backup:
+
+```bash
+JOB_SEARCH_HOME="/path/to/private-workspace" \
+  python3 scripts/jobctl.py migrate-schema --json
+JOB_SEARCH_HOME="/path/to/private-workspace" \
+  python3 scripts/jobctl.py doctor --strict --json
+JOB_SEARCH_HOME="/path/to/private-workspace" \
+  python3 scripts/jobctl.py rebuild --json
+JOB_SEARCH_HOME="/path/to/private-workspace" \
+  python3 scripts/jobctl.py stats
+```
+
+Never use `--no-backup` on a live database. Schema v3 backfills only the
+canonical external ID already known for each vacancy. Historical repost IDs
+must come from re-ingesting retained scan artifacts; do not reconstruct or
+guess them.
+
 ## 5. Execute one search cycle
 
 Use [`prompts/daily_run.md`](../prompts/daily_run.md) as the canonical order:
@@ -136,6 +156,12 @@ python3 scripts/jobctl.py ingest-json tmp/scan_YYYY-MM-DD.json \
 Preserve source URL, source identity, discovery date, title, company, mandate
 evidence, score, risks, open questions, and next action. Do not manufacture a
 URL or employer identity to make a row importable.
+
+After ingest, reconcile scan identities by `(channel, external_id)` against
+both `vacancies` and `vacancy_external_aliases`. A semantic repost is healthy
+when every scan identity resolves but several identities map to one canonical
+vacancy. Comparing only with `vacancies.external_id` produces false missing-ID
+reports.
 
 For HH, build queries from a private plan instead of hand-assembling URLs:
 

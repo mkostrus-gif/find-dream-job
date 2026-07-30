@@ -253,6 +253,10 @@ class SearchCoverageIntegrationTests(unittest.TestCase):
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM vacancies").fetchone()[0], 3)
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM source_hits").fetchone()[0], 3)
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM vacancy_fingerprints").fetchone()[0], 1)
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM vacancy_external_aliases").fetchone()[0],
+                4,
+            )
         report = (self.workspace / "reports" / "search_coverage.md").read_text(encoding="utf-8")
         self.assertIn("Run 2026-01-15 / hh: completed", report)
 
@@ -263,13 +267,14 @@ class SearchCoverageIntegrationTests(unittest.TestCase):
             conn.execute("DROP TABLE search_coverage")
             conn.execute("DROP TABLE search_runs")
             conn.execute("DROP TABLE vacancy_fingerprints")
+            conn.execute("DROP TABLE vacancy_external_aliases")
             conn.execute("PRAGMA user_version = 1")
             conn.commit()
         blocked = self.run_cli("doctor", "--strict", "--json", check=False)
         self.assertNotEqual(blocked.returncode, 0)
         migrated = json.loads(self.run_cli("migrate-schema", "--json").stdout)
         self.assertEqual(migrated["from_version"], 1)
-        self.assertEqual(migrated["to_version"], 2)
+        self.assertEqual(migrated["to_version"], 3)
         self.assertTrue(migrated["backup"])
         self.assertTrue(list(database.parent.glob("job_search.sqlite.bak-schema-v1-*")))
         doctor = json.loads(self.run_cli("doctor", "--strict", "--json").stdout)
