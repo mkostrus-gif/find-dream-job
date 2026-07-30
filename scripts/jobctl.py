@@ -32,7 +32,7 @@ from search_coverage import (
 
 
 CODE_ROOT = Path(__file__).resolve().parents[1]
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SETTINGS: Settings
 ROOT: Path
@@ -123,7 +123,12 @@ EXPECTED_TABLES = {
     "search_runs",
     "stage_events",
     "vacancies",
+    "vacancy_external_aliases",
     "vacancy_fingerprints",
+}
+EXPECTED_INDEXES = {
+    "idx_vacancy_external_aliases_external_id",
+    "idx_vacancy_external_aliases_vacancy",
 }
 
 STAGE_ALIASES = {
@@ -390,6 +395,78 @@ def missing_schema_tables(conn: sqlite3.Connection) -> list[str]:
     return sorted(EXPECTED_TABLES - present)
 
 
+def missing_schema_indexes(conn: sqlite3.Connection) -> list[str]:
+    rows = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'index'"
+    ).fetchall()
+    present = {str(row[0]) for row in rows}
+    return sorted(EXPECTED_INDEXES - present)
+
+
+def vacancy_external_alias_schema_issues(conn: sqlite3.Connection) -> list[str]:
+    table_exists = conn.execute(
+        """
+        SELECT 1
+        FROM sqlite_master
+        WHERE type = 'table' AND name = 'vacancy_external_aliases'
+        """
+    ).fetchone()
+    if not table_exists:
+        return ["table missing"]
+
+    required_columns = {
+        "id",
+        "vacancy_id",
+        "channel",
+        "external_id",
+        "url",
+        "first_seen_date",
+        "last_seen_date",
+        "created_at",
+        "updated_at",
+    }
+    columns = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(vacancy_external_aliases)").fetchall()
+    }
+    issues: list[str] = []
+    missing_columns = required_columns - columns
+    if missing_columns:
+        issues.append(f"missing columns: {','.join(sorted(missing_columns))}")
+
+    unique_channel_external_id = False
+    alias_indexes = conn.execute(
+        "PRAGMA index_list(vacancy_external_aliases)"
+    ).fetchall()
+    for index_row in alias_indexes:
+        if not int(index_row[2]):
+            continue
+        index_name = str(index_row[1]).replace("'", "''")
+        indexed_columns = [
+            str(row[2])
+            for row in conn.execute(f"PRAGMA index_info('{index_name}')").fetchall()
+        ]
+        if indexed_columns == ["channel", "external_id"]:
+            unique_channel_external_id = True
+            break
+    if not unique_channel_external_id:
+        issues.append("missing UNIQUE(channel, external_id)")
+
+    foreign_keys = conn.execute(
+        "PRAGMA foreign_key_list(vacancy_external_aliases)"
+    ).fetchall()
+    cascade_fk = any(
+        str(row[2]) == "vacancies"
+        and str(row[3]) == "vacancy_id"
+        and str(row[4]) == "id"
+        and str(row[6]).upper() == "CASCADE"
+        for row in foreign_keys
+    )
+    if not cascade_fk:
+        issues.append("missing vacancy_id -> vacancies(id) ON DELETE CASCADE")
+    return issues
+
+
 def ensure_schema(conn: sqlite3.Connection) -> None:
     version = int(conn.execute("PRAGMA user_version").fetchone()[0])
     if version > SCHEMA_VERSION:
@@ -414,6 +491,17 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             raise RuntimeError(
                 "Database is missing required tables: " + ", ".join(missing)
             )
+        missing_indexes = missing_schema_indexes(conn)
+        if missing_indexes:
+            raise RuntimeError(
+                "Database is missing required indexes: " + ", ".join(missing_indexes)
+            )
+        alias_schema_issues = vacancy_external_alias_schema_issues(conn)
+        if alias_schema_issues:
+            raise RuntimeError(
+                "Database vacancy external alias schema is invalid: "
+                + "; ".join(alias_schema_issues)
+            )
 
 
 def reset_schema(conn: sqlite3.Connection) -> None:
@@ -431,6 +519,7 @@ def reset_schema(conn: sqlite3.Connection) -> None:
         DROP TABLE IF EXISTS stage_events;
         DROP TABLE IF EXISTS interview_summaries;
         DROP TABLE IF EXISTS import_issues;
+        DROP TABLE IF EXISTS vacancy_external_aliases;
         DROP TABLE IF EXISTS vacancy_fingerprints;
         DROP TABLE IF EXISTS vacancies;
 
@@ -484,6 +573,26 @@ def reset_schema(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX idx_vacancy_fingerprints_vacancy
             ON vacancy_fingerprints(vacancy_id);
+
+        CREATE TABLE vacancy_external_aliases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            vacancy_id INTEGER NOT NULL,
+            channel TEXT NOT NULL,
+            external_id TEXT NOT NULL,
+            url TEXT,
+            first_seen_date TEXT,
+            last_seen_date TEXT,
+            created_at TEXT,
+            updated_at TEXT,
+            FOREIGN KEY (vacancy_id) REFERENCES vacancies(id) ON DELETE CASCADE,
+            UNIQUE(channel, external_id)
+        );
+
+        CREATE INDEX idx_vacancy_external_aliases_vacancy
+            ON vacancy_external_aliases(vacancy_id);
+
+        CREATE INDEX idx_vacancy_external_aliases_external_id
+            ON vacancy_external_aliases(external_id);
 
         CREATE TABLE search_runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -695,6 +804,26 @@ def ensure_auxiliary_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_vacancy_fingerprints_vacancy
             ON vacancy_fingerprints(vacancy_id);
 
+        CREATE TABLE IF NOT EXISTS vacancy_external_aliases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            vacancy_id INTEGER NOT NULL,
+            channel TEXT NOT NULL,
+            external_id TEXT NOT NULL,
+            url TEXT,
+            first_seen_date TEXT,
+            last_seen_date TEXT,
+            created_at TEXT,
+            updated_at TEXT,
+            FOREIGN KEY (vacancy_id) REFERENCES vacancies(id) ON DELETE CASCADE,
+            UNIQUE(channel, external_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_vacancy_external_aliases_vacancy
+            ON vacancy_external_aliases(vacancy_id);
+
+        CREATE INDEX IF NOT EXISTS idx_vacancy_external_aliases_external_id
+            ON vacancy_external_aliases(external_id);
+
         CREATE TABLE IF NOT EXISTS search_runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             run_date TEXT NOT NULL,
@@ -842,6 +971,135 @@ def merge_origin(existing: str | None, new_origin: str) -> str:
     return ",".join(origins)
 
 
+def store_vacancy_external_alias(
+    conn: sqlite3.Connection,
+    *,
+    vacancy_id: int,
+    channel: str,
+    external_id: str,
+    url: str,
+    seen_date: str,
+    timestamp: str | None = None,
+) -> bool:
+    """Persist one source identity without changing the canonical vacancy identity."""
+
+    channel = clean_cell(channel)
+    external_id = clean_cell(external_id)
+    if not channel or not external_id:
+        raise ValueError("Vacancy external aliases require channel and external_id")
+    norm_url = normalize_url(url)
+    timestamp = timestamp or now_iso()
+    conflicting = conn.execute(
+        """
+        SELECT DISTINCT vacancy_id
+        FROM vacancy_external_aliases
+        WHERE external_id = ? AND vacancy_id != ?
+        """,
+        (external_id, vacancy_id),
+    ).fetchone()
+    if conflicting:
+        raise RuntimeError(
+            f"External ID {external_id!r} is already assigned to vacancy "
+            f"{conflicting['vacancy_id']} in another channel"
+        )
+    existing = conn.execute(
+        """
+        SELECT *
+        FROM vacancy_external_aliases
+        WHERE channel = ? AND external_id = ?
+        """,
+        (channel, external_id),
+    ).fetchone()
+    if existing:
+        if int(existing["vacancy_id"]) != vacancy_id:
+            raise RuntimeError(
+                f"External ID {external_id!r} in channel {channel!r} is already "
+                f"assigned to vacancy {existing['vacancy_id']}"
+            )
+        observed_dates = [
+            value
+            for value in (
+                existing["first_seen_date"],
+                existing["last_seen_date"],
+                seen_date,
+            )
+            if value
+        ]
+        first_seen_date = min(observed_dates) if observed_dates else ""
+        last_seen_date = max(observed_dates) if observed_dates else ""
+        conn.execute(
+            """
+            UPDATE vacancy_external_aliases
+            SET url = ?, first_seen_date = ?, last_seen_date = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                norm_url or existing["url"] or "",
+                first_seen_date,
+                last_seen_date,
+                timestamp,
+                int(existing["id"]),
+            ),
+        )
+        return False
+
+    conn.execute(
+        """
+        INSERT INTO vacancy_external_aliases (
+            vacancy_id, channel, external_id, url, first_seen_date,
+            last_seen_date, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            vacancy_id,
+            channel,
+            external_id,
+            norm_url,
+            seen_date,
+            seen_date,
+            timestamp,
+            timestamp,
+        ),
+    )
+    return True
+
+
+def backfill_canonical_external_aliases(conn: sqlite3.Connection) -> int:
+    inserted = 0
+    for row in conn.execute(
+        """
+        SELECT id, channel, external_id, url, first_seen_date, last_seen_date, updated_at
+        FROM vacancies
+        ORDER BY id
+        """
+    ).fetchall():
+        first_seen_date = row["first_seen_date"] or row["last_seen_date"] or ""
+        last_seen_date = row["last_seen_date"] or first_seen_date
+        was_inserted = store_vacancy_external_alias(
+            conn,
+            vacancy_id=int(row["id"]),
+            channel=row["channel"],
+            external_id=row["external_id"],
+            url=row["url"] or "",
+            seen_date=first_seen_date,
+            timestamp=row["updated_at"] or now_iso(),
+        )
+        if last_seen_date != first_seen_date:
+            store_vacancy_external_alias(
+                conn,
+                vacancy_id=int(row["id"]),
+                channel=row["channel"],
+                external_id=row["external_id"],
+                url=row["url"] or "",
+                seen_date=last_seen_date,
+                timestamp=row["updated_at"] or now_iso(),
+            )
+        if was_inserted:
+            inserted += 1
+    return inserted
+
+
 def upsert_vacancy(
     conn: sqlite3.Connection,
     *,
@@ -851,6 +1109,7 @@ def upsert_vacancy(
     company: str,
     description: str,
     url: str,
+    external_id: str = "",
     seen_date: str,
     status: str,
     stage: str,
@@ -867,9 +1126,21 @@ def upsert_vacancy(
 ) -> int:
     norm_url = normalize_url(url)
     stage = canonical_stage(stage)
-    external_id = vacancy_external_id(channel, norm_url, title, company)
+    external_id = clean_cell(external_id) or vacancy_external_id(
+        channel, norm_url, title, company
+    )
     semantic_fingerprint = semantic_vacancy_fingerprint(company, title, description)
     row = conn.execute("SELECT * FROM vacancies WHERE external_id = ?", (external_id,)).fetchone()
+    if not row:
+        row = conn.execute(
+            """
+            SELECT v.*
+            FROM vacancy_external_aliases a
+            JOIN vacancies v ON v.id = a.vacancy_id
+            WHERE a.channel = ? AND a.external_id = ?
+            """,
+            (channel, external_id),
+        ).fetchone()
     if not row and semantic_fingerprint:
         row = conn.execute(
             """
@@ -917,6 +1188,15 @@ def upsert_vacancy(
             ),
         )
         vacancy_id = int(cur.lastrowid)
+        store_vacancy_external_alias(
+            conn,
+            vacancy_id=vacancy_id,
+            channel=channel,
+            external_id=external_id,
+            url=norm_url,
+            seen_date=seen_date,
+            timestamp=now,
+        )
         if semantic_fingerprint:
             conn.execute(
                 """
@@ -939,6 +1219,14 @@ def upsert_vacancy(
     def choose(field: str, new_value: str) -> str:
         return new_value or row[field] or ""
 
+    canonical_url = row["url"] or ""
+    if (
+        external_id == row["external_id"]
+        and channel == row["channel"]
+        and norm_url
+    ):
+        canonical_url = norm_url
+
     conn.execute(
         """
         UPDATE vacancies
@@ -951,7 +1239,7 @@ def upsert_vacancy(
         """,
         (
             choose("source", source),
-            choose("url", norm_url),
+            canonical_url,
             choose("title", title),
             choose("company", company),
             first_seen,
@@ -971,6 +1259,15 @@ def upsert_vacancy(
             now,
             vacancy_id,
         ),
+    )
+    store_vacancy_external_alias(
+        conn,
+        vacancy_id=vacancy_id,
+        channel=channel,
+        external_id=external_id,
+        url=norm_url,
+        seen_date=seen_date,
+        timestamp=now,
     )
     if semantic_fingerprint:
         conn.execute(
@@ -1250,6 +1547,7 @@ def ingest_item(
         or ""
     )
     url = clean_cell(str(item.get("url") or item.get("href") or ""))
+    external_id = clean_cell(str(item.get("external_id") or ""))
     if not title and not url:
         return None
 
@@ -1288,6 +1586,7 @@ def ingest_item(
         company=company,
         description=description,
         url=url,
+        external_id=external_id,
         seen_date=date,
         status=status,
         stage=stage,
@@ -2989,16 +3288,13 @@ def migrate_schema(args: argparse.Namespace) -> None:
         raise FileNotFoundError(f"Database not found: {args.db}")
     with sqlite3.connect(args.db) as probe:
         current_version = int(probe.execute("PRAGMA user_version").fetchone()[0])
-    if current_version == SCHEMA_VERSION:
-        print(f"Database schema is already at version {SCHEMA_VERSION}")
-        return
-    if current_version != 1:
+    if current_version not in {1, 2, SCHEMA_VERSION}:
         raise RuntimeError(
             f"Unsupported migration path: {current_version} -> {SCHEMA_VERSION}"
         )
 
     backup_path: Path | None = None
-    if not args.no_backup:
+    if current_version < SCHEMA_VERSION and not args.no_backup:
         stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
         backup_path = args.db.with_name(f"{args.db.name}.bak-schema-v{current_version}-{stamp}")
         with sqlite3.connect(args.db) as source_conn, sqlite3.connect(backup_path) as backup_conn:
@@ -3006,7 +3302,9 @@ def migrate_schema(args: argparse.Namespace) -> None:
 
     with connect_db(args.db) as conn:
         ensure_auxiliary_schema(conn)
-        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        backfilled_aliases = backfill_canonical_external_aliases(conn)
+        if current_version < SCHEMA_VERSION:
+            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         conn.commit()
 
     snapshot = render_outputs(args.db)
@@ -3014,14 +3312,20 @@ def migrate_schema(args: argparse.Namespace) -> None:
         "from_version": current_version,
         "to_version": SCHEMA_VERSION,
         "backup": db_label(backup_path) if backup_path else "",
+        "backfilled_aliases": backfilled_aliases,
+        "already_current": current_version == SCHEMA_VERSION,
         "kpis": snapshot["kpis"],
     }
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
-        print(f"Migrated database schema {current_version} -> {SCHEMA_VERSION}")
+        if current_version == SCHEMA_VERSION:
+            print(f"Database schema is already at version {SCHEMA_VERSION}")
+        else:
+            print(f"Migrated database schema {current_version} -> {SCHEMA_VERSION}")
         if backup_path:
             print(f"  backup: {db_label(backup_path)}")
+        print(f"  canonical aliases backfilled: {backfilled_aliases}")
 
 
 def build_coverage_plan_command(args: argparse.Namespace) -> None:
@@ -3272,15 +3576,7 @@ def update_vacancy(args: argparse.Namespace) -> None:
     norm_url = normalize_url(args.url or "")
     with connect_db(args.db) as conn:
         ensure_schema(conn)
-        row = None
-        if args.id is not None:
-            row = conn.execute("SELECT * FROM vacancies WHERE id = ?", (args.id,)).fetchone()
-            if not row:
-                raise SystemExit(f"Vacancy id {args.id} not found")
-        if not row and args.external_id:
-            row = conn.execute("SELECT * FROM vacancies WHERE external_id = ?", (args.external_id,)).fetchone()
-        if not row and norm_url:
-            row = conn.execute("SELECT * FROM vacancies WHERE url = ?", (norm_url,)).fetchone()
+        row = resolve_vacancy_row(conn, args, required=False)
         if not row and not (args.title or norm_url):
             raise SystemExit("Vacancy not found. Provide --title/--company with --url to create it.")
 
@@ -3333,6 +3629,7 @@ def update_vacancy(args: argparse.Namespace) -> None:
                 company=args.company or "",
                 description="",
                 url=norm_url,
+                external_id=args.external_id or "",
                 seen_date=date,
                 status=status,
                 stage=stage,
@@ -3417,21 +3714,80 @@ def update_vacancy(args: argparse.Namespace) -> None:
     )
 
 
-def resolve_vacancy_row(conn: sqlite3.Connection, args: argparse.Namespace) -> sqlite3.Row:
+def resolve_external_id_vacancy_row(
+    conn: sqlite3.Connection, external_id: str
+) -> sqlite3.Row | None:
+    external_id = clean_cell(external_id)
+    if not external_id:
+        return None
+    row = conn.execute(
+        "SELECT * FROM vacancies WHERE external_id = ?", (external_id,)
+    ).fetchone()
+    if row:
+        return row
+    rows = conn.execute(
+        """
+        SELECT DISTINCT v.*
+        FROM vacancy_external_aliases a
+        JOIN vacancies v ON v.id = a.vacancy_id
+        WHERE a.external_id = ?
+        ORDER BY v.id
+        """,
+        (external_id,),
+    ).fetchall()
+    if len(rows) > 1:
+        raise SystemExit(
+            f"External ID {external_id!r} is ambiguous across channels; "
+            "use --id or --url"
+        )
+    return rows[0] if rows else None
+
+
+def resolve_alias_url_vacancy_row(
+    conn: sqlite3.Connection, url: str
+) -> sqlite3.Row | None:
+    norm_url = normalize_url(url)
+    if not norm_url:
+        return None
+    row = conn.execute(
+        "SELECT * FROM vacancies WHERE url = ?", (norm_url,)
+    ).fetchone()
+    if row:
+        return row
+    rows = conn.execute(
+        """
+        SELECT DISTINCT v.*
+        FROM vacancy_external_aliases a
+        JOIN vacancies v ON v.id = a.vacancy_id
+        WHERE a.url = ?
+        ORDER BY v.id
+        """,
+        (norm_url,),
+    ).fetchall()
+    if len(rows) > 1:
+        raise SystemExit(f"Vacancy URL {norm_url!r} is ambiguous; use --id")
+    return rows[0] if rows else None
+
+
+def resolve_vacancy_row(
+    conn: sqlite3.Connection,
+    args: argparse.Namespace,
+    *,
+    required: bool = True,
+) -> sqlite3.Row | None:
     if args.id is None and not args.url and not args.external_id:
         raise SystemExit("Use --id, --url, or --external-id to identify the vacancy")
 
-    norm_url = normalize_url(args.url or "")
     row = None
     if args.id is not None:
         row = conn.execute("SELECT * FROM vacancies WHERE id = ?", (args.id,)).fetchone()
+        if not row:
+            raise SystemExit(f"Vacancy id {args.id} not found")
     if not row and args.external_id:
-        row = conn.execute(
-            "SELECT * FROM vacancies WHERE external_id = ?", (args.external_id,)
-        ).fetchone()
-    if not row and norm_url:
-        row = conn.execute("SELECT * FROM vacancies WHERE url = ?", (norm_url,)).fetchone()
-    if not row:
+        row = resolve_external_id_vacancy_row(conn, args.external_id)
+    if not row and args.url:
+        row = resolve_alias_url_vacancy_row(conn, args.url)
+    if not row and required:
         raise SystemExit("Vacancy not found")
     return row
 
@@ -3886,22 +4242,11 @@ def attach_interview_summary(args: argparse.Namespace) -> None:
         raise SystemExit("Use --id, --url, or --external-id to identify the vacancy")
 
     file_path = project_relative_file_path(args.file)
-    norm_url = normalize_url(args.url or "")
     date = args.date or dt.date.today().isoformat()
 
     with connect_db(args.db) as conn:
         ensure_schema(conn)
-        row = None
-        if args.id is not None:
-            row = conn.execute("SELECT * FROM vacancies WHERE id = ?", (args.id,)).fetchone()
-            if not row:
-                raise SystemExit(f"Vacancy id {args.id} not found")
-        if not row and args.external_id:
-            row = conn.execute("SELECT * FROM vacancies WHERE external_id = ?", (args.external_id,)).fetchone()
-        if not row and norm_url:
-            row = conn.execute("SELECT * FROM vacancies WHERE url = ?", (norm_url,)).fetchone()
-        if not row:
-            raise SystemExit("Vacancy not found")
+        row = resolve_vacancy_row(conn, args)
 
         vacancy_id = int(row["id"])
         parsed_no = parse_interview_no(args.stage)
@@ -4077,7 +4422,43 @@ def doctor(args: argparse.Namespace) -> None:
                 quick_check = str(conn.execute("PRAGMA quick_check").fetchone()[0])
                 schema_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
                 missing_tables = missing_schema_tables(conn)
+                missing_indexes = missing_schema_indexes(conn)
+                alias_schema_issues = vacancy_external_alias_schema_issues(conn)
                 foreign_key_issues = len(conn.execute("PRAGMA foreign_key_check").fetchall())
+                canonical_aliases_missing = (
+                    int(
+                        conn.execute(
+                            """
+                            SELECT COUNT(*)
+                            FROM vacancies v
+                            LEFT JOIN vacancy_external_aliases a
+                              ON a.vacancy_id = v.id
+                             AND a.channel = v.channel
+                             AND a.external_id = v.external_id
+                            WHERE a.id IS NULL
+                            """
+                        ).fetchone()[0]
+                    )
+                    if "vacancy_external_aliases" not in missing_tables
+                    else -1
+                )
+                ambiguous_aliases = (
+                    int(
+                        conn.execute(
+                            """
+                            SELECT COUNT(*)
+                            FROM (
+                                SELECT external_id
+                                FROM vacancy_external_aliases
+                                GROUP BY external_id
+                                HAVING COUNT(DISTINCT vacancy_id) > 1
+                            )
+                            """
+                        ).fetchone()[0]
+                    )
+                    if "vacancy_external_aliases" not in missing_tables
+                    else -1
+                )
             add("database_integrity", quick_check == "ok", quick_check)
             add(
                 "database_schema",
@@ -4085,6 +4466,24 @@ def doctor(args: argparse.Namespace) -> None:
                 (
                     f"database={schema_version}, supported={SCHEMA_VERSION}, "
                     f"missing_tables={','.join(missing_tables) or 'none'}"
+                ),
+            )
+            add(
+                "database_indexes",
+                not missing_indexes,
+                f"missing={','.join(missing_indexes) or 'none'}",
+            )
+            add(
+                "database_external_alias_schema",
+                not alias_schema_issues,
+                "; ".join(alias_schema_issues) or "valid",
+            )
+            add(
+                "database_canonical_aliases",
+                canonical_aliases_missing == 0 and ambiguous_aliases == 0,
+                (
+                    f"missing_canonical={canonical_aliases_missing}, "
+                    f"ambiguous_external_ids={ambiguous_aliases}"
                 ),
             )
             add(

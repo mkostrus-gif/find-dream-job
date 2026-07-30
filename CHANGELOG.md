@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Added schema v3 external-ID aliases so semantic repost deduplication keeps one
+  canonical vacancy while every imported source ID and URL remains resolvable.
 - Added fail-closed daily search coverage with configured required streams,
   deterministic HH OR/search-period query generation, page and lazy-load
   checkpoints, SQLite history, and a generated coverage report.
