@@ -230,6 +230,21 @@ The primary agent flows are `prompts/onboarding.md` for first setup and
 discover or submit data, but their result becomes durable system state only
 after an evidence-backed `jobctl.py` write.
 
+Gmail vacancy extraction supports both HH and LinkedIn. The legacy command
+defaults to HH; pass `--provider linkedin` for LinkedIn job mail. LinkedIn rows
+default to channel `linkedin`, source `linkedin_gmail_job_alert`, and stable
+`linkedin:<job-id>` identity when the canonical job URL exposes that ID:
+
+```bash
+python3 scripts/jobctl.py ingest-gmail-json tmp/linkedin_mail_YYYY-MM-DD.json \
+  --provider linkedin --json
+```
+
+This discovery import does not replace full screening. Open and score every
+vacancy, then ingest the completed screening rows with `ingest-json`. Mailbox
+archiving remains an external action: perform it only within explicit scope,
+after per-message reconciliation, and verify removal of the `INBOX` label.
+
 ## Generated output
 
 Every write command regenerates the dashboard and reports. Manual changes to

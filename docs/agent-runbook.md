@@ -129,18 +129,26 @@ Use [`prompts/daily_run.md`](../prompts/daily_run.md) as the canonical order:
 1. load settings and private evidence;
 2. validate and rebuild existing state;
 3. reconcile inbound replies and external statuses;
-4. build the configured source-stream coverage plan, search every generated
+4. process authorized Gmail HH mail and every LinkedIn message currently in
+   Inbox; score every recommended vacancy and verify each authorized archive;
+5. build the configured source-stream coverage plan, search every generated
    query through its final fully loaded page, and deduplicate against SQLite;
-5. normalize results into ignored JSON and ingest them;
-6. score the real mandate, hard constraints, and open questions;
-7. prepare or perform only the external actions allowed by current policy;
-8. verify visible success before recording sent state;
-9. run fail-closed `check-coverage`, rebuild, validate, and report.
+6. normalize results into ignored JSON and ingest them;
+7. score the real mandate, hard constraints, and open questions;
+8. prepare or perform only the external actions allowed by current policy;
+9. verify visible success before recording sent state;
+10. run fail-closed `check-coverage`, rebuild, validate, and report.
 
 Use [`prompts/scan_channel.md`](../prompts/scan_channel.md) when the task is
 limited to one company or source. Use
 [`prompts/ats_application_playbook.md`](../prompts/ats_application_playbook.md)
 for resumes, forms, applications, and outreach.
+
+Use [`prompts/gmail_hh_digest.md`](../prompts/gmail_hh_digest.md) for the mail
+pass. A LinkedIn message is complete only after all vacancy/reply content is
+reconciled into SQLite or classified as non-actionable. When archiving is in
+scope, verify the `INBOX` label was removed; an unverified archive or omitted
+message keeps the mail pass incomplete.
 
 ## 6. Normalize source results
 

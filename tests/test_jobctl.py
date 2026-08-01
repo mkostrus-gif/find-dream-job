@@ -59,6 +59,8 @@ class JobctlIntegrationTests(unittest.TestCase):
         self.assertTrue(doctor["ok"])
         self.assertFalse(doctor["auto_apply"])
         self.assertEqual(doctor["apply_threshold"], 85)
+        self.assertFalse(doctor["scan_linkedin_inbox"])
+        self.assertFalse(doctor["archive_processed_linkedin"])
 
         with sqlite3.connect(self.workspace / "data" / "job_search.sqlite") as conn:
             self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 3)
@@ -125,6 +127,117 @@ class JobctlIntegrationTests(unittest.TestCase):
         stats = json.loads(self.run_cli("stats").stdout)
         self.assertEqual(stats["vacancies"], 2)
         self.assertEqual(stats["applied"], 1)
+
+    def test_linkedin_gmail_ingest_uses_stable_job_identity_and_supports_screening(self) -> None:
+        self.run_cli("init", "--json")
+        mail_payload = self.workspace / "tmp" / "linkedin-mail.json"
+        mail_payload.write_text(
+            json.dumps(
+                {
+                    "vacancies": [
+                        {
+                            "date": "2026-08-01",
+                            "title": "Head of Product",
+                            "company": "Example Labs",
+                            "url": "https://www.linkedin.com/jobs/view/head-of-product-at-example-labs-4321098765/?trackingId=mail",
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = self.run_cli(
+            "ingest-gmail-json",
+            str(mail_payload),
+            "--provider",
+            "linkedin",
+            "--json",
+        )
+        self.assertIn('"provider": "linkedin"', result.stdout)
+
+        screening_payload = self.workspace / "tmp" / "linkedin-screening.json"
+        screening_payload.write_text(
+            json.dumps(
+                {
+                    "vacancies": [
+                        {
+                            "date": "2026-08-01",
+                            "kind": "screening",
+                            "title": "Head of Product",
+                            "company": "Example Labs",
+                            "url": "https://linkedin.com/jobs/view/4321098765/",
+                            "status": "NEEDS_REVIEW",
+                            "stage": "seen",
+                            "score": 88,
+                            "reason": "Strong mandate fit",
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.run_cli(
+            "ingest-json",
+            str(screening_payload),
+            "--channel",
+            "linkedin",
+            "--source",
+            "linkedin_gmail_job_alert",
+        )
+
+        with sqlite3.connect(self.workspace / "data" / "job_search.sqlite") as conn:
+            vacancy = conn.execute(
+                """
+                SELECT channel, source, external_id, latest_status, score
+                FROM vacancies
+                """
+            ).fetchone()
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM vacancies").fetchone()[0], 1)
+            self.assertEqual(
+                vacancy,
+                (
+                    "linkedin",
+                    "linkedin_gmail_job_alert",
+                    "linkedin:4321098765",
+                    "NEEDS_REVIEW",
+                    88,
+                ),
+            )
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM source_hits").fetchone()[0], 2)
+
+    def test_gmail_ingest_keeps_hh_as_the_backward_compatible_default(self) -> None:
+        self.run_cli("init", "--json")
+        payload = self.workspace / "tmp" / "hh-mail.json"
+        payload.write_text(
+            json.dumps(
+                {
+                    "vacancies": [
+                        {
+                            "date": "2026-08-01",
+                            "title": "Product Lead",
+                            "company": "Example Labs",
+                            "url": "https://hh.ru/vacancy/123456789",
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.run_cli("ingest-gmail-json", str(payload))
+
+        with sqlite3.connect(self.workspace / "data" / "job_search.sqlite") as conn:
+            vacancy = conn.execute(
+                "SELECT channel, source, external_id, latest_status FROM vacancies"
+            ).fetchone()
+        self.assertEqual(
+            vacancy,
+            (
+                "gmail_hh",
+                "hh_gmail_digest",
+                "hh:123456789",
+                "DISCOVERED_FROM_GMAIL",
+            ),
+        )
 
     def test_explicit_config_after_subcommand_is_supported(self) -> None:
         config = self.workspace / "custom.toml"

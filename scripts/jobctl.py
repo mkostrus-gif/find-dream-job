@@ -91,6 +91,7 @@ def configure_runtime(config_path: Path | None = None) -> None:
 configure_runtime(CODE_ROOT / "config" / ".defaults-only.toml")
 
 VACANCY_ID_RE = re.compile(r"/vacancy/(\d+)")
+LINKEDIN_JOB_ID_RE = re.compile(r"/jobs/view/(?:[^/?#]*-)?(\d+)(?:[/?#]|$)")
 FOLLOW_UP_STATUS_RE = re.compile(r"^FOLLOW_UP_(\d+)_")
 DIRECT_SEND_CONFIDENCE = {"confirmed", "strong"}
 CONTACT_CONFIDENCE = {"confirmed", "strong", "weak"}
@@ -302,6 +303,10 @@ def vacancy_external_id(channel: str, url: str, title: str, company: str) -> str
     match = VACANCY_ID_RE.search(url or "")
     if match:
         return f"hh:{match.group(1)}"
+    host = (urlsplit(url).hostname or "").lower()
+    match = LINKEDIN_JOB_ID_RE.search(url or "")
+    if match and (host == "linkedin.com" or host.endswith(".linkedin.com")):
+        return f"linkedin:{match.group(1)}"
     basis = url or f"{channel}:{title}:{company}"
     digest = hashlib.sha1(basis.encode("utf-8")).hexdigest()[:16]
     return f"{channel}:{digest}"
@@ -3541,30 +3546,57 @@ def ingest_gmail_json(args: argparse.Namespace) -> None:
     if not items:
         raise SystemExit("Expected a JSON array or an object with a vacancies array")
     origin_file = origin_for(args.file)
+    provider_defaults = {
+        "hh": {
+            "channel": "gmail_hh",
+            "source": "hh_gmail_digest",
+            "status": "DISCOVERED_FROM_GMAIL",
+            "label": "Gmail HH",
+        },
+        "linkedin": {
+            "channel": "linkedin",
+            "source": "linkedin_gmail_job_alert",
+            "status": "DISCOVERED_FROM_LINKEDIN_EMAIL",
+            "label": "Gmail LinkedIn",
+        },
+    }
+    defaults = provider_defaults[args.provider]
     with connect_db(args.db) as conn:
         ensure_schema(conn)
         count = 0
         for line_no, item in enumerate(items, start=1):
             item = dict(item)
-            item.setdefault("channel", "gmail_hh")
-            item.setdefault("source", "hh_gmail_digest")
-            item.setdefault("status", "DISCOVERED_FROM_GMAIL")
+            item.setdefault("channel", defaults["channel"])
+            item.setdefault("source", defaults["source"])
+            item.setdefault("status", defaults["status"])
             item.setdefault("stage", "seen")
             if ingest_item(
                 conn,
                 item,
-                default_channel="gmail_hh",
-                default_source="hh_gmail_digest",
+                default_channel=defaults["channel"],
+                default_source=defaults["source"],
                 origin_file=origin_file,
                 line_no=line_no,
             ):
                 count += 1
         conn.commit()
-    render_outputs(args.db)
+    snapshot = render_outputs(args.db)
     print(
-        f"Ingested {count} Gmail HH rows and regenerated "
+        f"Ingested {count} {defaults['label']} rows and regenerated "
         f"{display_path(DASHBOARD_PATH, ROOT)}"
     )
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "ingested": count,
+                    "provider": args.provider,
+                    "kpis": snapshot["kpis"],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
 
 
 def update_vacancy(args: argparse.Namespace) -> None:
@@ -4516,6 +4548,8 @@ def doctor(args: argparse.Namespace) -> None:
         "config": display_path(SETTINGS.config_path, ROOT),
         "auto_apply": SETTINGS.automation.auto_apply,
         "apply_threshold": SETTINGS.automation.apply_threshold,
+        "scan_linkedin_inbox": SETTINGS.mail.scan_linkedin_inbox,
+        "archive_processed_linkedin": SETTINGS.mail.archive_processed_linkedin,
         "checks": checks,
     }
     if args.json:
@@ -4637,9 +4671,19 @@ def build_parser() -> argparse.ArgumentParser:
     ingest_parser.add_argument("--json", action="store_true")
     ingest_parser.set_defaults(func=ingest_json)
 
-    gmail_parser = sub.add_parser("ingest-gmail-json", help="Ingest HH vacancy links extracted from Gmail")
+    gmail_parser = sub.add_parser(
+        "ingest-gmail-json",
+        help="Ingest HH or LinkedIn vacancy links extracted from Gmail",
+    )
     gmail_parser.add_argument("file", type=Path, help="JSON file with vacancies")
     gmail_parser.add_argument("--db", type=Path, default=DB_PATH)
+    gmail_parser.add_argument(
+        "--provider",
+        choices=("hh", "linkedin"),
+        default="hh",
+        help="Mail provider defaults to apply to rows without channel/source fields",
+    )
+    gmail_parser.add_argument("--json", action="store_true")
     gmail_parser.set_defaults(func=ingest_gmail_json)
 
     update_parser = sub.add_parser("update-vacancy", help="Update one vacancy status/stage in SQLite")
