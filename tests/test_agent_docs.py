@@ -103,6 +103,37 @@ class AgentDocumentationTests(unittest.TestCase):
         settings = self.read("config/settings.example.toml")
         self.assertIn("[search]", settings)
         self.assertIn("required_streams", settings)
+        self.assertIn("[mail]", settings)
+        self.assertIn("scan_linkedin_inbox = false", settings)
+        self.assertIn("archive_processed_linkedin = false", settings)
+
+    def test_daily_run_requires_complete_linkedin_mail_processing(self) -> None:
+        daily = self.read("prompts/daily_run.md")
+        mail_workflow = self.read("prompts/gmail_hh_digest.md")
+        required_daily_text = (
+            "complete set of LinkedIn messages",
+            "currently in Inbox",
+            "mail.scan_linkedin_inbox = true",
+            "mail.archive_processed_linkedin = true",
+            "linkedin_gmail_job_alert",
+            "Verify removal of the `INBOX` label",
+            "unaccounted LinkedIn message",
+            "archive-verified",
+        )
+        for text in required_daily_text:
+            with self.subTest(text=text):
+                self.assertIn(text, daily)
+
+        required_mail_text = (
+            "Review every matching message",
+            "Extract every vacancy link",
+            "--provider linkedin",
+            "Archive is not delete",
+            "unverified",
+        )
+        for text in required_mail_text:
+            with self.subTest(text=text):
+                self.assertIn(text, mail_workflow)
 
     def test_relative_markdown_links_resolve(self) -> None:
         candidates = self.public_candidates()

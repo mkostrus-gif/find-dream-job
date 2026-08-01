@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Added LinkedIn Gmail job-alert ingestion with stable LinkedIn job IDs and a
+  fail-closed daily mail workflow that scores every recommended vacancy and
+  archives each fully processed message only with authorization and verification.
 - Added schema v3 external-ID aliases so semantic repost deduplication keeps one
   canonical vacancy while every imported source ID and URL remains resolvable.
 - Added fail-closed daily search coverage with configured required streams,

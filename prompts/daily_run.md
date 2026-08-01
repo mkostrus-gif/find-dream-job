@@ -44,6 +44,29 @@ authorized scope.
 - When an application form asks for an unknown fact, store `needs_input` and the
   exact question. Never infer or improvise the answer.
 
+## Process Gmail job mail
+
+- Apply [`gmail_hh_digest.md`](gmail_hh_digest.md) whenever authorized Gmail
+  access is available. If `mail.scan_linkedin_inbox = true`, the LinkedIn pass
+  is mandatory; unavailable access is a blocker, not a silent skip.
+- Process HH mail and, when enabled, the complete set of LinkedIn messages
+  currently in Inbox. Do not limit the LinkedIn pass to unread messages or an
+  assumed recent date.
+- Review every LinkedIn message. Extract and open every vacancy it recommends,
+  score it against the private profile, deduplicate it, and persist it through
+  `jobctl.py` using `linkedin` as the vacancy channel and
+  `linkedin_gmail_job_alert` as the source.
+- Reconcile LinkedIn recruiter/application notifications against an exact
+  vacancy row. Explicitly classify messages that contain no vacancy or pipeline
+  action so they are still accounted for.
+- When `mail.archive_processed_linkedin = true` or the current user explicitly
+  authorizes the same scope, archive each message immediately after all of its
+  vacancies/replies are reconciled or it is classified as non-actionable.
+  Verify removal of the `INBOX` label. Do not delete mail.
+- Treat any unaccounted LinkedIn message, unresolved vacancy, or unverified
+  archive as an incomplete mail pass and report the exact message-level blocker
+  without copying private message content into public files.
+
 ## Discover and screen
 
 - Use search streams and exclusions from the private preferences/scoring files.
@@ -139,6 +162,8 @@ python3 scripts/jobctl.py doctor --strict --json
 
 Report verified counts for discovered, reviewed, needs-input, applied,
 follow-up, interviews, and rejections; list blockers and external actions with
-their evidence state. Include the persisted source coverage/checkpoints from
-`reports/search_coverage.md` and the exact workspace used so another agent can
-resume. Zero strong applications is a valid result.
+their evidence state. Report LinkedIn mail counts for found, processed,
+archived, archive-verified, and blocked messages plus vacancy links found,
+unique, known, new, scored, and unresolved. Include the persisted source
+coverage/checkpoints from `reports/search_coverage.md` and the exact workspace
+used so another agent can resume. Zero strong applications is a valid result.

@@ -12,7 +12,8 @@ summarize them: select the correct mode and execute the safe, authorized work.
 - Vacancy evaluation: apply [`scoring.md`](scoring.md).
 - Resume, form, submission, or direct outreach: apply
   [`ats_application_playbook.md`](ats_application_playbook.md).
-- Mail digest: apply [`gmail_hh_digest.md`](gmail_hh_digest.md).
+- Gmail HH and LinkedIn job mail: apply
+  [`gmail_hh_digest.md`](gmail_hh_digest.md).
 - Product code or publication preparation: switch to develop mode and follow
   [`CONTRIBUTING.md`](../CONTRIBUTING.md).
 

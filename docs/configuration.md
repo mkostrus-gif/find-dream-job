@@ -54,6 +54,19 @@ Only configured direct channels are accepted by contact and follow-up commands.
 Changing the list does not install or authenticate a messaging connector. It
 only changes validation and recording policy.
 
+## Mail
+
+`[mail]` makes LinkedIn Inbox processing an explicit local policy:
+
+- `scan_linkedin_inbox = true` requires each daily run to inspect every current
+  LinkedIn message in Gmail Inbox and process all vacancy/reply content;
+- `archive_processed_linkedin = true` records authorization to archive each
+  fully reconciled LinkedIn message and verify removal of the `INBOX` label.
+
+Both settings default to `false`. Archiving cannot be enabled unless scanning
+is enabled. These settings do not install or authenticate Gmail and do not
+authorize deletion, sending, or unrelated mailbox mutations.
+
 ## Search coverage
 
 `[search]` makes daily discovery completeness machine-checkable:
@@ -95,5 +108,6 @@ python3 scripts/jobctl.py doctor --strict --json
 python3 scripts/jobctl.py rebuild --json
 ```
 
-Report the selected workspace, config path, `auto_apply` state, threshold, and
-any failed check. Never weaken validation merely to make the command pass.
+Report the selected workspace, config path, `auto_apply` state, threshold,
+LinkedIn mail policy, and any failed check. Never weaken validation merely to
+make the command pass.
