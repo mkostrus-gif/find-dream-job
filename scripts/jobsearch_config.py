@@ -76,6 +76,12 @@ class FollowUpSettings:
 
 
 @dataclass(frozen=True)
+class MailSettings:
+    scan_linkedin_inbox: bool
+    archive_processed_linkedin: bool
+
+
+@dataclass(frozen=True)
 class SearchSettings:
     required_streams: tuple[str, ...]
     default_period_days: int
@@ -93,6 +99,7 @@ class Settings:
     profile: ProfileSettings
     automation: AutomationSettings
     follow_up: FollowUpSettings
+    mail: MailSettings
     search: SearchSettings
     channel_labels: dict[str, str]
 
@@ -206,6 +213,7 @@ def load_settings(code_root: Path, config_path: Path | None = None) -> Settings:
     profile = _table(data, "profile")
     automation = _table(data, "automation")
     follow_up = _table(data, "follow_up")
+    mail = _table(data, "mail")
     search = _table(data, "search")
     labels = _table(data, "channel_labels")
 
@@ -221,6 +229,20 @@ def load_settings(code_root: Path, config_path: Path | None = None) -> Settings:
         if not isinstance(channel, str) or not isinstance(label, str) or not label.strip():
             raise ValueError("channel_labels entries must map strings to non-empty strings")
         channel_labels[channel.strip().lower()] = label.strip()
+
+    mail_settings = MailSettings(
+        scan_linkedin_inbox=_boolean(mail, "scan_linkedin_inbox", False),
+        archive_processed_linkedin=_boolean(
+            mail, "archive_processed_linkedin", False
+        ),
+    )
+    if (
+        mail_settings.archive_processed_linkedin
+        and not mail_settings.scan_linkedin_inbox
+    ):
+        raise ValueError(
+            "mail.archive_processed_linkedin requires mail.scan_linkedin_inbox = true"
+        )
 
     settings = Settings(
         code_root=code_root,
@@ -271,6 +293,7 @@ def load_settings(code_root: Path, config_path: Path | None = None) -> Settings:
                 follow_up, "max_direct_messages_per_round", 1, 0
             ),
         ),
+        mail=mail_settings,
         search=SearchSettings(
             required_streams=_stream_names(
                 search,

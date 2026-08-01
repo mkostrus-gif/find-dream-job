@@ -37,6 +37,12 @@ primary_channel = "email"
 direct_channels = ["linkedin"]
 max_direct_messages_per_round = 1
 
+[mail]
+# Mail reads and mailbox mutations still require an authorized connector/session.
+# Keep both false until the candidate explicitly enables the LinkedIn Inbox flow.
+scan_linkedin_inbox = false
+archive_processed_linkedin = false
+
 [search]
 # A daily run is not complete until every configured stream has a validated
 # coverage checkpoint. Replace these generic names in the ignored local copy.

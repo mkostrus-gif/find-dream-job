@@ -180,7 +180,7 @@ A search run is complete only when:
 - One source or company: `prompts/scan_channel.md`
 - Vacancy scoring: `prompts/scoring.md`
 - Resume, form, application, or outreach: `prompts/ats_application_playbook.md`
-- Mail digest: `prompts/gmail_hh_digest.md`
+- Gmail HH and LinkedIn job mail: `prompts/gmail_hh_digest.md`
 - Detailed operational reference: `docs/agent-runbook.md`
 
 When handing control back, lead with the outcome. Include the workspace used,
