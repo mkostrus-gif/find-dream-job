@@ -83,6 +83,24 @@ configuration and preferences. The public template contains generic examples.
 `check-coverage` exits non-zero when a stream, page, or expected card count is
 missing.
 
+## Source stream aliases
+
+Optional `[source_stream_aliases]` entries map a raw historical stream label to
+a canonical reporting key. Matching is case-insensitive, so one entry can
+consolidate case variants:
+
+```toml
+[source_stream_aliases]
+"Legacy Product Stream" = "product_roles"
+```
+
+The engine always preserves `source_hits.source_stream`. Generated source and
+conversion reports apply the current mapping; unmapped values retain their raw
+key and appear in `reports/source_streams.md`. Changing the mapping changes
+future report grouping on rebuild but does not rewrite historical raw values.
+This mapping does not alter the exact fail-closed `search.required_streams`
+coverage contract.
+
 An agent should configure only channels both chosen by the candidate and
 available in the intended workflow. Configuration is policy, not proof of a
 working connector or permission to send.

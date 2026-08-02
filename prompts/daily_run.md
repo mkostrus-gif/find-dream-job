@@ -23,8 +23,9 @@ not an onboarded candidate workspace.
    python3 scripts/jobctl.py rebuild --json
    ```
 
-5. Review `views/review_active.md`, `views/today.md`, `views/followups.md`, and
-   `reports/source_quality.md`.
+5. Review `views/review_active.md`, `views/today.md`, `views/followups.md`,
+   `views/employer_accounts.md`, `reports/source_quality.md`,
+   `reports/source_streams.md`, and `reports/conversion_cohorts.md`.
 
 If the local config or required profile files are missing, stop before external
 actions, complete safe onboarding repairs where possible, and report the exact
@@ -40,6 +41,12 @@ authorized scope.
 - Check relevant job-board messages and recruiter email before sending anything.
 - Resolve new replies, rejections, interview invitations, and closed vacancies
   against an exact database row.
+- Record every visible automated acknowledgment or human employer response with
+  `record-employer-interaction`. An inbound event needs an evidence note;
+  automated acknowledgments are not human replies.
+- Keep interaction recording separate from state changes. Use an additional
+  evidence-backed `update-vacancy` for `interview_1` or `rejected`; never let an
+  interaction mutate the funnel implicitly.
 - Record only what the external system visibly proves.
 - When an application form asks for an unknown fact, store `needs_input` and the
   exact question. Never infer or improvise the answer.
@@ -97,6 +104,9 @@ authorized scope.
   reposts that received a new external ID.
 - Separate mandate fit from practical risks such as location, compensation,
   language, work authorization, or schedule.
+- Do not narrow discovery to AI-titled vacancies and do not award a score bonus
+  for the word AI. Employer AI adoption is a separate evidence-backed employer
+  signal, not proof of candidate fit or enterprise AI transformation experience.
 - Apply explicit calibration caps. A title alone cannot override a hard
   mismatch or excluded responsibility.
 - Do not use `examples/vacancies.json` as a substitute for a live source and do
@@ -156,13 +166,17 @@ Run:
 
 ```bash
 python3 scripts/jobctl.py rebuild --json
+python3 scripts/jobctl.py conversion-report --as-of YYYY-MM-DD --json
 python3 scripts/jobctl.py stats
 python3 scripts/jobctl.py doctor --strict --json
 ```
 
 Report verified counts for discovered, reviewed, needs-input, applied,
 follow-up, interviews, and rejections; list blockers and external actions with
-their evidence state. Report LinkedIn mail counts for found, processed,
+their evidence state. Include unique applications, matured 14/30-day
+denominators, human replies versus automated acknowledgments, interview-1
+conversion, verified-contact coverage, completed-contact-search coverage, and
+the current interaction-history caveat. Report LinkedIn mail counts for found, processed,
 archived, archive-verified, and blocked messages plus vacancy links found,
 unique, known, new, scored, and unresolved. Include the persisted source
 coverage/checkpoints from `reports/search_coverage.md` and the exact workspace

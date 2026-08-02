@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Added schema v4 employer interactions, vacancy-level 14/30-day conversion
+  cohorts, canonical source-stream aliases, downstream source-quality metrics,
+  explicit employer account radar/signals/links, and evidence-backed vacancy
+  factors that never alter score automatically.
 - Added LinkedIn Gmail job-alert ingestion with stable LinkedIn job IDs and a
   fail-closed daily mail workflow that scores every recommended vacancy and
   archives each fully processed message only with authorization and verification.

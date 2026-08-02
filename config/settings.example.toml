@@ -50,6 +50,12 @@ required_streams = ["recommendations", "target_roles"]
 default_period_days = 3
 items_per_page = 100
 
+[source_stream_aliases]
+# Optional case-insensitive raw alias -> canonical reporting key mapping.
+# Raw source_hits.source_stream values are always preserved. Keep this empty
+# when no historical aliases need consolidation.
+# "Legacy Product Stream" = "product_roles"
+
 [channel_labels]
 email = "Email"
 linkedin = "LinkedIn"
