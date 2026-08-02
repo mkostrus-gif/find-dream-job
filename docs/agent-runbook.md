@@ -117,10 +117,12 @@ JOB_SEARCH_HOME="/path/to/private-workspace" \
   python3 scripts/jobctl.py stats
 ```
 
-Never use `--no-backup` on a live database. Schema v3 backfills only the
-canonical external ID already known for each vacancy. Historical repost IDs
-must come from re-ingesting retained scan artifacts; do not reconstruct or
-guess them.
+Never use `--no-backup` on a live database. Schema v4 preserves the schema-v3
+external-ID aliases, raw source streams, and every existing row. It adds
+canonical stream keys, employer interactions, account radar tables, and
+vacancy factors without inventing any historical outcome or evidence. Restore
+the timestamped backup with the prior Engine version for rollback; there is no
+destructive reverse migration.
 
 ## 5. Execute one search cycle
 
@@ -128,7 +130,9 @@ Use [`prompts/daily_run.md`](../prompts/daily_run.md) as the canonical order:
 
 1. load settings and private evidence;
 2. validate and rebuild existing state;
-3. reconcile inbound replies and external statuses;
+3. reconcile inbound replies and external statuses; record each automated or
+   human employer event with `record-employer-interaction`, then make any
+   evidence-backed stage change separately;
 4. process authorized Gmail HH mail and every LinkedIn message currently in
    Inbox; score every recommended vacancy and verify each authorized archive;
 5. build the configured source-stream coverage plan, search every generated
@@ -165,6 +169,11 @@ Preserve source URL, source identity, discovery date, title, company, mandate
 evidence, score, risks, open questions, and next action. Do not manufacture a
 URL or employer identity to make a row importable.
 
+Preserve raw `source_stream`. Local `[source_stream_aliases]` may consolidate
+historical names and case variants for reporting, but unmapped values retain
+their raw identity and remain visible in `reports/source_streams.md`. Aliases do
+not alter the fail-closed `search.required_streams` coverage manifest.
+
 After ingest, reconcile scan identities by `(channel, external_id)` against
 both `vacancies` and `vacancy_external_aliases`. A semantic repost is healthy
 when every scan identity resolves but several identities map to one canonical
@@ -189,6 +198,30 @@ python3 scripts/jobctl.py check-coverage tmp/search_coverage_YYYY-MM-DD.json
 
 Do not claim a complete run after a non-zero exit. The SQLite checkpoint and
 `reports/search_coverage.md` preserve the resumable incomplete state.
+
+### Reconcile downstream outcomes
+
+An automated acknowledgment is an inbound automated employer interaction, not
+a human reply. A recruiter, hiring-manager, or founder response is a human
+interaction only when the actor/humanity classification and evidence note are
+stored. Neither event changes the funnel automatically. Record interview or
+rejection state separately after visible evidence.
+
+Use `conversion-report --as-of YYYY-MM-DD --json` or the generated
+`reports/conversion_cohorts.md`. The cohort grain is one vacancy at its earliest
+confirmed application. Human-reply maturity is 14 calendar days; interview-1
+maturity is 30. First-touch source attribution selects the earliest hit on or
+before the application date, then `source_hits.id`. Never infer historical
+replies from status text; absent structured history must display `n/a`.
+
+### Maintain employer accounts and factors
+
+Create an account explicitly, link a vacancy explicitly, and append signals
+only with evidence. Exact normalized account-name matching is allowed; fuzzy
+company matching is not. `ai_adoption` is an employer signal only. It does not
+prove candidate fit, growth, culture, or enterprise AI transformation
+experience. Vacancy factors such as `hiring_reality` and `human_access` inform
+action planning but never replace strategic fit or change score automatically.
 
 ## 7. Handle blockers
 

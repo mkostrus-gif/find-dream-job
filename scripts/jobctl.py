@@ -16,8 +16,10 @@ import os
 import re
 import shutil
 import sqlite3
+import statistics
 import sys
 import time
+import unicodedata
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
@@ -32,7 +34,7 @@ from search_coverage import (
 
 
 CODE_ROOT = Path(__file__).resolve().parents[1]
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SETTINGS: Settings
 ROOT: Path
@@ -53,6 +55,7 @@ REQUIRED_SEARCH_STREAMS: tuple[str, ...]
 DEFAULT_SEARCH_PERIOD_DAYS: int
 SEARCH_ITEMS_PER_PAGE: int
 CHANNEL_LABELS: dict[str, str]
+SOURCE_STREAM_ALIASES: dict[str, str]
 
 
 def configure_runtime(config_path: Path | None = None) -> None:
@@ -64,6 +67,7 @@ def configure_runtime(config_path: Path | None = None) -> None:
     global DIRECT_OUTREACH_CHANNELS, FOLLOW_UP_CHANNELS
     global MAX_DIRECT_MESSAGES_PER_ROUND, REQUIRED_SEARCH_STREAMS
     global DEFAULT_SEARCH_PERIOD_DAYS, SEARCH_ITEMS_PER_PAGE, CHANNEL_LABELS
+    global SOURCE_STREAM_ALIASES
 
     SETTINGS = load_settings(CODE_ROOT, config_path)
     ROOT = SETTINGS.workspace_root
@@ -84,6 +88,7 @@ def configure_runtime(config_path: Path | None = None) -> None:
     DEFAULT_SEARCH_PERIOD_DAYS = SETTINGS.search.default_period_days
     SEARCH_ITEMS_PER_PAGE = SETTINGS.search.items_per_page
     CHANNEL_LABELS = dict(SETTINGS.channel_labels)
+    SOURCE_STREAM_ALIASES = dict(SETTINGS.search.stream_aliases)
 
 
 # Load safe built-in defaults at import time. main() reloads the selected local
@@ -110,10 +115,45 @@ CONTACT_SEARCH_STATUSES = {
     "unreachable",
 }
 OUTREACH_DELIVERY_STATUSES = {"sent", "failed", "not_sent"}
+EMPLOYER_INTERACTION_TYPES = {
+    "human_reply",
+    "automated_ack",
+    "screening_request",
+    "interview_invite",
+    "rejection",
+    "other",
+}
+EMPLOYER_ACTOR_TYPES = {
+    "recruiter",
+    "hiring_manager",
+    "founder",
+    "system",
+    "unknown",
+}
+EMPLOYER_SIGNAL_TYPES = {
+    "technology_adoption",
+    "ai_adoption",
+    "hiring_growth",
+    "restructuring",
+    "leadership_change",
+    "culture",
+    "other",
+}
+EVIDENCE_CONFIDENCE = {"low", "medium", "high", "confirmed"}
+CORE_VACANCY_FACTORS = {
+    "technology_adoption_maturity",
+    "work_content_risk",
+    "hiring_reality",
+    "human_access",
+}
+FACTOR_KEY_RE = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
 EXPECTED_TABLES = {
     "applications",
     "contact_searches",
     "employer_contacts",
+    "employer_accounts",
+    "employer_account_signals",
+    "employer_interactions",
     "evaluations",
     "followup_rounds",
     "import_issues",
@@ -124,12 +164,18 @@ EXPECTED_TABLES = {
     "search_runs",
     "stage_events",
     "vacancies",
+    "vacancy_employer_accounts",
     "vacancy_external_aliases",
+    "vacancy_factors",
     "vacancy_fingerprints",
 }
 EXPECTED_INDEXES = {
+    "idx_employer_account_signals_account",
+    "idx_employer_interactions_vacancy",
     "idx_vacancy_external_aliases_external_id",
     "idx_vacancy_external_aliases_vacancy",
+    "idx_vacancy_employer_accounts_account",
+    "idx_vacancy_factors_vacancy",
 }
 
 STAGE_ALIASES = {
@@ -267,6 +313,49 @@ def clean_cell(value: str | None) -> str:
     value = value.replace("<br>", " ").replace("<br/>", " ").replace("<br />", " ")
     value = re.sub(r"\s+", " ", value)
     return value.strip()
+
+
+def canonical_source_stream(value: str | None) -> tuple[str, bool]:
+    """Return the current config-backed canonical key while preserving raw input."""
+
+    raw = clean_cell(value)
+    if not raw:
+        return "unknown", False
+    mapped = SOURCE_STREAM_ALIASES.get(raw.casefold())
+    return (mapped if mapped else raw), mapped is not None
+
+
+def normalized_account_name(value: str | None) -> str:
+    normalized = unicodedata.normalize("NFKC", clean_cell(value)).casefold()
+    return " ".join(normalized.split())
+
+
+def parse_iso_date(value: str, *, label: str) -> dt.date:
+    candidate = clean_cell(value)
+    try:
+        return dt.date.fromisoformat(candidate)
+    except ValueError as exc:
+        raise ValueError(f"{label} must be an ISO date (YYYY-MM-DD)") from exc
+
+
+def parse_iso_datetime(value: str, *, label: str) -> dt.datetime:
+    candidate = clean_cell(value)
+    if not candidate:
+        raise ValueError(f"{label} is required")
+    if candidate.endswith("Z"):
+        candidate = candidate[:-1] + "+00:00"
+    try:
+        parsed = dt.datetime.fromisoformat(candidate)
+    except ValueError:
+        try:
+            parsed = dt.datetime.combine(dt.date.fromisoformat(candidate), dt.time())
+        except ValueError as exc:
+            raise ValueError(
+                f"{label} must be an ISO date or timestamp"
+            ) from exc
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(dt.timezone.utc).replace(tzinfo=None)
+    return parsed
 
 
 def project_relative_file_path(path: Path) -> str:
@@ -472,6 +561,58 @@ def vacancy_external_alias_schema_issues(conn: sqlite3.Connection) -> list[str]:
     return issues
 
 
+def schema_v4_issues(conn: sqlite3.Connection) -> list[str]:
+    required_columns = {
+        "source_hits": {"source_stream", "canonical_source_stream"},
+        "employer_interactions": {
+            "vacancy_id",
+            "event_at",
+            "direction",
+            "event_type",
+            "channel",
+            "actor_type",
+            "is_human",
+            "evidence_note",
+            "dedupe_key",
+        },
+        "employer_accounts": {"canonical_name", "normalized_name", "updated_at"},
+        "employer_account_signals": {
+            "account_id",
+            "signal_type",
+            "observed_date",
+            "confidence",
+            "evidence_note",
+        },
+        "vacancy_employer_accounts": {"vacancy_id", "account_id", "link_method"},
+        "vacancy_factors": {
+            "vacancy_id",
+            "factor_key",
+            "factor_value",
+            "observed_date",
+            "evidence_note",
+            "confidence",
+        },
+    }
+    issues: list[str] = []
+    present_tables = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    for table, columns in required_columns.items():
+        if table not in present_tables:
+            issues.append(f"{table}: table missing")
+            continue
+        present_columns = {
+            str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        missing = columns - present_columns
+        if missing:
+            issues.append(f"{table}: missing {','.join(sorted(missing))}")
+    return issues
+
+
 def ensure_schema(conn: sqlite3.Connection) -> None:
     version = int(conn.execute("PRAGMA user_version").fetchone()[0])
     if version > SCHEMA_VERSION:
@@ -507,6 +648,11 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
                 "Database vacancy external alias schema is invalid: "
                 + "; ".join(alias_schema_issues)
             )
+        v4_issues = schema_v4_issues(conn)
+        if v4_issues:
+            raise RuntimeError(
+                "Database schema v4 contract is invalid: " + "; ".join(v4_issues)
+            )
 
 
 def reset_schema(conn: sqlite3.Connection) -> None:
@@ -516,6 +662,11 @@ def reset_schema(conn: sqlite3.Connection) -> None:
         DROP TABLE IF EXISTS followup_rounds;
         DROP TABLE IF EXISTS contact_searches;
         DROP TABLE IF EXISTS employer_contacts;
+        DROP TABLE IF EXISTS employer_account_signals;
+        DROP TABLE IF EXISTS vacancy_employer_accounts;
+        DROP TABLE IF EXISTS employer_accounts;
+        DROP TABLE IF EXISTS employer_interactions;
+        DROP TABLE IF EXISTS vacancy_factors;
         DROP TABLE IF EXISTS search_coverage;
         DROP TABLE IF EXISTS search_runs;
         DROP TABLE IF EXISTS source_hits;
@@ -559,6 +710,7 @@ def reset_schema(conn: sqlite3.Connection) -> None:
             seen_date TEXT,
             source_name TEXT,
             source_stream TEXT,
+            canonical_source_stream TEXT,
             raw_status TEXT,
             quick_score INTEGER,
             reason TEXT,
@@ -782,6 +934,90 @@ def reset_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX idx_outreach_messages_vacancy
             ON outreach_messages(vacancy_id, followup_round_id, channel);
 
+        CREATE TABLE employer_interactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            vacancy_id INTEGER NOT NULL,
+            event_at TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            channel TEXT NOT NULL,
+            actor_type TEXT NOT NULL,
+            is_human INTEGER NOT NULL,
+            evidence_note TEXT,
+            evidence_url TEXT,
+            external_reference TEXT,
+            dedupe_key TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (vacancy_id) REFERENCES vacancies(id) ON DELETE CASCADE,
+            CHECK(direction IN ('inbound', 'outbound')),
+            CHECK(is_human IN (0, 1))
+        );
+
+        CREATE INDEX idx_employer_interactions_vacancy
+            ON employer_interactions(vacancy_id, event_at, id);
+
+        CREATE TABLE employer_accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            canonical_name TEXT NOT NULL,
+            normalized_name TEXT NOT NULL UNIQUE,
+            website TEXT,
+            careers_url TEXT,
+            country_market TEXT,
+            priority TEXT,
+            status TEXT,
+            last_checked_date TEXT,
+            notes TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE employer_account_signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id INTEGER NOT NULL,
+            signal_type TEXT NOT NULL,
+            observed_date TEXT NOT NULL,
+            confidence TEXT NOT NULL,
+            evidence_url TEXT,
+            evidence_note TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (account_id) REFERENCES employer_accounts(id) ON DELETE CASCADE,
+            UNIQUE(account_id, signal_type, observed_date, evidence_url, evidence_note)
+        );
+
+        CREATE INDEX idx_employer_account_signals_account
+            ON employer_account_signals(account_id, observed_date, id);
+
+        CREATE TABLE vacancy_employer_accounts (
+            vacancy_id INTEGER PRIMARY KEY,
+            account_id INTEGER NOT NULL,
+            link_method TEXT NOT NULL,
+            evidence_note TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (vacancy_id) REFERENCES vacancies(id) ON DELETE CASCADE,
+            FOREIGN KEY (account_id) REFERENCES employer_accounts(id) ON DELETE RESTRICT
+        );
+
+        CREATE INDEX idx_vacancy_employer_accounts_account
+            ON vacancy_employer_accounts(account_id, vacancy_id);
+
+        CREATE TABLE vacancy_factors (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            vacancy_id INTEGER NOT NULL,
+            factor_key TEXT NOT NULL,
+            factor_value TEXT NOT NULL,
+            observed_date TEXT NOT NULL,
+            evidence_note TEXT NOT NULL,
+            evidence_url TEXT,
+            confidence TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (vacancy_id) REFERENCES vacancies(id) ON DELETE CASCADE,
+            UNIQUE(vacancy_id, factor_key, factor_value, observed_date, evidence_note)
+        );
+
+        CREATE INDEX idx_vacancy_factors_vacancy
+            ON vacancy_factors(vacancy_id, factor_key, observed_date, id);
+
         CREATE TABLE import_issues (
             id INTEGER PRIMARY KEY,
             origin_file TEXT,
@@ -796,6 +1032,11 @@ def reset_schema(conn: sqlite3.Connection) -> None:
 
 
 def ensure_auxiliary_schema(conn: sqlite3.Connection) -> None:
+    source_hit_columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(source_hits)").fetchall()
+    }
+    if "canonical_source_stream" not in source_hit_columns:
+        conn.execute("ALTER TABLE source_hits ADD COLUMN canonical_source_stream TEXT")
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS vacancy_fingerprints (
@@ -964,6 +1205,90 @@ def ensure_auxiliary_schema(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_outreach_messages_vacancy
             ON outreach_messages(vacancy_id, followup_round_id, channel);
+
+        CREATE TABLE IF NOT EXISTS employer_interactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            vacancy_id INTEGER NOT NULL,
+            event_at TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            channel TEXT NOT NULL,
+            actor_type TEXT NOT NULL,
+            is_human INTEGER NOT NULL,
+            evidence_note TEXT,
+            evidence_url TEXT,
+            external_reference TEXT,
+            dedupe_key TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (vacancy_id) REFERENCES vacancies(id) ON DELETE CASCADE,
+            CHECK(direction IN ('inbound', 'outbound')),
+            CHECK(is_human IN (0, 1))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_employer_interactions_vacancy
+            ON employer_interactions(vacancy_id, event_at, id);
+
+        CREATE TABLE IF NOT EXISTS employer_accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            canonical_name TEXT NOT NULL,
+            normalized_name TEXT NOT NULL UNIQUE,
+            website TEXT,
+            careers_url TEXT,
+            country_market TEXT,
+            priority TEXT,
+            status TEXT,
+            last_checked_date TEXT,
+            notes TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS employer_account_signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id INTEGER NOT NULL,
+            signal_type TEXT NOT NULL,
+            observed_date TEXT NOT NULL,
+            confidence TEXT NOT NULL,
+            evidence_url TEXT,
+            evidence_note TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (account_id) REFERENCES employer_accounts(id) ON DELETE CASCADE,
+            UNIQUE(account_id, signal_type, observed_date, evidence_url, evidence_note)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_employer_account_signals_account
+            ON employer_account_signals(account_id, observed_date, id);
+
+        CREATE TABLE IF NOT EXISTS vacancy_employer_accounts (
+            vacancy_id INTEGER PRIMARY KEY,
+            account_id INTEGER NOT NULL,
+            link_method TEXT NOT NULL,
+            evidence_note TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (vacancy_id) REFERENCES vacancies(id) ON DELETE CASCADE,
+            FOREIGN KEY (account_id) REFERENCES employer_accounts(id) ON DELETE RESTRICT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_vacancy_employer_accounts_account
+            ON vacancy_employer_accounts(account_id, vacancy_id);
+
+        CREATE TABLE IF NOT EXISTS vacancy_factors (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            vacancy_id INTEGER NOT NULL,
+            factor_key TEXT NOT NULL,
+            factor_value TEXT NOT NULL,
+            observed_date TEXT NOT NULL,
+            evidence_note TEXT NOT NULL,
+            evidence_url TEXT,
+            confidence TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (vacancy_id) REFERENCES vacancies(id) ON DELETE CASCADE,
+            UNIQUE(vacancy_id, factor_key, factor_value, observed_date, evidence_note)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_vacancy_factors_vacancy
+            ON vacancy_factors(vacancy_id, factor_key, observed_date, id);
         """
     )
     conn.commit()
@@ -1103,6 +1428,26 @@ def backfill_canonical_external_aliases(conn: sqlite3.Connection) -> int:
         if was_inserted:
             inserted += 1
     return inserted
+
+
+def backfill_canonical_source_streams(conn: sqlite3.Connection) -> int:
+    updated = 0
+    for row in conn.execute(
+        """
+        SELECT id, source_stream, canonical_source_stream
+        FROM source_hits
+        ORDER BY id
+        """
+    ).fetchall():
+        if clean_cell(row["canonical_source_stream"]):
+            continue
+        canonical, _ = canonical_source_stream(row["source_stream"])
+        conn.execute(
+            "UPDATE source_hits SET canonical_source_stream = ? WHERE id = ?",
+            (canonical, int(row["id"])),
+        )
+        updated += 1
+    return updated
 
 
 def upsert_vacancy(
@@ -1381,6 +1726,7 @@ def insert_source_hit_once(
     origin_file: str,
     line_no: int,
 ) -> None:
+    canonical_stream, _ = canonical_source_stream(source_stream)
     existing = conn.execute(
         """
         SELECT 1
@@ -1399,16 +1745,18 @@ def insert_source_hit_once(
     conn.execute(
         """
         INSERT INTO source_hits (
-            vacancy_id, seen_date, source_name, source_stream, raw_status,
+            vacancy_id, seen_date, source_name, source_stream,
+            canonical_source_stream, raw_status,
             quick_score, reason, next_action, origin_file, line_no
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             vacancy_id,
             seen_date,
             source_name,
             source_stream,
+            canonical_stream,
             raw_status,
             quick_score,
             reason,
@@ -1530,6 +1878,63 @@ def insert_application_once(
             line_no,
         ),
     )
+
+
+def insert_vacancy_factor_once(
+    conn: sqlite3.Connection,
+    *,
+    vacancy_id: int,
+    factor: dict[str, Any],
+    default_date: str,
+) -> bool:
+    factor_key = clean_cell(str(factor.get("factor_key") or factor.get("key") or "")).lower()
+    if not FACTOR_KEY_RE.fullmatch(factor_key):
+        raise ValueError(
+            "factor key must use lowercase snake_case (2-64 characters)"
+        )
+    raw_value = factor.get("value", factor.get("level"))
+    if raw_value is None or isinstance(raw_value, (dict, list)):
+        raise ValueError(f"factor {factor_key!r} requires a scalar value or level")
+    factor_value = clean_cell(str(raw_value))
+    if not factor_value:
+        raise ValueError(f"factor {factor_key!r} requires a non-empty value")
+    observed_date = clean_cell(
+        str(factor.get("observed_date") or factor.get("evaluation_date") or default_date)
+    )
+    parse_iso_date(observed_date, label=f"factor {factor_key} observed_date")
+    evidence_note = clean_cell(str(factor.get("evidence_note") or ""))
+    if not evidence_note:
+        raise ValueError(f"factor {factor_key!r} requires evidence_note")
+    evidence_url = normalize_url(str(factor.get("evidence_url") or ""))
+    if evidence_url and not safe_external_url(evidence_url):
+        raise ValueError(f"factor {factor_key!r} evidence_url must use http or https")
+    confidence = clean_cell(str(factor.get("confidence") or "")).lower()
+    if confidence not in EVIDENCE_CONFIDENCE:
+        raise ValueError(
+            f"factor {factor_key!r} confidence must be one of: "
+            + ", ".join(sorted(EVIDENCE_CONFIDENCE))
+        )
+    before = conn.total_changes
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO vacancy_factors (
+            vacancy_id, factor_key, factor_value, observed_date,
+            evidence_note, evidence_url, confidence, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            vacancy_id,
+            factor_key,
+            factor_value,
+            observed_date,
+            evidence_note,
+            evidence_url,
+            confidence,
+            now_iso(),
+        ),
+    )
+    return conn.total_changes > before
 
 
 def ingest_item(
@@ -1663,6 +2068,21 @@ def ingest_item(
             line_no=line_no,
         )
 
+    factors = item.get("factors", [])
+    if factors is None:
+        factors = []
+    if not isinstance(factors, list) or not all(
+        isinstance(factor, dict) for factor in factors
+    ):
+        raise ValueError("factors must be an array of objects")
+    for factor in factors:
+        insert_vacancy_factor_once(
+            conn,
+            vacancy_id=vacancy_id,
+            factor=factor,
+            default_date=date,
+        )
+
     insert_stage_event(
         conn,
         vacancy_id,
@@ -1678,6 +2098,348 @@ def ingest_item(
 
 def rows_to_dicts(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
     return [{key: row[key] for key in row.keys()} for row in rows]
+
+
+APPLICATION_STAGES = {
+    "applied",
+    "follow_up",
+    "interview_1",
+    "interview_2",
+    "interview_3",
+    "offer",
+    "rejected",
+}
+UNCONFIRMED_APPLICATION_MARKERS = (
+    "not_sent",
+    "not sent",
+    "не отправлен",
+    "draft",
+    "attempted",
+    "unconfirmed",
+    "failed",
+)
+
+
+def application_row_is_confirmed(row: sqlite3.Row) -> bool:
+    if canonical_stage(row["stage"]) not in APPLICATION_STAGES:
+        return False
+    status = clean_cell(row["status"]).casefold()
+    return not any(marker in status for marker in UNCONFIRMED_APPLICATION_MARKERS)
+
+
+def first_application_cohorts(
+    conn: sqlite3.Connection, as_of: dt.date
+) -> tuple[list[dict[str, Any]], int]:
+    first_by_vacancy: dict[int, dict[str, Any]] = {}
+    invalid_dates = 0
+    rows = conn.execute(
+        """
+        SELECT a.id, a.vacancy_id, a.applied_date, a.status, a.stage,
+               v.channel, v.company, v.title
+        FROM applications a
+        JOIN vacancies v ON v.id = a.vacancy_id
+        ORDER BY a.id
+        """
+    ).fetchall()
+    for row in rows:
+        if not application_row_is_confirmed(row):
+            continue
+        try:
+            applied_date = dt.date.fromisoformat(clean_cell(row["applied_date"])[:10])
+        except ValueError:
+            invalid_dates += 1
+            continue
+        if applied_date > as_of:
+            continue
+        vacancy_id = int(row["vacancy_id"])
+        candidate = {
+            "vacancy_id": vacancy_id,
+            "application_id": int(row["id"]),
+            "application_date": applied_date,
+            "source_channel": clean_cell(row["channel"]) or "unknown",
+            "company": row["company"] or "",
+            "title": row["title"] or "",
+        }
+        existing = first_by_vacancy.get(vacancy_id)
+        if existing is None or (
+            applied_date,
+            int(row["id"]),
+        ) < (
+            existing["application_date"],
+            existing["application_id"],
+        ):
+            first_by_vacancy[vacancy_id] = candidate
+
+    source_hits_by_vacancy: dict[int, list[sqlite3.Row]] = defaultdict(list)
+    for row in conn.execute(
+        """
+        SELECT id, vacancy_id, seen_date, source_stream, canonical_source_stream
+        FROM source_hits
+        ORDER BY COALESCE(seen_date, ''), id
+        """
+    ).fetchall():
+        source_hits_by_vacancy[int(row["vacancy_id"])].append(row)
+
+    for cohort in first_by_vacancy.values():
+        first_touch = None
+        for hit in source_hits_by_vacancy.get(cohort["vacancy_id"], []):
+            try:
+                hit_date = dt.date.fromisoformat(clean_cell(hit["seen_date"])[:10])
+            except ValueError:
+                continue
+            if hit_date <= cohort["application_date"]:
+                first_touch = hit
+                break
+        if first_touch is None:
+            cohort["source_stream"] = "unknown"
+        else:
+            cohort["source_stream"] = canonical_source_stream(
+                first_touch["source_stream"]
+            )[0]
+        cohort["application_month"] = cohort["application_date"].strftime("%Y-%m")
+        cohort["age_days"] = (as_of - cohort["application_date"]).days
+    return sorted(first_by_vacancy.values(), key=lambda row: row["vacancy_id"]), invalid_dates
+
+
+def aggregate_conversion_group(
+    rows: list[dict[str, Any]], *, interaction_history_available: bool
+) -> dict[str, Any]:
+    applications_unique = len(rows)
+    matured_14 = [row for row in rows if row["age_days"] >= 14]
+    matured_30 = [row for row in rows if row["age_days"] >= 30]
+    human_reply_rows = [row for row in matured_14 if row["first_human_reply_at"]]
+    interview_rows = [row for row in matured_30 if row["interview_1_ever"]]
+    reply_times = [
+        float(row["time_to_first_human_reply_days"])
+        for row in rows
+        if row["time_to_first_human_reply_days"] is not None
+    ]
+    verified_contacts = sum(1 for row in rows if row["verified_contact"])
+    contact_searches = sum(1 for row in rows if row["contact_search_completed"])
+
+    def percent(numerator: int, denominator: int) -> float | None:
+        return round(numerator / denominator * 100, 1) if denominator else None
+
+    return {
+        "applications_unique": applications_unique,
+        "matured_applications_14d": len(matured_14),
+        "human_replies": len(human_reply_rows)
+        if interaction_history_available
+        else None,
+        "human_reply_rate_14d": percent(len(human_reply_rows), len(matured_14))
+        if interaction_history_available
+        else None,
+        "matured_applications_30d": len(matured_30),
+        "interview_1_ever": len(interview_rows),
+        "interview_1_rate_30d": percent(len(interview_rows), len(matured_30)),
+        "first_human_reply_sample": len(reply_times),
+        "median_time_to_first_human_reply_days": round(statistics.median(reply_times), 2)
+        if reply_times
+        else None,
+        "average_time_to_first_human_reply_days": round(statistics.mean(reply_times), 2)
+        if reply_times
+        else None,
+        "verified_contacts": verified_contacts,
+        "verified_contact_coverage": percent(verified_contacts, applications_unique),
+        "contact_search_completed": contact_searches,
+        "contact_search_coverage": percent(contact_searches, applications_unique),
+    }
+
+
+def build_conversion_report_data(
+    conn: sqlite3.Connection, as_of: dt.date
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    cohorts, invalid_application_dates = first_application_cohorts(conn, as_of)
+    cohort_by_vacancy = {row["vacancy_id"]: row for row in cohorts}
+
+    interactions = conn.execute(
+        """
+        SELECT vacancy_id, event_at
+        FROM employer_interactions
+        WHERE direction = 'inbound' AND is_human = 1
+        ORDER BY event_at, id
+        """
+    ).fetchall()
+    interaction_history_available = bool(
+        conn.execute(
+            "SELECT 1 FROM employer_interactions WHERE event_at <= ? LIMIT 1",
+            (as_of.isoformat() + "T23:59:59",),
+        ).fetchone()
+    )
+    for row in cohorts:
+        row["first_human_reply_at"] = None
+        row["time_to_first_human_reply_days"] = None
+        row["interview_1_ever"] = False
+        row["verified_contact"] = False
+        row["contact_search_completed"] = False
+
+    for interaction in interactions:
+        cohort = cohort_by_vacancy.get(int(interaction["vacancy_id"]))
+        if not cohort or cohort["first_human_reply_at"]:
+            continue
+        try:
+            event_at = parse_iso_datetime(interaction["event_at"], label="event_at")
+        except ValueError:
+            continue
+        applied_at = dt.datetime.combine(cohort["application_date"], dt.time())
+        if applied_at <= event_at < dt.datetime.combine(
+            as_of + dt.timedelta(days=1), dt.time()
+        ):
+            cohort["first_human_reply_at"] = event_at.isoformat()
+            cohort["time_to_first_human_reply_days"] = (
+                event_at - applied_at
+            ).total_seconds() / 86400
+
+    for row in conn.execute(
+        """
+        SELECT DISTINCT vacancy_id
+        FROM stage_events
+        WHERE stage = 'interview_1'
+          AND TRIM(COALESCE(note, '')) != ''
+          AND COALESCE(event_date, '') <= ?
+        """,
+        (as_of.isoformat(),),
+    ).fetchall():
+        cohort = cohort_by_vacancy.get(int(row["vacancy_id"]))
+        if cohort:
+            cohort["interview_1_ever"] = True
+
+    for row in conn.execute(
+        """
+        SELECT DISTINCT vacancy_id
+        FROM employer_contacts
+        WHERE is_active = 1
+          AND confidence IN ('confirmed', 'strong')
+          AND (COALESCE(verified_date, '') = '' OR verified_date <= ?)
+        """,
+        (as_of.isoformat(),),
+    ).fetchall():
+        cohort = cohort_by_vacancy.get(int(row["vacancy_id"]))
+        if cohort:
+            cohort["verified_contact"] = True
+
+    for row in conn.execute(
+        """
+        SELECT DISTINCT vacancy_id
+        FROM contact_searches
+        WHERE search_date <= ?
+        """,
+        (as_of.isoformat(),),
+    ).fetchall():
+        cohort = cohort_by_vacancy.get(int(row["vacancy_id"]))
+        if cohort:
+            cohort["contact_search_completed"] = True
+
+    overall = aggregate_conversion_group(
+        cohorts, interaction_history_available=interaction_history_available
+    )
+    breakdowns: dict[str, list[dict[str, Any]]] = {}
+    for grouping in ("source_channel", "source_stream", "application_month"):
+        grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for row in cohorts:
+            grouped[str(row[grouping] or "unknown")].append(row)
+        breakdowns[grouping] = [
+            {
+                grouping: key,
+                **aggregate_conversion_group(
+                    grouped[key],
+                    interaction_history_available=interaction_history_available,
+                ),
+            }
+            for key in sorted(grouped)
+        ]
+
+    caveats = [
+        "One cohort member is the earliest confirmed application row per unique vacancy.",
+        "Canonical stream attribution is the earliest source hit on or before the first application date; ties use source_hits.id.",
+        "Human replies are inbound interactions marked human after the application date; automated acknowledgments are excluded.",
+        "Interview conversion requires an interview_1 stage event with a non-empty evidence note.",
+    ]
+    if not interaction_history_available:
+        caveats.append(
+            "No employer interaction history is recorded, so reply counts and rates are n/a rather than zero."
+        )
+    else:
+        caveats.append(
+            "Reply metrics reflect recorded interactions only; the engine does not reconstruct historical replies from status text."
+        )
+    if invalid_application_dates:
+        caveats.append(
+            f"Excluded {invalid_application_dates} application row(s) with invalid dates."
+        )
+    return (
+        {
+            "as_of": as_of.isoformat(),
+            "interaction_history_available": interaction_history_available,
+            "methodology": {
+                "grain": "one unique vacancy with its earliest confirmed application",
+                "reply_maturity_days": 14,
+                "interview_maturity_days": 30,
+                "stream_attribution": "earliest source hit on or before application date; source_hits.id breaks ties; unknown when absent",
+            },
+            "overall": overall,
+            "breakdowns": breakdowns,
+            "caveats": caveats,
+        },
+        cohorts,
+    )
+
+
+def build_source_quality_data(
+    conn: sqlite3.Connection,
+    conversion_report: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    screening: dict[str, dict[str, set[int]]] = defaultdict(
+        lambda: {"seen": set(), "signals": set()}
+    )
+    raw_streams: dict[str, dict[str, Any]] = {}
+    signal_statuses = {"POTENTIAL", "NEEDS_REVIEW", "SHORTLISTED", "APPLIED"}
+    for row in conn.execute(
+        """
+        SELECT vacancy_id, source_stream, raw_status
+        FROM source_hits
+        ORDER BY id
+        """
+    ).fetchall():
+        raw = clean_cell(row["source_stream"]) or "unknown"
+        canonical, mapped = canonical_source_stream(raw)
+        vacancy_id = int(row["vacancy_id"])
+        screening[canonical]["seen"].add(vacancy_id)
+        if clean_cell(row["raw_status"]).upper() in signal_statuses:
+            screening[canonical]["signals"].add(vacancy_id)
+        diagnostic = raw_streams.setdefault(
+            raw,
+            {"raw_stream": raw, "canonical_stream": canonical, "mapped": mapped, "hits": 0},
+        )
+        diagnostic["hits"] += 1
+
+    downstream = {
+        row["source_stream"]: row
+        for row in conversion_report["breakdowns"]["source_stream"]
+    }
+    keys = sorted(set(screening) | set(downstream))
+    result: list[dict[str, Any]] = []
+    for key in keys:
+        seen = len(screening[key]["seen"])
+        signals = len(screening[key]["signals"])
+        outcomes = downstream.get(key, {})
+        result.append(
+            {
+                "canonical_source_stream": key,
+                "seen": seen,
+                "signals": signals,
+                "signal_rate": round(signals / seen * 100, 1) if seen else None,
+                "applied": outcomes.get("applications_unique", 0),
+                "matured_for_reply": outcomes.get("matured_applications_14d", 0),
+                "human_replies": outcomes.get("human_replies"),
+                "human_reply_rate": outcomes.get("human_reply_rate_14d"),
+                "matured_for_interview": outcomes.get("matured_applications_30d", 0),
+                "interview_1": outcomes.get("interview_1_ever", 0),
+                "interview_rate": outcomes.get("interview_1_rate_30d"),
+            }
+        )
+    diagnostics = sorted(raw_streams.values(), key=lambda row: (row["canonical_stream"], row["raw_stream"]))
+    return result, diagnostics
 
 
 def build_snapshot(
@@ -1943,20 +2705,62 @@ def build_snapshot(
         if v["latest_stage"] in {"needs_input", "follow_up"}
     ]
 
-    best_sources = rows_to_dicts(
+    conversion_report, _ = build_conversion_report_data(conn, dt.date.today())
+    source_quality, source_stream_diagnostics = build_source_quality_data(
+        conn, conversion_report
+    )
+
+    vacancy_factors = rows_to_dicts(
         conn.execute(
             """
-            SELECT source_stream, COUNT(*) AS seen,
-                   SUM(CASE WHEN raw_status IN ('POTENTIAL', 'NEEDS_REVIEW', 'SHORTLISTED', 'APPLIED') THEN 1 ELSE 0 END) AS signal
-            FROM source_hits
-            GROUP BY source_stream
-            ORDER BY signal DESC, seen DESC
-            LIMIT 40
+            SELECT f.*, v.company, v.title, v.url
+            FROM vacancy_factors f
+            JOIN vacancies v ON v.id = f.vacancy_id
+            ORDER BY f.observed_date DESC, f.id DESC
             """
         ).fetchall()
     )
+    factors_by_vacancy: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for factor in vacancy_factors:
+        factors_by_vacancy[int(factor["vacancy_id"])].append(factor)
+    for vacancy in vacancies:
+        vacancy["factors"] = factors_by_vacancy.get(int(vacancy["id"]), [])
+
+    account_signals = rows_to_dicts(
+        conn.execute(
+            """
+            SELECT *
+            FROM employer_account_signals
+            ORDER BY observed_date DESC, id DESC
+            """
+        ).fetchall()
+    )
+    signals_by_account: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for signal in account_signals:
+        signals_by_account[int(signal["account_id"])].append(signal)
+    employer_accounts = rows_to_dicts(
+        conn.execute(
+            """
+            SELECT a.*,
+                   COUNT(l.vacancy_id) AS linked_vacancies,
+                   SUM(CASE WHEN l.vacancy_id IS NOT NULL
+                                  AND COALESCE(v.latest_stage, 'seen') != 'rejected'
+                            THEN 1 ELSE 0 END) AS active_target_vacancies
+            FROM employer_accounts a
+            LEFT JOIN vacancy_employer_accounts l ON l.account_id = a.id
+            LEFT JOIN vacancies v ON v.id = l.vacancy_id
+            GROUP BY a.id
+            ORDER BY COALESCE(a.priority, ''), a.canonical_name
+            """
+        ).fetchall()
+    )
+    for account in employer_accounts:
+        signals = signals_by_account.get(int(account["id"]), [])
+        account["latest_signal"] = signals[0] if signals else None
+        account["signals"] = signals
 
     issue_count = conn.execute("SELECT COUNT(*) AS n FROM import_issues").fetchone()["n"]
+    conversion_overall = conversion_report["overall"]
 
     return {
         "generated_at": now_iso(),
@@ -1972,6 +2776,24 @@ def build_snapshot(
                 1 for contact in employer_contacts if int(contact.get("is_active") or 0)
             ),
             "applied": len(applied_ids),
+            "applications_unique": conversion_overall["applications_unique"],
+            "matured_applications_14d": conversion_overall[
+                "matured_applications_14d"
+            ],
+            "human_replies": conversion_overall["human_replies"],
+            "human_reply_rate_14d": conversion_overall["human_reply_rate_14d"],
+            "interview_1_rate_30d": conversion_overall[
+                "interview_1_rate_30d"
+            ],
+            "verified_contact_coverage": conversion_overall[
+                "verified_contact_coverage"
+            ],
+            "employer_accounts": len(employer_accounts),
+            "employer_account_signals": len(account_signals),
+            "active_account_targets": sum(
+                int(account.get("active_target_vacancies") or 0)
+                for account in employer_accounts
+            ),
             "interviews": sum(1 for v in vacancies if v["latest_stage"] in {"interview_1", "interview_2", "interview_3"}),
             "offers": stage_counts["offer"],
             "rejected": stage_counts["rejected"],
@@ -1986,7 +2808,13 @@ def build_snapshot(
         "followups": followups,
         "needs_user": needs_input,
         "needs_action": needs_action,
-        "best_sources": best_sources,
+        "best_sources": source_quality,
+        "source_quality": source_quality,
+        "source_stream_diagnostics": source_stream_diagnostics,
+        "conversion_report": conversion_report,
+        "employer_accounts": employer_accounts,
+        "account_signals": account_signals,
+        "vacancy_factors": vacancy_factors,
         "interview_summaries": interview_summaries,
         "employer_contacts": employer_contacts,
         "vacancies": vacancies,
@@ -1995,7 +2823,14 @@ def build_snapshot(
 
 def md_escape(value: Any) -> str:
     text = "" if value is None else str(value)
-    return text.replace("|", "\\|").replace("\n", " ").strip()
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("|", "\\|")
+        .replace("\n", " ")
+        .strip()
+    )
 
 
 def safe_external_url(value: str) -> str:
@@ -2187,18 +3022,295 @@ def generate_views(
         "Verified recruiter and hiring-manager contacts. Only confirmed/strong active contacts may be messaged automatically.",
     )
 
+    def pct_label(value: Any) -> str:
+        return "n/a" if value is None else f"{float(value):.1f}%"
+
+    def ratio_label(numerator: Any, denominator: Any, rate: Any) -> str:
+        if numerator is None or rate is None:
+            return "n/a"
+        return f"{int(numerator)}/{int(denominator or 0)} ({pct_label(rate)})"
+
     sources_rows = []
-    for item in snapshot["best_sources"]:
-        seen = int(item.get("seen") or 0)
-        signal = int(item.get("signal") or 0)
-        rate = f"{(signal / seen * 100):.1f}%" if seen else "0.0%"
-        sources_rows.append([item.get("source_stream") or "", seen, signal, rate])
+    for item in snapshot["source_quality"]:
+        sources_rows.append(
+            [
+                item.get("canonical_source_stream") or "unknown",
+                item.get("seen") or 0,
+                item.get("signals") or 0,
+                pct_label(item.get("signal_rate")),
+                item.get("applied") or 0,
+                item.get("matured_for_reply") or 0,
+                item.get("human_replies")
+                if item.get("human_replies") is not None
+                else "n/a",
+                ratio_label(
+                    item.get("human_replies"),
+                    item.get("matured_for_reply"),
+                    item.get("human_reply_rate"),
+                ),
+                item.get("matured_for_interview") or 0,
+                item.get("interview_1") or 0,
+                ratio_label(
+                    item.get("interview_1"),
+                    item.get("matured_for_interview"),
+                    item.get("interview_rate"),
+                ),
+            ]
+        )
     write_markdown_table(
         REPORTS_DIR / "source_quality.md",
         "Source Quality",
-        ["source_stream", "seen", "signals", "signal_rate"],
+        [
+            "canonical_source_stream",
+            "seen",
+            "signals",
+            "signal_rate",
+            "applied",
+            "matured_reply_14d",
+            "human_replies",
+            "human_reply_rate",
+            "matured_interview_30d",
+            "interview_1",
+            "interview_rate",
+        ],
         sources_rows,
-        "Signal means POTENTIAL, NEEDS_REVIEW, SHORTLISTED, or APPLIED in screening rows.",
+        (
+            "Seen/signals use unique vacancy-stream pairs. Downstream outcomes use "
+            "first-touch canonical stream attribution at vacancy-level. Signal means "
+            "POTENTIAL, NEEDS_REVIEW, SHORTLISTED, or APPLIED. Small samples are shown "
+            "with numerator and denominator and are not evidence that a stream is best."
+        ),
+    )
+
+    stream_rows = [
+        [
+            item.get("raw_stream") or "unknown",
+            item.get("canonical_stream") or "unknown",
+            "mapped" if item.get("mapped") else "unmapped/identity",
+            item.get("hits") or 0,
+        ]
+        for item in snapshot["source_stream_diagnostics"]
+    ]
+    write_markdown_table(
+        REPORTS_DIR / "source_streams.md",
+        "Source Stream Canonicalization",
+        ["raw_source_stream", "canonical_key", "mapping_state", "hits"],
+        stream_rows,
+        (
+            "Raw values remain stored in source_hits.source_stream. Current local "
+            "source_stream_aliases are applied at report time; unmapped values retain "
+            "their raw key."
+        ),
+    )
+
+    conversion = snapshot["conversion_report"]
+    overall = conversion["overall"]
+    conversion_lines = [
+        "# Application Conversion Cohorts",
+        "",
+        f"As of: {md_escape(conversion['as_of'])}.",
+        "",
+        "## Methodology",
+        "",
+    ]
+    conversion_lines.extend(f"- {md_escape(item)}" for item in conversion["caveats"])
+    conversion_lines.extend(
+        [
+            "",
+            "## Overall",
+            "",
+            "| KPI | value |",
+            "|---|---|",
+            f"| applications_unique | {overall['applications_unique']} |",
+            f"| matured_applications_14d | {overall['matured_applications_14d']} |",
+            "| human_replies | "
+            + (
+                "n/a |"
+                if overall["human_replies"] is None
+                else f"{overall['human_replies']} |"
+            ),
+            "| human_reply_rate_14d | "
+            + ratio_label(
+                overall["human_replies"],
+                overall["matured_applications_14d"],
+                overall["human_reply_rate_14d"],
+            )
+            + " |",
+            f"| matured_applications_30d | {overall['matured_applications_30d']} |",
+            f"| interview_1_ever | {overall['interview_1_ever']} |",
+            "| interview_1_rate_30d | "
+            + ratio_label(
+                overall["interview_1_ever"],
+                overall["matured_applications_30d"],
+                overall["interview_1_rate_30d"],
+            )
+            + " |",
+            "| median_time_to_first_human_reply_days | "
+            + (
+                "n/a"
+                if overall["median_time_to_first_human_reply_days"] is None
+                else str(overall["median_time_to_first_human_reply_days"])
+            )
+            + " |",
+            "| average_time_to_first_human_reply_days | "
+            + (
+                "n/a"
+                if overall["average_time_to_first_human_reply_days"] is None
+                else str(overall["average_time_to_first_human_reply_days"])
+            )
+            + " |",
+            "| verified_contact_coverage | "
+            + ratio_label(
+                overall["verified_contacts"],
+                overall["applications_unique"],
+                overall["verified_contact_coverage"],
+            )
+            + " |",
+            "| contact_search_coverage | "
+            + ratio_label(
+                overall["contact_search_completed"],
+                overall["applications_unique"],
+                overall["contact_search_coverage"],
+            )
+            + " |",
+            "",
+        ]
+    )
+    for grouping, title in (
+        ("source_channel", "Source channel"),
+        ("source_stream", "Canonical source stream"),
+        ("application_month", "Application month"),
+    ):
+        conversion_lines.extend(
+            [
+                f"## {title}",
+                "",
+                "| key | applied | reply 14d | interview 30d | verified contact | contact search |",
+                "|---|---|---|---|---|---|",
+            ]
+        )
+        for row in conversion["breakdowns"][grouping]:
+            conversion_lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        md_escape(row[grouping]),
+                        str(row["applications_unique"]),
+                        ratio_label(
+                            row["human_replies"],
+                            row["matured_applications_14d"],
+                            row["human_reply_rate_14d"],
+                        ),
+                        ratio_label(
+                            row["interview_1_ever"],
+                            row["matured_applications_30d"],
+                            row["interview_1_rate_30d"],
+                        ),
+                        ratio_label(
+                            row["verified_contacts"],
+                            row["applications_unique"],
+                            row["verified_contact_coverage"],
+                        ),
+                        ratio_label(
+                            row["contact_search_completed"],
+                            row["applications_unique"],
+                            row["contact_search_coverage"],
+                        ),
+                    ]
+                )
+                + " |"
+            )
+        conversion_lines.append("")
+    (REPORTS_DIR / "conversion_cohorts.md").write_text(
+        "\n".join(conversion_lines), encoding="utf-8"
+    )
+
+    account_rows = []
+    for account in snapshot["employer_accounts"]:
+        latest = account.get("latest_signal") or {}
+        latest_signal = ""
+        if latest:
+            signal_label = " · ".join(
+                part
+                for part in (
+                    latest.get("observed_date") or "",
+                    latest.get("signal_type") or "",
+                    latest.get("confidence") or "",
+                    latest.get("evidence_note") or "",
+                )
+                if part
+            )
+            latest_signal = md_link(signal_label, latest.get("evidence_url") or "")
+        account_rows.append(
+            [
+                account.get("id") or "",
+                account.get("canonical_name") or "",
+                account.get("priority") or "",
+                account.get("status") or "",
+                md_link("website", account.get("website") or ""),
+                md_link("careers", account.get("careers_url") or ""),
+                account.get("country_market") or "",
+                account.get("linked_vacancies") or 0,
+                account.get("active_target_vacancies") or 0,
+                latest_signal,
+                account.get("last_checked_date") or "",
+                account.get("notes") or "",
+            ]
+        )
+    write_markdown_table(
+        VIEWS_DIR / "employer_accounts.md",
+        "Employer Account Radar",
+        [
+            "account_id",
+            "account",
+            "priority",
+            "status",
+            "website",
+            "careers",
+            "market",
+            "linked_vacancies",
+            "active_targets",
+            "latest_evidence_signal",
+            "last_checked",
+            "notes",
+        ],
+        account_rows,
+        "Accounts and evidence-backed employer signals are separate from candidate fit and vacancy score.",
+    )
+
+    factor_rows = []
+    for factor in snapshot["vacancy_factors"]:
+        evidence = md_link(
+            factor.get("evidence_note") or "evidence",
+            factor.get("evidence_url") or "",
+        )
+        factor_rows.append(
+            [
+                factor.get("vacancy_id") or "",
+                factor.get("company") or "",
+                md_link(factor.get("title") or "", factor.get("url") or ""),
+                factor.get("factor_key") or "",
+                factor.get("factor_value") or "",
+                factor.get("observed_date") or "",
+                factor.get("confidence") or "",
+                evidence,
+            ]
+        )
+    write_markdown_table(
+        VIEWS_DIR / "vacancy_factors.md",
+        "Vacancy Evidence Factors",
+        [
+            "vacancy_id",
+            "company",
+            "vacancy",
+            "factor",
+            "value",
+            "observed_date",
+            "confidence",
+            "evidence",
+        ],
+        factor_rows,
+        "Factors are evidence records only and never change the candidate-relative score automatically.",
     )
 
     coverage_rows: list[list[Any]] = []
@@ -2773,6 +3885,13 @@ def render_dashboard(snapshot: dict[str, Any]) -> str:
   </header>
   <main>
     <div class="kpis" id="kpis"></div>
+    <div id="conversionCaveat" class="note" style="margin: -4px 0 14px;"></div>
+    <section>
+      <div class="panel">
+        <h2>Employer Account Radar</h2>
+        <div id="accountSummary"></div>
+      </div>
+    </section>
     <div class="tabs">
       <button data-tab="review" class="active">Review Inbox</button>
       <button data-tab="funnel">Funnel</button>
@@ -2974,6 +4093,7 @@ def render_dashboard(snapshot: dict[str, Any]) -> str:
     }}
 
     function renderKpis() {{
+      const percentMetric = value => value === null || value === undefined ? 'n/a' : `${{Number(value).toFixed(1)}}%`;
       const items = [
         ['Vacancies', DATA.kpis.vacancies],
         ['Channels', DATA.kpis.channels],
@@ -2982,11 +4102,39 @@ def render_dashboard(snapshot: dict[str, Any]) -> str:
         ['Follow-ups', DATA.kpis.followups],
         ['Direct contacts', DATA.kpis.direct_contacts],
         ['Applied', DATA.kpis.applied],
+        ['Matured 14d', DATA.kpis.matured_applications_14d],
+        ['Human replies', DATA.kpis.human_replies === null ? 'n/a' : DATA.kpis.human_replies],
+        ['Human reply rate', percentMetric(DATA.kpis.human_reply_rate_14d)],
+        ['Interview conversion', percentMetric(DATA.kpis.interview_1_rate_30d)],
+        ['Verified contact coverage', percentMetric(DATA.kpis.verified_contact_coverage)],
+        ['Employer accounts', DATA.kpis.employer_accounts],
+        ['Active account targets', DATA.kpis.active_account_targets],
         ['Rejected', DATA.kpis.rejected],
       ];
       $('kpis').innerHTML = items.map(([label, value]) => `
         <div class="kpi"><div class="label">${{esc(label)}}</div><div class="value">${{esc(value)}}</div></div>
       `).join('');
+      $('conversionCaveat').textContent = DATA.conversion_report.interaction_history_available
+        ? 'Reply metrics use recorded employer interactions only; no replies are inferred from status text.'
+        : 'Historical employer interactions are absent. Human reply counts and rates are n/a, not zero.';
+    }}
+
+    function renderAccountSummary() {{
+      const rows = DATA.employer_accounts || [];
+      const headers = ['Account','Priority','Status','Latest evidence signal','Linked','Active targets','Last checked'];
+      $('accountSummary').innerHTML = table(headers, rows, account => {{
+        const signal = account.latest_signal || {{}};
+        const signalText = [signal.observed_date, signal.signal_type, signal.confidence, signal.evidence_note].filter(Boolean).join(' · ');
+        return `<tr>
+          ${{cell(headers[0], link(account.canonical_name, account.website || account.careers_url))}}
+          ${{cell(headers[1], esc(account.priority || ''))}}
+          ${{cell(headers[2], esc(account.status || ''))}}
+          ${{cell(headers[3], signal.evidence_url ? link(signalText, signal.evidence_url) : esc(signalText), 'detail-cell')}}
+          ${{cell(headers[4], esc(account.linked_vacancies || 0))}}
+          ${{cell(headers[5], esc(account.active_target_vacancies || 0))}}
+          ${{cell(headers[6], esc(account.last_checked_date || ''))}}
+        </tr>`;
+      }}, {{ limit: 20 }});
     }}
 
     function renderFilters() {{
@@ -3187,6 +4335,7 @@ def render_dashboard(snapshot: dict[str, Any]) -> str:
     $('generated').textContent = DATA.generated_at;
     $('dbPath').textContent = DATA.db_path;
     renderKpis();
+    renderAccountSummary();
     renderFilters();
     renderTab();
     bindPicker('channel');
@@ -3293,7 +4442,7 @@ def migrate_schema(args: argparse.Namespace) -> None:
         raise FileNotFoundError(f"Database not found: {args.db}")
     with sqlite3.connect(args.db) as probe:
         current_version = int(probe.execute("PRAGMA user_version").fetchone()[0])
-    if current_version not in {1, 2, SCHEMA_VERSION}:
+    if current_version not in {1, 2, 3, SCHEMA_VERSION}:
         raise RuntimeError(
             f"Unsupported migration path: {current_version} -> {SCHEMA_VERSION}"
         )
@@ -3308,6 +4457,7 @@ def migrate_schema(args: argparse.Namespace) -> None:
     with connect_db(args.db) as conn:
         ensure_auxiliary_schema(conn)
         backfilled_aliases = backfill_canonical_external_aliases(conn)
+        backfilled_source_streams = backfill_canonical_source_streams(conn)
         if current_version < SCHEMA_VERSION:
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         conn.commit()
@@ -3318,6 +4468,7 @@ def migrate_schema(args: argparse.Namespace) -> None:
         "to_version": SCHEMA_VERSION,
         "backup": db_label(backup_path) if backup_path else "",
         "backfilled_aliases": backfilled_aliases,
+        "backfilled_source_streams": backfilled_source_streams,
         "already_current": current_version == SCHEMA_VERSION,
         "kpis": snapshot["kpis"],
     }
@@ -3331,6 +4482,7 @@ def migrate_schema(args: argparse.Namespace) -> None:
         if backup_path:
             print(f"  backup: {db_label(backup_path)}")
         print(f"  canonical aliases backfilled: {backfilled_aliases}")
+        print(f"  canonical source streams backfilled: {backfilled_source_streams}")
 
 
 def build_coverage_plan_command(args: argparse.Namespace) -> None:
@@ -3822,6 +4974,363 @@ def resolve_vacancy_row(
     if not row and required:
         raise SystemExit("Vacancy not found")
     return row
+
+
+def validate_optional_external_url(value: str, *, label: str) -> str:
+    normalized = normalize_url(value)
+    if normalized and not safe_external_url(normalized):
+        raise SystemExit(f"{label} must use http or https")
+    return normalized
+
+
+def record_employer_interaction(args: argparse.Namespace) -> None:
+    evidence_note = clean_cell(args.evidence_note)
+    if args.direction == "inbound" and not evidence_note:
+        raise SystemExit("Inbound employer interactions require --evidence-note")
+    is_human = args.humanity == "human"
+    if args.event_type == "automated_ack" and is_human:
+        raise SystemExit("automated_ack must use --humanity automated")
+    if args.event_type == "human_reply" and not is_human:
+        raise SystemExit("human_reply must use --humanity human")
+    if args.actor_type == "system" and is_human:
+        raise SystemExit("actor type system cannot be marked human")
+    parsed_at = parse_iso_datetime(args.at or now_iso(), label="--at")
+    event_at = parsed_at.isoformat()
+    evidence_url = validate_optional_external_url(
+        args.evidence_url, label="--evidence-url"
+    )
+    external_reference = clean_cell(args.external_reference)
+
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        vacancy = resolve_vacancy_row(conn, args)
+        vacancy_id = int(vacancy["id"])
+        if external_reference:
+            dedupe_material = {
+                "vacancy_id": vacancy_id,
+                "direction": args.direction,
+                "channel": clean_cell(args.channel).casefold(),
+                "external_reference": external_reference,
+            }
+        else:
+            dedupe_material = {
+                "vacancy_id": vacancy_id,
+                "event_at": event_at,
+                "direction": args.direction,
+                "event_type": args.event_type,
+                "channel": clean_cell(args.channel).casefold(),
+                "actor_type": args.actor_type,
+                "is_human": is_human,
+                "evidence_note": evidence_note,
+                "evidence_url": evidence_url,
+            }
+        dedupe_key = hashlib.sha256(
+            json.dumps(dedupe_material, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+        before = conn.total_changes
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO employer_interactions (
+                vacancy_id, event_at, direction, event_type, channel,
+                actor_type, is_human, evidence_note, evidence_url,
+                external_reference, dedupe_key, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                vacancy_id,
+                event_at,
+                args.direction,
+                args.event_type,
+                clean_cell(args.channel),
+                args.actor_type,
+                1 if is_human else 0,
+                evidence_note,
+                evidence_url,
+                external_reference,
+                dedupe_key,
+                now_iso(),
+            ),
+        )
+        created = conn.total_changes > before
+        row = conn.execute(
+            "SELECT id FROM employer_interactions WHERE dedupe_key = ?",
+            (dedupe_key,),
+        ).fetchone()
+        interaction_id = int(row["id"])
+        conn.commit()
+    render_outputs(args.db)
+    result = {
+        "interaction_id": interaction_id,
+        "vacancy_id": vacancy_id,
+        "created": created,
+        "stage_changed": False,
+    }
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        state = "Recorded" if created else "Kept existing duplicate"
+        print(f"{state} employer interaction {interaction_id} for vacancy {vacancy_id}")
+
+
+def conversion_report_command(args: argparse.Namespace) -> None:
+    as_of = parse_iso_date(
+        args.as_of or dt.date.today().isoformat(), label="--as-of"
+    )
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        report, _ = build_conversion_report_data(conn, as_of)
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return
+    overall = report["overall"]
+    print(f"Application conversion as of {report['as_of']}")
+    print(f"  unique applications: {overall['applications_unique']}")
+    print(f"  matured 14d: {overall['matured_applications_14d']}")
+    print(f"  human replies: {overall['human_replies'] if overall['human_replies'] is not None else 'n/a'}")
+    print(f"  matured 30d: {overall['matured_applications_30d']}")
+    print(f"  interview_1: {overall['interview_1_ever']}")
+
+
+def resolve_employer_account(
+    conn: sqlite3.Connection,
+    *,
+    account_id: int | None,
+    account_name: str,
+) -> sqlite3.Row:
+    if account_id is not None:
+        row = conn.execute(
+            "SELECT * FROM employer_accounts WHERE id = ?", (account_id,)
+        ).fetchone()
+        if not row:
+            raise SystemExit(f"Employer account id {account_id} not found")
+        return row
+    normalized = normalized_account_name(account_name)
+    if not normalized:
+        raise SystemExit("Use --account-id or --account-name")
+    row = conn.execute(
+        "SELECT * FROM employer_accounts WHERE normalized_name = ?", (normalized,)
+    ).fetchone()
+    if not row:
+        raise SystemExit(f"Employer account {account_name!r} not found by exact normalized name")
+    return row
+
+
+def upsert_employer_account(args: argparse.Namespace) -> None:
+    canonical_name = clean_cell(args.canonical_name)
+    if not canonical_name:
+        raise SystemExit("--canonical-name is required")
+    normalized_name = normalized_account_name(canonical_name)
+    website = validate_optional_external_url(args.website or "", label="--website")
+    careers_url = validate_optional_external_url(
+        args.careers_url or "", label="--careers-url"
+    )
+    if args.last_checked_date:
+        parse_iso_date(args.last_checked_date, label="--last-checked-date")
+    now = now_iso()
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        row = None
+        if args.account_id is not None:
+            row = conn.execute(
+                "SELECT * FROM employer_accounts WHERE id = ?", (args.account_id,)
+            ).fetchone()
+            if not row:
+                raise SystemExit(f"Employer account id {args.account_id} not found")
+            conflict = conn.execute(
+                "SELECT id FROM employer_accounts WHERE normalized_name = ? AND id != ?",
+                (normalized_name, args.account_id),
+            ).fetchone()
+            if conflict:
+                raise SystemExit("Another employer account already has that exact normalized name")
+        else:
+            row = conn.execute(
+                "SELECT * FROM employer_accounts WHERE normalized_name = ?",
+                (normalized_name,),
+            ).fetchone()
+        created = row is None
+        if created:
+            cur = conn.execute(
+                """
+                INSERT INTO employer_accounts (
+                    canonical_name, normalized_name, website, careers_url,
+                    country_market, priority, status, last_checked_date,
+                    notes, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    canonical_name,
+                    normalized_name,
+                    website,
+                    careers_url,
+                    clean_cell(args.country_market or ""),
+                    clean_cell(args.priority or ""),
+                    clean_cell(args.account_status or ""),
+                    clean_cell(args.last_checked_date or ""),
+                    clean_cell(args.notes or ""),
+                    now,
+                    now,
+                ),
+            )
+            account_id = int(cur.lastrowid)
+        else:
+            account_id = int(row["id"])
+
+            def selected(column: str, value: str | None) -> str:
+                return clean_cell(value) if value is not None else clean_cell(row[column])
+
+            conn.execute(
+                """
+                UPDATE employer_accounts
+                SET canonical_name = ?, normalized_name = ?, website = ?,
+                    careers_url = ?, country_market = ?, priority = ?, status = ?,
+                    last_checked_date = ?, notes = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    canonical_name,
+                    normalized_name,
+                    website if args.website is not None else row["website"],
+                    careers_url if args.careers_url is not None else row["careers_url"],
+                    selected("country_market", args.country_market),
+                    selected("priority", args.priority),
+                    selected("status", args.account_status),
+                    selected("last_checked_date", args.last_checked_date),
+                    selected("notes", args.notes),
+                    now,
+                    account_id,
+                ),
+            )
+        conn.commit()
+    render_outputs(args.db)
+    result = {"account_id": account_id, "created": created, "canonical_name": canonical_name}
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print(f"{'Created' if created else 'Updated'} employer account {account_id}: {canonical_name}")
+
+
+def record_employer_signal(args: argparse.Namespace) -> None:
+    evidence_note = clean_cell(args.evidence_note)
+    if not evidence_note:
+        raise SystemExit("--evidence-note is required")
+    observed_date = args.observed_date or dt.date.today().isoformat()
+    parse_iso_date(observed_date, label="--observed-date")
+    evidence_url = validate_optional_external_url(
+        args.evidence_url, label="--evidence-url"
+    )
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        account = resolve_employer_account(
+            conn, account_id=args.account_id, account_name=args.account_name
+        )
+        account_id = int(account["id"])
+        before = conn.total_changes
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO employer_account_signals (
+                account_id, signal_type, observed_date, confidence,
+                evidence_url, evidence_note, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                account_id,
+                args.signal_type,
+                observed_date,
+                args.confidence,
+                evidence_url,
+                evidence_note,
+                now_iso(),
+            ),
+        )
+        created = conn.total_changes > before
+        signal = conn.execute(
+            """
+            SELECT id FROM employer_account_signals
+            WHERE account_id = ? AND signal_type = ? AND observed_date = ?
+              AND evidence_url = ? AND evidence_note = ?
+            """,
+            (account_id, args.signal_type, observed_date, evidence_url, evidence_note),
+        ).fetchone()
+        signal_id = int(signal["id"])
+        conn.commit()
+    render_outputs(args.db)
+    result = {"signal_id": signal_id, "account_id": account_id, "created": created}
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print(f"{'Recorded' if created else 'Kept existing'} employer signal {signal_id}")
+
+
+def link_vacancy_account(args: argparse.Namespace) -> None:
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        vacancy = resolve_vacancy_row(conn, args)
+        account = resolve_employer_account(
+            conn, account_id=args.account_id, account_name=args.account_name
+        )
+        vacancy_id = int(vacancy["id"])
+        account_id = int(account["id"])
+        existing = conn.execute(
+            "SELECT account_id FROM vacancy_employer_accounts WHERE vacancy_id = ?",
+            (vacancy_id,),
+        ).fetchone()
+        if existing and int(existing["account_id"]) != account_id:
+            raise SystemExit(
+                f"Vacancy {vacancy_id} is already linked to account {existing['account_id']}; "
+                "unlink/relink requires an explicit future workflow"
+            )
+        created = existing is None
+        if created:
+            now = now_iso()
+            conn.execute(
+                """
+                INSERT INTO vacancy_employer_accounts (
+                    vacancy_id, account_id, link_method, evidence_note,
+                    created_at, updated_at
+                )
+                VALUES (?, ?, 'explicit', ?, ?, ?)
+                """,
+                (vacancy_id, account_id, clean_cell(args.evidence_note), now, now),
+            )
+        conn.commit()
+    render_outputs(args.db)
+    result = {"vacancy_id": vacancy_id, "account_id": account_id, "created": created}
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print(f"{'Linked' if created else 'Kept link for'} vacancy {vacancy_id} to account {account_id}")
+
+
+def record_vacancy_factor(args: argparse.Namespace) -> None:
+    observed_date = args.observed_date or dt.date.today().isoformat()
+    factor = {
+        "factor_key": args.factor_key,
+        "value": args.value,
+        "observed_date": observed_date,
+        "evidence_note": args.evidence_note,
+        "evidence_url": args.evidence_url,
+        "confidence": args.confidence,
+    }
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        vacancy = resolve_vacancy_row(conn, args)
+        vacancy_id = int(vacancy["id"])
+        created = insert_vacancy_factor_once(
+            conn,
+            vacancy_id=vacancy_id,
+            factor=factor,
+            default_date=observed_date,
+        )
+        conn.commit()
+    render_outputs(args.db)
+    result = {"vacancy_id": vacancy_id, "factor_key": args.factor_key, "created": created}
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print(f"{'Recorded' if created else 'Kept existing'} factor {args.factor_key} for vacancy {vacancy_id}")
 
 
 def upsert_employer_contact(args: argparse.Namespace) -> None:
@@ -4456,7 +5965,20 @@ def doctor(args: argparse.Namespace) -> None:
                 missing_tables = missing_schema_tables(conn)
                 missing_indexes = missing_schema_indexes(conn)
                 alias_schema_issues = vacancy_external_alias_schema_issues(conn)
+                v4_contract_issues = schema_v4_issues(conn)
                 foreign_key_issues = len(conn.execute("PRAGMA foreign_key_check").fetchall())
+                missing_canonical_streams = (
+                    int(
+                        conn.execute(
+                            """
+                            SELECT COUNT(*) FROM source_hits
+                            WHERE TRIM(COALESCE(canonical_source_stream, '')) = ''
+                            """
+                        ).fetchone()[0]
+                    )
+                    if not v4_contract_issues
+                    else -1
+                )
                 canonical_aliases_missing = (
                     int(
                         conn.execute(
@@ -4509,6 +6031,16 @@ def doctor(args: argparse.Namespace) -> None:
                 "database_external_alias_schema",
                 not alias_schema_issues,
                 "; ".join(alias_schema_issues) or "valid",
+            )
+            add(
+                "database_schema_v4_contract",
+                not v4_contract_issues,
+                "; ".join(v4_contract_issues) or "valid",
+            )
+            add(
+                "database_canonical_source_streams",
+                missing_canonical_streams == 0,
+                f"missing={missing_canonical_streams}",
             )
             add(
                 "database_canonical_aliases",
@@ -4628,6 +6160,15 @@ def build_parser() -> argparse.ArgumentParser:
     stats_parser.add_argument("--db", type=Path, default=DB_PATH)
     stats_parser.set_defaults(func=print_stats)
 
+    conversion_parser = sub.add_parser(
+        "conversion-report",
+        help="Calculate vacancy-level application conversion cohorts",
+    )
+    conversion_parser.add_argument("--db", type=Path, default=DB_PATH)
+    conversion_parser.add_argument("--as-of", default="")
+    conversion_parser.add_argument("--json", action="store_true")
+    conversion_parser.set_defaults(func=conversion_report_command)
+
     migrate_parser = sub.add_parser("migrate-stages", help="Migrate existing DB rows to the compact funnel stage model")
     migrate_parser.add_argument("--db", type=Path, default=DB_PATH)
     migrate_parser.add_argument("--no-backup", action="store_true", help="Do not create a .bak copy before migration")
@@ -4714,6 +6255,106 @@ def build_parser() -> argparse.ArgumentParser:
         help="Also sync status, stage, and follow-up date to the latest application row",
     )
     update_parser.set_defaults(func=update_vacancy)
+
+    interaction_parser = sub.add_parser(
+        "record-employer-interaction",
+        help="Append an evidence-backed employer interaction without changing funnel stage",
+    )
+    interaction_parser.add_argument("--db", type=Path, default=DB_PATH)
+    interaction_parser.add_argument("--id", type=int, default=None)
+    interaction_parser.add_argument("--url", default="")
+    interaction_parser.add_argument("--external-id", default="")
+    interaction_parser.add_argument("--at", default="", help="ISO date or timestamp")
+    interaction_parser.add_argument(
+        "--direction", choices=("inbound", "outbound"), default="inbound"
+    )
+    interaction_parser.add_argument(
+        "--event-type", choices=sorted(EMPLOYER_INTERACTION_TYPES), required=True
+    )
+    interaction_parser.add_argument("--channel", required=True)
+    interaction_parser.add_argument(
+        "--actor-type", choices=sorted(EMPLOYER_ACTOR_TYPES), default="unknown"
+    )
+    interaction_parser.add_argument(
+        "--humanity", choices=("human", "automated"), required=True
+    )
+    interaction_parser.add_argument("--evidence-note", default="")
+    interaction_parser.add_argument("--evidence-url", default="")
+    interaction_parser.add_argument("--external-reference", default="")
+    interaction_parser.add_argument("--json", action="store_true")
+    interaction_parser.set_defaults(func=record_employer_interaction)
+
+    account_parser = sub.add_parser(
+        "upsert-employer-account", help="Create or update an exact employer account"
+    )
+    account_parser.add_argument("--db", type=Path, default=DB_PATH)
+    account_parser.add_argument("--account-id", type=int, default=None)
+    account_parser.add_argument("--canonical-name", required=True)
+    account_parser.add_argument("--website", default=None)
+    account_parser.add_argument("--careers-url", default=None)
+    account_parser.add_argument("--country-market", default=None)
+    account_parser.add_argument("--priority", default=None)
+    account_parser.add_argument("--status", dest="account_status", default=None)
+    account_parser.add_argument("--last-checked-date", default=None)
+    account_parser.add_argument("--notes", default=None)
+    account_parser.add_argument("--json", action="store_true")
+    account_parser.set_defaults(func=upsert_employer_account)
+
+    signal_parser = sub.add_parser(
+        "record-employer-signal", help="Append an evidence-backed employer account signal"
+    )
+    signal_parser.add_argument("--db", type=Path, default=DB_PATH)
+    signal_account = signal_parser.add_mutually_exclusive_group(required=True)
+    signal_account.add_argument("--account-id", type=int, default=None)
+    signal_account.add_argument("--account-name", default="")
+    signal_parser.add_argument(
+        "--signal-type", choices=sorted(EMPLOYER_SIGNAL_TYPES), required=True
+    )
+    signal_parser.add_argument("--observed-date", default="")
+    signal_parser.add_argument(
+        "--confidence", choices=sorted(EVIDENCE_CONFIDENCE), required=True
+    )
+    signal_parser.add_argument("--evidence-url", default="")
+    signal_parser.add_argument("--evidence-note", required=True)
+    signal_parser.add_argument("--json", action="store_true")
+    signal_parser.set_defaults(func=record_employer_signal)
+
+    link_parser = sub.add_parser(
+        "link-vacancy-account", help="Explicitly link one vacancy to one employer account"
+    )
+    link_parser.add_argument("--db", type=Path, default=DB_PATH)
+    link_parser.add_argument("--id", type=int, default=None)
+    link_parser.add_argument("--url", default="")
+    link_parser.add_argument("--external-id", default="")
+    link_account = link_parser.add_mutually_exclusive_group(required=True)
+    link_account.add_argument("--account-id", type=int, default=None)
+    link_account.add_argument("--account-name", default="")
+    link_parser.add_argument("--evidence-note", default="")
+    link_parser.add_argument("--json", action="store_true")
+    link_parser.set_defaults(func=link_vacancy_account)
+
+    factor_parser = sub.add_parser(
+        "record-vacancy-factor",
+        help="Append an evidence-backed vacancy factor without changing score",
+    )
+    factor_parser.add_argument("--db", type=Path, default=DB_PATH)
+    factor_parser.add_argument("--id", type=int, default=None)
+    factor_parser.add_argument("--url", default="")
+    factor_parser.add_argument("--external-id", default="")
+    factor_parser.add_argument(
+        "--factor-key",
+        required=True,
+        help="Lowercase snake_case; core keys: " + ", ".join(sorted(CORE_VACANCY_FACTORS)),
+    )
+    factor_parser.add_argument("--value", required=True)
+    factor_parser.add_argument("--observed-date", default="")
+    factor_parser.add_argument(
+        "--confidence", choices=sorted(EVIDENCE_CONFIDENCE), required=True
+    )
+    factor_parser.add_argument("--evidence-note", required=True)
+    factor_parser.add_argument("--evidence-url", default="")
+    factor_parser.add_argument("--json", action="store_true")
+    factor_parser.set_defaults(func=record_vacancy_factor)
 
     contact_parser = sub.add_parser(
         "upsert-contact",

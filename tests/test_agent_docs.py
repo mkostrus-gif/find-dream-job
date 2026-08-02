@@ -135,6 +135,27 @@ class AgentDocumentationTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertIn(text, mail_workflow)
 
+    def test_outcome_and_ai_evidence_contract_is_public(self) -> None:
+        system = self.read("JOB_SYSTEM.md")
+        daily = self.read("prompts/daily_run.md")
+        scoring = self.read("prompts/scoring.md")
+        for text in (
+            "Screening signal",
+            "Automated acknowledgment",
+            "Human reply",
+            "Verified contact",
+            "Employer signal",
+            "Candidate evidence",
+            "record-employer-interaction",
+            "conversion-report",
+            "deterministic first touch",
+            "[source_stream_aliases]",
+        ):
+            with self.subTest(text=text):
+                self.assertIn(text, system)
+        self.assertIn("Do not narrow discovery to AI-titled vacancies", daily)
+        self.assertIn("enterprise AI transformation experience", scoring)
+
     def test_relative_markdown_links_resolve(self) -> None:
         candidates = self.public_candidates()
         markdown_files = [ROOT / path for path in candidates if path.endswith(".md")]
