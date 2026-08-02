@@ -86,6 +86,7 @@ class SearchSettings:
     required_streams: tuple[str, ...]
     default_period_days: int
     items_per_page: int
+    stream_aliases: dict[str, str]
 
 
 @dataclass(frozen=True)
@@ -157,6 +158,27 @@ def _stream_names(table: dict[str, Any], key: str, default: list[str]) -> tuple[
     return tuple(normalized)
 
 
+def _stream_aliases(table: dict[str, Any]) -> dict[str, str]:
+    aliases: dict[str, str] = {}
+    original_keys: dict[str, str] = {}
+    for raw_alias, canonical_key in table.items():
+        if not isinstance(raw_alias, str) or not raw_alias.strip():
+            raise ValueError("source_stream_aliases keys must be non-empty strings")
+        if not isinstance(canonical_key, str) or not canonical_key.strip():
+            raise ValueError(
+                "source_stream_aliases values must be non-empty canonical keys"
+            )
+        folded = raw_alias.strip().casefold()
+        if folded in aliases:
+            raise ValueError(
+                "source_stream_aliases contains case-insensitive duplicate keys: "
+                f"{original_keys[folded]!r} and {raw_alias.strip()!r}"
+            )
+        aliases[folded] = canonical_key.strip()
+        original_keys[folded] = raw_alias.strip()
+    return aliases
+
+
 def _path(workspace_root: Path, value: str) -> Path:
     candidate = Path(value).expanduser()
     if not candidate.is_absolute():
@@ -215,6 +237,7 @@ def load_settings(code_root: Path, config_path: Path | None = None) -> Settings:
     follow_up = _table(data, "follow_up")
     mail = _table(data, "mail")
     search = _table(data, "search")
+    source_stream_aliases = _table(data, "source_stream_aliases")
     labels = _table(data, "channel_labels")
 
     direct_channels = _strings(
@@ -304,6 +327,7 @@ def load_settings(code_root: Path, config_path: Path | None = None) -> Settings:
                 search, "default_period_days", 3, 1
             ),
             items_per_page=_integer(search, "items_per_page", 100, 1),
+            stream_aliases=_stream_aliases(source_stream_aliases),
         ),
         channel_labels=channel_labels,
     )

@@ -79,6 +79,12 @@ It provides:
   authorized archive verification in the daily workflow;
 - a compact application funnel and structured follow-up rounds;
 - evidence-backed recruiter and hiring-manager contacts;
+- structured employer interactions that distinguish automated acknowledgments
+  from human replies without changing funnel stage;
+- vacancy-level 14/30-day conversion cohorts with deterministic first-touch
+  source attribution and canonical stream aliases;
+- an explicit employer account radar, evidence-backed employer signals, and
+  structured vacancy factors that remain separate from candidate-relative score;
 - generated `views/*.md`, `reports/*.md`, and `dashboard/index.html`;
 - agent workflows for onboarding, discovery, scoring, ATS documents,
   applications, and reconciliation;
@@ -161,6 +167,9 @@ The public template is deliberately review-only:
   files;
 - SQLite is authoritative; Markdown and dashboard files are rebuildable read
   models.
+- employer AI adoption, an AI word in a vacancy title, and a candidate's use of
+  AI tools never prove candidate fit or enterprise AI transformation experience;
+  candidate claims still require private evidence.
 
 Candidate-specific behavior belongs in ignored `config/settings.toml` and the
 private files it references. See [`PROJECT_RULES.md`](PROJECT_RULES.md) for the
@@ -187,6 +196,12 @@ build-coverage-plan FILE  Generate deterministic HH URLs and manifest skeleton
 check-coverage FILE       Persist and fail-closed validate daily-run coverage
 migrate-schema            Back up and upgrade an existing SQLite workspace
 update-vacancy            Change one vacancy and optionally its application
+record-employer-interaction Append a human or automated employer event
+conversion-report         Calculate vacancy-level 14/30-day cohorts
+upsert-employer-account   Create or update an exact employer account
+record-employer-signal    Append an evidence-backed account signal
+link-vacancy-account      Explicitly link a vacancy to an account
+record-vacancy-factor     Append a structured evidence factor without scoring
 upsert-contact            Store an evidence-backed employer contact
 record-contact-search     Record a negative or ambiguous contact search
 record-followup           Record one structured multi-channel follow-up round
