@@ -44,6 +44,7 @@
 !/scripts/jobctl.py
 !/scripts/jobsearch_config.py
 !/scripts/search_coverage.py
+!/scripts/telegram_source.py
 !/scripts/public_audit.py
 !/scripts/qa_dashboard.mjs
 

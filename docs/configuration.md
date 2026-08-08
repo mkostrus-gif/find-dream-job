@@ -67,6 +67,31 @@ Both settings default to `false`. Archiving cannot be enabled unless scanning
 is enabled. These settings do not install or authenticate Gmail and do not
 authorize deletion, sending, or unrelated mailbox mutations.
 
+## Telegram sources
+
+`[telegram]` enables public Telegram channels as mandatory daily discovery
+sources:
+
+```toml
+[telegram]
+enabled = true
+initial_lookback_days = 30
+channels = ["https://t.me/example_exec_jobs"]
+```
+
+Real channel URLs belong only in the ignored local settings file. The public
+template stays disabled with an empty list. URLs are normalized to public
+handles; post links, invite links, query strings, invalid handles, and
+case-insensitive duplicates are rejected.
+
+On the first successful scan of each channel, `initial_lookback_days` defines
+the backfill window. Later plans use that channel's durable numeric Telegram
+post cursor and process only the delta. A cursor advances only after
+`check-telegram-coverage` proves complete pagination/classification and
+evidence-backed SQLite ingest for every vacancy post. Enabling a channel grants
+read-only discovery scope; it does not join a channel, authenticate Telegram,
+send a message, or authorize an application.
+
 ## Search coverage
 
 `[search]` makes daily discovery completeness machine-checkable:
@@ -127,5 +152,5 @@ python3 scripts/jobctl.py rebuild --json
 ```
 
 Report the selected workspace, config path, `auto_apply` state, threshold,
-LinkedIn mail policy, and any failed check. Never weaken validation merely to
-make the command pass.
+LinkedIn mail policy, Telegram enabled/channel count/lookback, and any failed
+check. Never weaken validation merely to make the command pass.

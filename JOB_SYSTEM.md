@@ -23,6 +23,7 @@ Default local paths:
 - `views/vacancy_factors.md` — structured evidence factors;
 - `reports/source_quality.md` — screening and downstream source performance;
 - `reports/source_streams.md` — raw-to-canonical stream diagnostics;
+- `reports/source_checkpoints.md` — durable cursors for incremental sources;
 - `reports/conversion_cohorts.md` — vacancy-level application conversion;
 - `reports/data_quality.md` — import diagnostics.
 
@@ -51,6 +52,8 @@ Use a disposable `JOB_SEARCH_HOME` for smoke tests.
 - `source_hits` — discovery events by source and stream;
 - `search_runs` / `search_coverage` — fail-closed daily-run manifests and
   per-stream page/query checkpoints;
+- `source_checkpoints` — per-source/per-stream cursors that advance only after
+  a complete fail-closed manifest;
 - `vacancy_external_aliases` — every observed `(channel, external_id)` mapped
   to one canonical vacancy, with its own URL and first/last observation dates;
 - `vacancy_fingerprints` — conservative semantic repost aliases based on
@@ -181,6 +184,61 @@ Search coverage still validates the exact configured
 `search.required_streams` manifest fail-closed. Stream aliases consolidate
 outcome reporting; they do not excuse a missing required checkpoint.
 
+## Telegram channel discovery
+
+Public Telegram channel URLs are private, candidate-specific configuration:
+
+```toml
+[telegram]
+enabled = true
+initial_lookback_days = 30
+channels = ["https://t.me/example_exec_jobs"]
+```
+
+The public Engine contains no real channel list. It accepts only public `t.me`
+handles, canonicalizes URLs, rejects post/invite URLs and duplicates, and uses
+one stream key per channel: `telegram:<handle>`.
+
+Build the daily plan from SQLite rather than choosing a date range manually:
+
+```bash
+python3 scripts/jobctl.py build-telegram-plan --run-date 2026-01-15 \
+  --output tmp/telegram_coverage_2026-01-15.json --json
+```
+
+A channel without a completed `source_checkpoints` row receives an inclusive
+initial backfill beginning `initial_lookback_days` before the run date. A
+completed channel receives a delta plan from its last observed numeric post ID.
+Adding another channel does not reset established channels: the new stream
+backfills independently.
+
+The operating agent starts at `https://t.me/s/<handle>`, records every fetched
+page and post ID/date, and paginates backward until it proves the generated
+date/post boundary or the actual start of the channel. Every in-scope post is
+classified as vacancy-bearing or non-vacancy. Every vacancy is scored and
+ingested before coverage closes, using:
+
+- `channel = telegram`;
+- `source = telegram_public_channel`;
+- `source_stream = telegram:<handle>`;
+- exact post URL;
+- `external_id = telegram:<handle>:<post_id>` for a single vacancy, or the same
+  prefix plus a stable lowercase item suffix for a multi-vacancy post.
+
+Then validate and persist:
+
+```bash
+python3 scripts/jobctl.py check-telegram-coverage \
+  tmp/telegram_coverage_2026-01-15.json
+```
+
+The validator fails closed on a missing configured channel, unproven boundary,
+unclassified fetched post, unstable/mismatched ID, absent post URL, missing
+SQLite alias/source hit, or missing 0–100 score. Incomplete attempts are kept in
+`search_runs` / `search_coverage`, but `source_checkpoints` advances only after
+the entire Telegram manifest succeeds. This is read-only discovery authority;
+it never authorizes joining, messaging, applying, or another external action.
+
 ## Search coverage contract
 
 Prepare a private plan whose stream keys match local
@@ -289,12 +347,13 @@ JOB_SEARCH_HOME="/path/to/private-workspace" \
   python3 scripts/jobctl.py migrate-schema --json
 ```
 
-Schema v4 retains the schema-v3 external-ID model and adds canonical stream
-keys, employer interactions, account radar tables, and vacancy factors. A v3
-workspace is upgraded without rewriting raw stream values or inventing any
-historical replies, accounts, signals, links, or factors. Existing source hits
-receive only a deterministic canonical key from the current local alias
-configuration, or their raw identity when unmapped.
+Schema v5 retains schema v4 and adds generic incremental `source_checkpoints`.
+It does not invent a Telegram cursor or mark any source initialized: the first
+successful manifest creates that state. Schema v4 itself retains the schema-v3
+external-ID model and adds canonical stream keys, employer interactions,
+account radar tables, and vacancy factors. Older workspaces are upgraded
+without rewriting raw stream values or inventing historical replies, accounts,
+signals, links, factors, or source completion.
 
 Do not use `--no-backup` on a live candidate database. After migration, use the
 same workspace selection for:
@@ -312,7 +371,7 @@ Rollback is recovery from the timestamped
 `job_search.sqlite.bak-schema-v<old>-<timestamp>` copy: stop writers, preserve
 the failed/current database for diagnosis, restore the backup to the configured
 database path, and use the prior compatible Engine version. There is no
-destructive reverse migration. Repeating `migrate-schema` on schema v4 is
+destructive reverse migration. Repeating `migrate-schema` on schema v5 is
 idempotent and creates no additional backup.
 
 ## Exact state changes

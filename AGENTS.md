@@ -145,6 +145,9 @@ A search run is complete only when:
 - every locally configured search stream has a successful persisted coverage
   checkpoint; missing streams, incomplete pagination, and partial lazy-loads
   are fail-closed conditions;
+- every enabled incremental source has a successful manifest for every
+  configured stream; a first scan must complete its configured backfill and
+  later scans must begin from the last success-gated cursor;
 - discovered vacancies were deduplicated and written through `jobctl.py`;
 - scores cite verified evidence and hard constraints;
 - external actions distinguish drafted, attempted, visibly confirmed, and

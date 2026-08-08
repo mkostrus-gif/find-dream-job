@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Added schema v5 generic source checkpoints and configurable public Telegram
+  discovery with a per-channel 30-day initial backfill, post-ID deltas,
+  fail-closed page/post/score/SQLite reconciliation, and cursors that advance
+  only after complete coverage.
 - Added schema v4 employer interactions, vacancy-level 14/30-day conversion
   cohorts, canonical source-stream aliases, downstream source-quality metrics,
   explicit employer account radar/signals/links, and evidence-backed vacancy

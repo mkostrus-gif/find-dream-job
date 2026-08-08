@@ -13,7 +13,7 @@ Use Python 3.11 or newer. The core has no third-party runtime dependencies.
 Never use a real candidate workspace as a test fixture.
 
 ```bash
-python3 -m py_compile scripts/jobctl.py scripts/jobsearch_config.py scripts/search_coverage.py scripts/public_audit.py
+python3 -m py_compile scripts/jobctl.py scripts/jobsearch_config.py scripts/search_coverage.py scripts/telegram_source.py scripts/public_audit.py
 python3 -m unittest discover -s tests -v
 python3 scripts/public_audit.py --strict
 ```

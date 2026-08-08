@@ -75,6 +75,9 @@ It provides:
 - canonical external-ID plus persisted repost aliases, conservative
   semantic-repost deduplication, and source/evaluation history;
 - deterministic HH query plans and fail-closed stream/page/lazy-load coverage;
+- configurable public Telegram channels with a per-channel 30-day first
+  backfill, success-gated post cursors, incremental daily deltas, and
+  fail-closed post/ingest reconciliation;
 - Gmail HH and LinkedIn job-mail ingestion, with per-message reconciliation and
   authorized archive verification in the daily workflow;
 - a compact application funnel and structured follow-up rounds;
@@ -194,6 +197,8 @@ ingest-json FILE          Import structured vacancy/evaluation rows
 ingest-gmail-json FILE    Import HH or LinkedIn vacancy links extracted from Gmail
 build-coverage-plan FILE  Generate deterministic HH URLs and manifest skeleton
 check-coverage FILE       Persist and fail-closed validate daily-run coverage
+build-telegram-plan       Generate per-channel first-backfill or delta plan
+check-telegram-coverage   Validate post/ingest evidence and advance cursors
 migrate-schema            Back up and upgrade an existing SQLite workspace
 update-vacancy            Change one vacancy and optionally its application
 record-employer-interaction Append a human or automated employer event

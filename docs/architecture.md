@@ -30,6 +30,20 @@ configured streams -> generated source URLs -> page/lazy-load checkpoints
                                              -> coverage validation -> SQLite
 ```
 
+Incremental sources add a success-gated cursor path:
+
+```text
+local source list + last completed cursor -> backfill/delta plan
+                                         -> page/post evidence
+                                         -> scored SQLite aliases
+                                         -> complete manifest -> new cursor
+```
+
+Telegram is the first implementation. Channel URLs remain private
+configuration; the public Engine owns only generic plan, identity, validation,
+and checkpoint rules. A partial or blocked scan can persist diagnostic coverage
+but cannot advance `source_checkpoints`.
+
 Vacancy identity first uses the canonical source external ID, then a persisted
 external-ID alias in the same channel. When a full description is available, a
 conservative normalized company/title/description fingerprint is checked next
@@ -97,10 +111,11 @@ workspaces.
 
 ## SQLite lifecycle
 
-The schema has an explicit `PRAGMA user_version`; schema v4 retains external-ID
-aliases and adds canonical source streams, employer interactions, employer
-accounts/signals/links, and vacancy factors. The CLI refuses databases newer
-than the supported schema. Connections
+The schema has an explicit `PRAGMA user_version`; schema v5 retains schema v4
+and adds generic success-gated incremental source checkpoints. Schema v4
+retains external-ID aliases and adds canonical source streams, employer
+interactions, employer accounts/signals/links, and vacancy factors. The CLI
+refuses databases newer than the supported schema. Connections
 enable foreign-key enforcement and a bounded busy timeout. Generated output is
 rebuilt from a consistent snapshot. Explicit migrations create a recoverable
 backup by default, create tables and indexes idempotently, and backfill only

@@ -43,6 +43,14 @@ max_direct_messages_per_round = 1
 scan_linkedin_inbox = false
 archive_processed_linkedin = false
 
+[telegram]
+# Public channel handles belong only in the ignored local settings file. The
+# first completed scan covers this many calendar days; later plans use the
+# durable per-channel post cursor and request only the delta.
+enabled = false
+initial_lookback_days = 30
+channels = []
+
 [search]
 # A daily run is not complete until every configured stream has a validated
 # coverage checkpoint. Replace these generic names in the ignored local copy.

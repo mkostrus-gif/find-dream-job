@@ -117,12 +117,14 @@ JOB_SEARCH_HOME="/path/to/private-workspace" \
   python3 scripts/jobctl.py stats
 ```
 
-Never use `--no-backup` on a live database. Schema v4 preserves the schema-v3
-external-ID aliases, raw source streams, and every existing row. It adds
-canonical stream keys, employer interactions, account radar tables, and
-vacancy factors without inventing any historical outcome or evidence. Restore
-the timestamped backup with the prior Engine version for rollback; there is no
-destructive reverse migration.
+Never use `--no-backup` on a live database. Schema v5 preserves schema v4 and
+adds empty generic incremental-source checkpoints; it never fabricates a
+completed source or cursor. Schema v4 preserves the schema-v3 external-ID
+aliases, raw source streams, and every existing row. It adds canonical stream
+keys, employer interactions, account radar tables, and vacancy factors without
+inventing any historical outcome or evidence. Restore the timestamped backup
+with the prior Engine version for rollback; there is no destructive reverse
+migration.
 
 ## 5. Execute one search cycle
 
@@ -135,13 +137,17 @@ Use [`prompts/daily_run.md`](../prompts/daily_run.md) as the canonical order:
    evidence-backed stage change separately;
 4. process authorized Gmail HH mail and every LinkedIn message currently in
    Inbox; score every recommended vacancy and verify each authorized archive;
-5. build the configured source-stream coverage plan, search every generated
+5. when Telegram is enabled, build its SQLite-backed backfill/delta plan,
+   inspect every configured channel to the generated boundary, score/import
+   vacancy posts, and pass `check-telegram-coverage` without manually advancing
+   a cursor;
+6. build the configured source-stream coverage plan, search every generated
    query through its final fully loaded page, and deduplicate against SQLite;
-6. normalize results into ignored JSON and ingest them;
-7. score the real mandate, hard constraints, and open questions;
-8. prepare or perform only the external actions allowed by current policy;
-9. verify visible success before recording sent state;
-10. run fail-closed `check-coverage`, rebuild, validate, and report.
+7. normalize results into ignored JSON and ingest them;
+8. score the real mandate, hard constraints, and open questions;
+9. prepare or perform only the external actions allowed by current policy;
+10. verify visible success before recording sent state;
+11. run every enabled fail-closed source check, rebuild, validate, and report.
 
 Use [`prompts/scan_channel.md`](../prompts/scan_channel.md) when the task is
 limited to one company or source. Use
@@ -198,6 +204,30 @@ python3 scripts/jobctl.py check-coverage tmp/search_coverage_YYYY-MM-DD.json
 
 Do not claim a complete run after a non-zero exit. The SQLite checkpoint and
 `reports/search_coverage.md` preserve the resumable incomplete state.
+
+For configured public Telegram channels, build a plan before browsing:
+
+```bash
+python3 scripts/jobctl.py build-telegram-plan --run-date YYYY-MM-DD \
+  --output tmp/telegram_coverage_YYYY-MM-DD.json --json
+```
+
+Never-completed channels receive the local initial lookback (30 days by
+default); completed channels receive their post-ID delta. Start at each current
+public preview, paginate to the generated date/post boundary, classify every
+fetched post, and ingest every scored vacancy with the exact post URL,
+`source_stream = telegram:<handle>`, and a stable
+`telegram:<handle>:<post_id>` identity (plus a stable item suffix when a post
+contains several vacancies). Then run:
+
+```bash
+python3 scripts/jobctl.py check-telegram-coverage \
+  tmp/telegram_coverage_YYYY-MM-DD.json
+```
+
+The cursor is stored in `source_checkpoints` only after the whole manifest
+passes. Inspect `reports/source_checkpoints.md` when resuming; an incomplete
+attempt in `search_runs` is evidence of a blocker, not permission to skip it.
 
 ### Reconcile downstream outcomes
 

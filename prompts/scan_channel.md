@@ -28,6 +28,14 @@ without repeating the scan.
 
 7. Rebuild and verify targeted rows and counts.
 
+For a configured Telegram source, do not invent a date window. Use
+`build-telegram-plan` so a never-completed channel receives its initial
+lookback and an established channel receives only its SQLite-backed delta.
+Record every fetched page/post and boundary, ingest scored vacancy rows with
+stable `telegram:<handle>:<post_id>` identities, then run
+`check-telegram-coverage`. The channel cursor must not advance after partial
+history, unresolved post classification, or missing SQLite ingest evidence.
+
 Do not create channel-specific Markdown journals. Do not apply merely because a
 scan found a high score; application authorization comes from local settings
 and the current user request.

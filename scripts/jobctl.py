@@ -31,10 +31,11 @@ from search_coverage import (
     semantic_vacancy_fingerprint,
     validate_coverage_manifest,
 )
+from telegram_source import build_telegram_plan, validate_telegram_manifest
 
 
 CODE_ROOT = Path(__file__).resolve().parents[1]
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 SETTINGS: Settings
 ROOT: Path
@@ -56,6 +57,9 @@ DEFAULT_SEARCH_PERIOD_DAYS: int
 SEARCH_ITEMS_PER_PAGE: int
 CHANNEL_LABELS: dict[str, str]
 SOURCE_STREAM_ALIASES: dict[str, str]
+TELEGRAM_ENABLED: bool
+TELEGRAM_INITIAL_LOOKBACK_DAYS: int
+TELEGRAM_CHANNELS: tuple[Any, ...]
 
 
 def configure_runtime(config_path: Path | None = None) -> None:
@@ -67,7 +71,8 @@ def configure_runtime(config_path: Path | None = None) -> None:
     global DIRECT_OUTREACH_CHANNELS, FOLLOW_UP_CHANNELS
     global MAX_DIRECT_MESSAGES_PER_ROUND, REQUIRED_SEARCH_STREAMS
     global DEFAULT_SEARCH_PERIOD_DAYS, SEARCH_ITEMS_PER_PAGE, CHANNEL_LABELS
-    global SOURCE_STREAM_ALIASES
+    global SOURCE_STREAM_ALIASES, TELEGRAM_ENABLED
+    global TELEGRAM_INITIAL_LOOKBACK_DAYS, TELEGRAM_CHANNELS
 
     SETTINGS = load_settings(CODE_ROOT, config_path)
     ROOT = SETTINGS.workspace_root
@@ -89,6 +94,9 @@ def configure_runtime(config_path: Path | None = None) -> None:
     SEARCH_ITEMS_PER_PAGE = SETTINGS.search.items_per_page
     CHANNEL_LABELS = dict(SETTINGS.channel_labels)
     SOURCE_STREAM_ALIASES = dict(SETTINGS.search.stream_aliases)
+    TELEGRAM_ENABLED = SETTINGS.telegram.enabled
+    TELEGRAM_INITIAL_LOOKBACK_DAYS = SETTINGS.telegram.initial_lookback_days
+    TELEGRAM_CHANNELS = SETTINGS.telegram.channels
 
 
 # Load safe built-in defaults at import time. main() reloads the selected local
@@ -162,6 +170,7 @@ EXPECTED_TABLES = {
     "source_hits",
     "search_coverage",
     "search_runs",
+    "source_checkpoints",
     "stage_events",
     "vacancies",
     "vacancy_employer_accounts",
@@ -172,6 +181,7 @@ EXPECTED_TABLES = {
 EXPECTED_INDEXES = {
     "idx_employer_account_signals_account",
     "idx_employer_interactions_vacancy",
+    "idx_source_checkpoints_source",
     "idx_vacancy_external_aliases_external_id",
     "idx_vacancy_external_aliases_vacancy",
     "idx_vacancy_employer_accounts_account",
@@ -613,6 +623,38 @@ def schema_v4_issues(conn: sqlite3.Connection) -> list[str]:
     return issues
 
 
+def schema_v5_issues(conn: sqlite3.Connection) -> list[str]:
+    table_exists = conn.execute(
+        """
+        SELECT 1 FROM sqlite_master
+        WHERE type = 'table' AND name = 'source_checkpoints'
+        """
+    ).fetchone()
+    if not table_exists:
+        return ["source_checkpoints: table missing"]
+    required_columns = {
+        "source",
+        "stream_key",
+        "cursor_value",
+        "cursor_date",
+        "initialized_at",
+        "last_completed_run_date",
+        "last_manifest_file",
+        "created_at",
+        "updated_at",
+    }
+    columns = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(source_checkpoints)").fetchall()
+    }
+    missing = required_columns - columns
+    return (
+        ["source_checkpoints: missing " + ",".join(sorted(missing))]
+        if missing
+        else []
+    )
+
+
 def ensure_schema(conn: sqlite3.Connection) -> None:
     version = int(conn.execute("PRAGMA user_version").fetchone()[0])
     if version > SCHEMA_VERSION:
@@ -653,6 +695,11 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             raise RuntimeError(
                 "Database schema v4 contract is invalid: " + "; ".join(v4_issues)
             )
+        v5_issues = schema_v5_issues(conn)
+        if v5_issues:
+            raise RuntimeError(
+                "Database schema v5 contract is invalid: " + "; ".join(v5_issues)
+            )
 
 
 def reset_schema(conn: sqlite3.Connection) -> None:
@@ -667,6 +714,7 @@ def reset_schema(conn: sqlite3.Connection) -> None:
         DROP TABLE IF EXISTS employer_accounts;
         DROP TABLE IF EXISTS employer_interactions;
         DROP TABLE IF EXISTS vacancy_factors;
+        DROP TABLE IF EXISTS source_checkpoints;
         DROP TABLE IF EXISTS search_coverage;
         DROP TABLE IF EXISTS search_runs;
         DROP TABLE IF EXISTS source_hits;
@@ -791,6 +839,23 @@ def reset_schema(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX idx_search_coverage_run
             ON search_coverage(search_run_id, stream_key);
+
+        CREATE TABLE source_checkpoints (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT NOT NULL,
+            stream_key TEXT NOT NULL,
+            cursor_value TEXT,
+            cursor_date TEXT,
+            initialized_at TEXT NOT NULL,
+            last_completed_run_date TEXT NOT NULL,
+            last_manifest_file TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(source, stream_key)
+        );
+
+        CREATE INDEX idx_source_checkpoints_source
+            ON source_checkpoints(source, stream_key);
 
         CREATE TABLE evaluations (
             id INTEGER PRIMARY KEY,
@@ -1110,6 +1175,23 @@ def ensure_auxiliary_schema(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_search_coverage_run
             ON search_coverage(search_run_id, stream_key);
+
+        CREATE TABLE IF NOT EXISTS source_checkpoints (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT NOT NULL,
+            stream_key TEXT NOT NULL,
+            cursor_value TEXT,
+            cursor_date TEXT,
+            initialized_at TEXT NOT NULL,
+            last_completed_run_date TEXT NOT NULL,
+            last_manifest_file TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(source, stream_key)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_source_checkpoints_source
+            ON source_checkpoints(source, stream_key);
 
         CREATE TABLE IF NOT EXISTS interview_summaries (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3316,19 +3398,27 @@ def generate_views(
     coverage_rows: list[list[Any]] = []
     coverage_intro = "No search coverage manifest has been recorded."
     with connect_db(db_path) as conn:
-        latest_run = conn.execute(
+        latest_runs = conn.execute(
             """
-            SELECT * FROM search_runs
-            ORDER BY run_date DESC, id DESC
-            LIMIT 1
+            SELECT current.*
+            FROM search_runs current
+            WHERE current.id = (
+                SELECT candidate.id
+                FROM search_runs candidate
+                WHERE candidate.source = current.source
+                ORDER BY candidate.run_date DESC, candidate.id DESC
+                LIMIT 1
+            )
+            ORDER BY current.source COLLATE NOCASE
             """
-        ).fetchone()
-        if latest_run:
-            coverage_intro = (
-                f"Run {latest_run['run_date']} / {latest_run['source']}: "
+        ).fetchall()
+        summaries: list[str] = []
+        for latest_run in latest_runs:
+            summaries.append(
+                f"{latest_run['run_date']} / {latest_run['source']}: "
                 f"{latest_run['status']}; unique={latest_run['total_unique']}, "
                 f"known={latest_run['known_count']}, new={latest_run['new_count']}, "
-                f"issues={latest_run['issue_count']}."
+                f"issues={latest_run['issue_count']}"
             )
             checkpoints = conn.execute(
                 """
@@ -3344,6 +3434,8 @@ def generate_views(
             for item in checkpoints:
                 coverage_rows.append(
                     [
+                        latest_run["run_date"],
+                        latest_run["source"],
                         item["stream_key"],
                         item["status"],
                         md_link("query", item["query_url"] or ""),
@@ -3357,10 +3449,16 @@ def generate_views(
                         item["error"] or item["issues"] or "",
                     ]
                 )
+        if len(summaries) == 1:
+            coverage_intro = "Run " + summaries[0] + "."
+        elif summaries:
+            coverage_intro = "Latest runs by source: " + "; ".join(summaries) + "."
     write_markdown_table(
         REPORTS_DIR / "search_coverage.md",
         "Search Coverage",
         [
+            "run_date",
+            "source",
             "stream",
             "status",
             "query",
@@ -3375,6 +3473,50 @@ def generate_views(
         ],
         coverage_rows,
         coverage_intro,
+    )
+
+    checkpoint_rows: list[list[Any]] = []
+    with connect_db(db_path) as conn:
+        checkpoints = conn.execute(
+            """
+            SELECT source, stream_key, cursor_value, cursor_date,
+                   initialized_at, last_completed_run_date,
+                   last_manifest_file, updated_at
+            FROM source_checkpoints
+            ORDER BY source COLLATE NOCASE, stream_key COLLATE NOCASE
+            """
+        ).fetchall()
+        for item in checkpoints:
+            checkpoint_rows.append(
+                [
+                    item["source"],
+                    item["stream_key"],
+                    item["cursor_value"] or "",
+                    item["cursor_date"] or "",
+                    item["initialized_at"],
+                    item["last_completed_run_date"],
+                    item["last_manifest_file"] or "",
+                    item["updated_at"],
+                ]
+            )
+    write_markdown_table(
+        REPORTS_DIR / "source_checkpoints.md",
+        "Incremental Source Checkpoints",
+        [
+            "source",
+            "stream",
+            "cursor",
+            "cursor_date",
+            "initialized_at",
+            "last_completed_run",
+            "manifest",
+            "updated_at",
+        ],
+        checkpoint_rows,
+        (
+            "Cursors advance only after a complete fail-closed source manifest. "
+            "An empty table means that no incremental source has completed its first scan."
+        ),
     )
 
     issue_rows = []
@@ -4442,7 +4584,7 @@ def migrate_schema(args: argparse.Namespace) -> None:
         raise FileNotFoundError(f"Database not found: {args.db}")
     with sqlite3.connect(args.db) as probe:
         current_version = int(probe.execute("PRAGMA user_version").fetchone()[0])
-    if current_version not in {1, 2, 3, SCHEMA_VERSION}:
+    if current_version not in {1, 2, 3, 4, SCHEMA_VERSION}:
         raise RuntimeError(
             f"Unsupported migration path: {current_version} -> {SCHEMA_VERSION}"
         )
@@ -4593,6 +4735,166 @@ def check_coverage(args: argparse.Namespace) -> None:
             run_id = persist_coverage_result(conn, result, origin_for(manifest_path))
             conn.commit()
         result["search_run_id"] = run_id
+        render_outputs(args.db)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    if not result["ok"]:
+        raise SystemExit(1)
+
+
+def load_source_checkpoints(
+    conn: sqlite3.Connection, source: str
+) -> dict[str, dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT source, stream_key, cursor_value, cursor_date, initialized_at,
+               last_completed_run_date, last_manifest_file, updated_at
+        FROM source_checkpoints
+        WHERE source = ?
+        ORDER BY stream_key COLLATE NOCASE
+        """,
+        (source,),
+    ).fetchall()
+    return {str(row["stream_key"]): dict(row) for row in rows}
+
+
+def load_telegram_vacancy_evidence(
+    conn: sqlite3.Connection,
+) -> dict[str, dict[str, Any]]:
+    evidence: dict[str, dict[str, Any]] = {}
+    rows = conn.execute(
+        """
+        SELECT a.external_id, a.url, a.vacancy_id, v.score, sh.source_stream
+        FROM vacancy_external_aliases a
+        JOIN vacancies v ON v.id = a.vacancy_id
+        LEFT JOIN source_hits sh ON sh.vacancy_id = a.vacancy_id
+        WHERE a.channel = 'telegram'
+        ORDER BY a.external_id, sh.id
+        """
+    ).fetchall()
+    for row in rows:
+        external_id = str(row["external_id"])
+        item = evidence.setdefault(
+            external_id,
+            {
+                "vacancy_id": int(row["vacancy_id"]),
+                "url": row["url"] or "",
+                "score": row["score"],
+                "source_streams": set(),
+            },
+        )
+        if row["source_stream"]:
+            item["source_streams"].add(str(row["source_stream"]))
+    return evidence
+
+
+def persist_source_checkpoints(
+    conn: sqlite3.Connection,
+    result: dict[str, Any],
+    manifest_file: str,
+) -> None:
+    if not result["ok"]:
+        raise ValueError("source checkpoints may advance only after complete coverage")
+    now = now_iso()
+    for stream in result["streams"]:
+        checkpoint = stream.get("checkpoint") or {}
+        conn.execute(
+            """
+            INSERT INTO source_checkpoints (
+                source, stream_key, cursor_value, cursor_date, initialized_at,
+                last_completed_run_date, last_manifest_file, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(source, stream_key) DO UPDATE SET
+                cursor_value = excluded.cursor_value,
+                cursor_date = excluded.cursor_date,
+                last_completed_run_date = excluded.last_completed_run_date,
+                last_manifest_file = excluded.last_manifest_file,
+                updated_at = excluded.updated_at
+            """,
+            (
+                result["source"],
+                stream["key"],
+                clean_cell(str(checkpoint.get("cursor_value") or "")),
+                clean_cell(str(checkpoint.get("cursor_date") or "")),
+                now,
+                result["run_date"],
+                manifest_file,
+                now,
+                now,
+            ),
+        )
+
+
+def build_telegram_plan_command(args: argparse.Namespace) -> None:
+    if not TELEGRAM_ENABLED:
+        raise RuntimeError(
+            "Telegram discovery is disabled; enable [telegram] in local settings first"
+        )
+    run_date = args.run_date or dt.date.today().isoformat()
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        checkpoints = load_source_checkpoints(conn, "telegram")
+    plan = build_telegram_plan(
+        run_date,
+        TELEGRAM_CHANNELS,
+        initial_lookback_days=TELEGRAM_INITIAL_LOOKBACK_DAYS,
+        checkpoints=checkpoints,
+    )
+    output_path = args.output or ROOT / "tmp" / f"telegram_coverage_{run_date}.json"
+    if not output_path.is_absolute():
+        output_path = ROOT / output_path
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        json.dumps(plan, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "output": display_path(output_path.resolve(), ROOT),
+                    "plan": plan,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    else:
+        backfills = sum(
+            stream["query"]["mode"] == "backfill" for stream in plan["streams"]
+        )
+        print(f"Built Telegram coverage plan: {display_path(output_path.resolve(), ROOT)}")
+        print(
+            f"  channels: {len(plan['streams'])}; backfill: {backfills}; "
+            f"delta: {len(plan['streams']) - backfills}"
+        )
+
+
+def check_telegram_coverage(args: argparse.Namespace) -> None:
+    if not TELEGRAM_ENABLED:
+        raise RuntimeError(
+            "Telegram discovery is disabled; enable [telegram] in local settings first"
+        )
+    manifest_path = args.file if args.file.is_absolute() else ROOT / args.file
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest_file = origin_for(manifest_path)
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        checkpoints = load_source_checkpoints(conn, "telegram")
+        vacancy_evidence = load_telegram_vacancy_evidence(conn)
+        result = validate_telegram_manifest(
+            payload,
+            TELEGRAM_CHANNELS,
+            initial_lookback_days=TELEGRAM_INITIAL_LOOKBACK_DAYS,
+            checkpoints=checkpoints,
+            vacancy_evidence=vacancy_evidence,
+        )
+        if result.get("run_date") and result.get("source"):
+            run_id = persist_coverage_result(conn, result, manifest_file)
+            result["search_run_id"] = run_id
+            if result["ok"]:
+                persist_source_checkpoints(conn, result, manifest_file)
+            conn.commit()
+    if result.get("search_run_id"):
         render_outputs(args.db)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     if not result["ok"]:
@@ -5966,6 +6268,7 @@ def doctor(args: argparse.Namespace) -> None:
                 missing_indexes = missing_schema_indexes(conn)
                 alias_schema_issues = vacancy_external_alias_schema_issues(conn)
                 v4_contract_issues = schema_v4_issues(conn)
+                v5_contract_issues = schema_v5_issues(conn)
                 foreign_key_issues = len(conn.execute("PRAGMA foreign_key_check").fetchall())
                 missing_canonical_streams = (
                     int(
@@ -6038,6 +6341,11 @@ def doctor(args: argparse.Namespace) -> None:
                 "; ".join(v4_contract_issues) or "valid",
             )
             add(
+                "database_schema_v5_contract",
+                not v5_contract_issues,
+                "; ".join(v5_contract_issues) or "valid",
+            )
+            add(
                 "database_canonical_source_streams",
                 missing_canonical_streams == 0,
                 f"missing={missing_canonical_streams}",
@@ -6072,6 +6380,19 @@ def doctor(args: argparse.Namespace) -> None:
         bool(REQUIRED_SEARCH_STREAMS),
         ", ".join(REQUIRED_SEARCH_STREAMS) or "none configured",
     )
+    telegram_handles = [channel.handle for channel in TELEGRAM_CHANNELS]
+    add(
+        "telegram_sources",
+        not TELEGRAM_ENABLED or bool(telegram_handles),
+        (
+            "disabled"
+            if not TELEGRAM_ENABLED
+            else (
+                f"enabled; initial_lookback_days={TELEGRAM_INITIAL_LOOKBACK_DAYS}; "
+                + ", ".join(telegram_handles)
+            )
+        ),
+    )
 
     failed = [check for check in checks if check["required"] and not check["ok"]]
     result = {
@@ -6082,6 +6403,9 @@ def doctor(args: argparse.Namespace) -> None:
         "apply_threshold": SETTINGS.automation.apply_threshold,
         "scan_linkedin_inbox": SETTINGS.mail.scan_linkedin_inbox,
         "archive_processed_linkedin": SETTINGS.mail.archive_processed_linkedin,
+        "telegram_enabled": TELEGRAM_ENABLED,
+        "telegram_initial_lookback_days": TELEGRAM_INITIAL_LOOKBACK_DAYS,
+        "telegram_channels": telegram_handles,
         "checks": checks,
     }
     if args.json:
@@ -6198,6 +6522,28 @@ def build_parser() -> argparse.ArgumentParser:
     coverage_parser.add_argument("file", type=Path, help="Completed coverage manifest JSON")
     coverage_parser.add_argument("--db", type=Path, default=DB_PATH)
     coverage_parser.set_defaults(func=check_coverage)
+
+    telegram_plan_parser = sub.add_parser(
+        "build-telegram-plan",
+        help="Build first-backfill or incremental Telegram channel checkpoints",
+    )
+    telegram_plan_parser.add_argument(
+        "--run-date", default="", help="Run date in YYYY-MM-DD; defaults to today"
+    )
+    telegram_plan_parser.add_argument("--output", type=Path, default=None)
+    telegram_plan_parser.add_argument("--db", type=Path, default=DB_PATH)
+    telegram_plan_parser.add_argument("--json", action="store_true")
+    telegram_plan_parser.set_defaults(func=build_telegram_plan_command)
+
+    telegram_coverage_parser = sub.add_parser(
+        "check-telegram-coverage",
+        help="Validate Telegram post coverage, ingest evidence, and advance cursors",
+    )
+    telegram_coverage_parser.add_argument(
+        "file", type=Path, help="Completed Telegram coverage manifest JSON"
+    )
+    telegram_coverage_parser.add_argument("--db", type=Path, default=DB_PATH)
+    telegram_coverage_parser.set_defaults(func=check_telegram_coverage)
 
     watch_parser = sub.add_parser("watch", help="Regenerate views automatically when the SQLite database changes")
     watch_parser.add_argument("--db", type=Path, default=DB_PATH)

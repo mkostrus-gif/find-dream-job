@@ -135,6 +135,36 @@ class AgentDocumentationTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertIn(text, mail_workflow)
 
+    def test_daily_run_requires_success_gated_telegram_backfill_and_delta(self) -> None:
+        daily = self.read("prompts/daily_run.md")
+        system = self.read("JOB_SYSTEM.md")
+        settings = self.read("config/settings.example.toml")
+        required_daily_text = (
+            "telegram.enabled = true",
+            "build-telegram-plan",
+            "check-telegram-coverage",
+            "30 days by default",
+            "telegram:<handle>:<post_id>",
+            "advances a channel cursor only when the entire",
+            "Telegram manifest passes",
+            "reports/source_checkpoints.md",
+        )
+        for text in required_daily_text:
+            with self.subTest(text=text):
+                self.assertIn(text, daily)
+        for text in (
+            "source_checkpoints",
+            "initial backfill",
+            "delta plan",
+            "missing 0–100 score",
+        ):
+            with self.subTest(text=text):
+                self.assertIn(text, system)
+        self.assertIn("[telegram]", settings)
+        self.assertIn("enabled = false", settings)
+        self.assertIn("initial_lookback_days = 30", settings)
+        self.assertIn("channels = []", settings)
+
     def test_outcome_and_ai_evidence_contract_is_public(self) -> None:
         system = self.read("JOB_SYSTEM.md")
         daily = self.read("prompts/daily_run.md")

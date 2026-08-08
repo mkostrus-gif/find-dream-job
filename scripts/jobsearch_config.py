@@ -9,10 +9,12 @@ All paths in settings.toml are resolved relative to that workspace.
 from __future__ import annotations
 
 import os
+import re
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 
 DEFAULT_CHANNEL_LABELS = {
@@ -82,6 +84,24 @@ class MailSettings:
 
 
 @dataclass(frozen=True)
+class TelegramChannelSettings:
+    handle: str
+    url: str
+    preview_url: str
+
+    @property
+    def stream_key(self) -> str:
+        return f"telegram:{self.handle}"
+
+
+@dataclass(frozen=True)
+class TelegramSettings:
+    enabled: bool
+    initial_lookback_days: int
+    channels: tuple[TelegramChannelSettings, ...]
+
+
+@dataclass(frozen=True)
 class SearchSettings:
     required_streams: tuple[str, ...]
     default_period_days: int
@@ -101,6 +121,7 @@ class Settings:
     automation: AutomationSettings
     follow_up: FollowUpSettings
     mail: MailSettings
+    telegram: TelegramSettings
     search: SearchSettings
     channel_labels: dict[str, str]
 
@@ -179,6 +200,55 @@ def _stream_aliases(table: dict[str, Any]) -> dict[str, str]:
     return aliases
 
 
+TELEGRAM_HANDLE_RE = re.compile(r"^[A-Za-z0-9_]{5,32}$")
+
+
+def _telegram_channels(table: dict[str, Any]) -> tuple[TelegramChannelSettings, ...]:
+    value = table.get("channels", [])
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError("telegram.channels must be an array of public t.me URLs")
+
+    channels: list[TelegramChannelSettings] = []
+    seen: set[str] = set()
+    for raw_url in value:
+        candidate = raw_url.strip()
+        if not candidate:
+            continue
+        parsed = urlsplit(candidate)
+        host = (parsed.hostname or "").casefold()
+        if parsed.scheme.casefold() not in {"http", "https"} or host not in {
+            "t.me",
+            "www.t.me",
+        }:
+            raise ValueError(
+                f"telegram channel must use a public t.me URL: {candidate!r}"
+            )
+        if parsed.query or parsed.fragment:
+            raise ValueError(
+                f"telegram channel URL must not contain a query or fragment: {candidate!r}"
+            )
+        parts = [part for part in parsed.path.split("/") if part]
+        if len(parts) == 2 and parts[0].casefold() == "s":
+            parts = parts[1:]
+        if len(parts) != 1 or not TELEGRAM_HANDLE_RE.fullmatch(parts[0]):
+            raise ValueError(
+                "telegram channel URL must identify one public channel handle, "
+                f"not a post or invite link: {candidate!r}"
+            )
+        handle = parts[0].casefold()
+        if handle in seen:
+            raise ValueError(f"telegram.channels contains duplicate handle: {handle}")
+        seen.add(handle)
+        channels.append(
+            TelegramChannelSettings(
+                handle=handle,
+                url=f"https://t.me/{handle}",
+                preview_url=f"https://t.me/s/{handle}",
+            )
+        )
+    return tuple(channels)
+
+
 def _path(workspace_root: Path, value: str) -> Path:
     candidate = Path(value).expanduser()
     if not candidate.is_absolute():
@@ -236,6 +306,7 @@ def load_settings(code_root: Path, config_path: Path | None = None) -> Settings:
     automation = _table(data, "automation")
     follow_up = _table(data, "follow_up")
     mail = _table(data, "mail")
+    telegram = _table(data, "telegram")
     search = _table(data, "search")
     source_stream_aliases = _table(data, "source_stream_aliases")
     labels = _table(data, "channel_labels")
@@ -265,6 +336,20 @@ def load_settings(code_root: Path, config_path: Path | None = None) -> Settings:
     ):
         raise ValueError(
             "mail.archive_processed_linkedin requires mail.scan_linkedin_inbox = true"
+        )
+
+    telegram_settings = TelegramSettings(
+        enabled=_boolean(telegram, "enabled", False),
+        initial_lookback_days=_integer(
+            telegram, "initial_lookback_days", 30, 1
+        ),
+        channels=_telegram_channels(telegram),
+    )
+    if telegram_settings.initial_lookback_days > 366:
+        raise ValueError("telegram.initial_lookback_days must be between 1 and 366")
+    if telegram_settings.enabled and not telegram_settings.channels:
+        raise ValueError(
+            "telegram.enabled = true requires at least one public channel URL"
         )
 
     settings = Settings(
@@ -317,6 +402,7 @@ def load_settings(code_root: Path, config_path: Path | None = None) -> Settings:
             ),
         ),
         mail=mail_settings,
+        telegram=telegram_settings,
         search=SearchSettings(
             required_streams=_stream_names(
                 search,
