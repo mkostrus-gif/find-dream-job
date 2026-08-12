@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Added schema v6 append-only lifecycle, current-action, and external-action
+  evidence; precise interview progression; configurable decision metadata;
+  multi-label source attribution; import quarantine and reprocessing; outcome,
+  WIP/SLA, operational-health, account-portfolio, and false-negative-audit
+  workflows; plus backed-up idempotent migrations from every supported prior
+  schema.
 - Added schema v5 generic source checkpoints and configurable public Telegram
   discovery with a per-channel 30-day initial backfill, post-ID deltas,
   fail-closed page/post/score/SQLite reconciliation, and cursors that advance

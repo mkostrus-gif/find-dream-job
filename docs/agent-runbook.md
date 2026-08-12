@@ -87,6 +87,7 @@ Run health checks in the selected real workspace:
 python3 scripts/jobctl.py doctor --strict --json
 python3 scripts/jobctl.py rebuild --json
 python3 scripts/jobctl.py stats
+python3 scripts/jobctl.py operational-doctor --strict --json
 ```
 
 Use synthetic vacancy data only for a separate smoke test. On POSIX systems:
@@ -101,6 +102,11 @@ JOB_SEARCH_HOME="$SMOKE_WORKSPACE" python3 scripts/jobctl.py doctor --strict --j
 
 The temporary database proves mechanics, not live source access or candidate
 fit. Do not report its vacancies as search results.
+
+Structural health and operational closeout are intentionally separate. A new
+or stale workspace may pass `doctor --strict` while
+`operational-doctor --strict` fails because current required coverage is
+absent. Do not weaken or skip that closeout gate.
 
 ### Upgrade an existing private workspace
 
@@ -117,14 +123,15 @@ JOB_SEARCH_HOME="/path/to/private-workspace" \
   python3 scripts/jobctl.py stats
 ```
 
-Never use `--no-backup` on a live database. Schema v5 preserves schema v4 and
-adds empty generic incremental-source checkpoints; it never fabricates a
-completed source or cursor. Schema v4 preserves the schema-v3 external-ID
-aliases, raw source streams, and every existing row. It adds canonical stream
-keys, employer interactions, account radar tables, and vacancy factors without
-inventing any historical outcome or evidence. Restore the timestamped backup
-with the prior Engine version for rollback; there is no destructive reverse
-migration.
+Never use `--no-backup` on a live database. Schema v6 upgrades supported
+versions v1–v5 and preserves raw source hits, canonical vacancy identity,
+aliases, applications, interactions, accounts, factors, and checkpoints. A
+legacy confirmed application becomes a durable event with explicitly
+incomplete history and unknown legacy authorization; no campaign, resume,
+reply, interview, offer, quarantine reason, or source completion is invented.
+Restore the timestamped backup with the prior Engine version for rollback;
+there is no destructive reverse migration. Russian operator recovery guidance
+is in [`operations-v6.ru.md`](operations-v6.ru.md).
 
 ## 5. Execute one search cycle
 
@@ -133,8 +140,8 @@ Use [`prompts/daily_run.md`](../prompts/daily_run.md) as the canonical order:
 1. load settings and private evidence;
 2. validate and rebuild existing state;
 3. reconcile inbound replies and external statuses; record each automated or
-   human employer event with `record-employer-interaction`, then make any
-   evidence-backed stage change separately;
+   human employer event with `record-employer-interaction`, then append precise
+   lifecycle evidence separately;
 4. process authorized Gmail HH mail and every LinkedIn message currently in
    Inbox; score every recommended vacancy and verify each authorized archive;
 5. when Telegram is enabled, build its SQLite-backed backfill/delta plan,
@@ -145,8 +152,10 @@ Use [`prompts/daily_run.md`](../prompts/daily_run.md) as the canonical order:
    query through its final fully loaded page, and deduplicate against SQLite;
 7. normalize results into ignored JSON and ingest them;
 8. score the real mandate, hard constraints, and open questions;
-9. prepare or perform only the external actions allowed by current policy;
-10. verify visible success before recording sent state;
+9. prepare only in-scope actions; persist an exact `authorized` action record
+   before any attempt—score and `auto_apply` are not authorization;
+10. append attempted/blocked/failed evidence and verify visible success before
+    adding `visibly_confirmed`;
 11. run every enabled fail-closed source check, rebuild, validate, and report.
 
 Use [`prompts/scan_channel.md`](../prompts/scan_channel.md) when the task is
@@ -175,10 +184,17 @@ Preserve source URL, source identity, discovery date, title, company, mandate
 evidence, score, risks, open questions, and next action. Do not manufacture a
 URL or employer identity to make a row importable.
 
-Preserve raw `source_stream`. Local `[source_stream_aliases]` may consolidate
-historical names and case variants for reporting, but unmapped values retain
-their raw identity and remain visible in `reports/source_streams.md`. Aliases do
-not alter the fail-closed `search.required_streams` coverage manifest.
+CAPTCHA, logged-out/access-error pages, malformed payloads, and source-aware
+missing required fields belong in quarantine, not among low-fit vacancies.
+Inspect `quarantine-report`; reprocess one exact ID only after correcting its
+raw/replacement payload. `classify-legacy-records --dry-run` never mutates
+ambiguous history.
+
+Preserve raw `source_stream`. Local `[source_stream_aliases]` may map one whole
+raw label to one or several normalized labels, but arbitrary punctuation is
+never split. Unmapped values retain their raw identity and remain visible in
+`reports/source_streams.md`. Alias changes refresh only derived links on
+rebuild; they do not alter the fail-closed `search.required_streams` manifest.
 
 After ingest, reconcile scan identities by `(channel, external_id)` against
 both `vacancies` and `vacancy_external_aliases`. A semantic repost is healthy
@@ -237,12 +253,15 @@ interaction only when the actor/humanity classification and evidence note are
 stored. Neither event changes the funnel automatically. Record interview or
 rejection state separately after visible evidence.
 
-Use `conversion-report --as-of YYYY-MM-DD --json` or the generated
-`reports/conversion_cohorts.md`. The cohort grain is one vacancy at its earliest
-confirmed application. Human-reply maturity is 14 calendar days; interview-1
-maturity is 30. First-touch source attribution selects the earliest hit on or
-before the application date, then `source_hits.id`. Never infer historical
-replies from status text; absent structured history must display `n/a`.
+Use `outcome-scorecard --as-of YYYY-MM-DD --json` or the generated
+`reports/outcome_scorecard.md`. The cohort grain is one canonical vacancy at
+its earliest confirmed-application lifecycle event. Human-reply maturity is 14
+calendar days; completed-interview maturity is 30. Invitations and scheduled
+slots are separate and do not count as completed. First-touch source
+attribution uses the explicitly linked application source, otherwise the
+earliest hit on or before application date and then `source_hits.id`. Never
+infer historical outcomes from status text; incomplete history must display
+`n/a`.
 
 ### Maintain employer accounts and factors
 
@@ -252,6 +271,10 @@ company matching is not. `ai_adoption` is an employer signal only. It does not
 prove candidate fit, growth, culture, or enterprise AI transformation
 experience. Vacancy factors such as `hiring_reality` and `human_access` inform
 action planning but never replace strategic fit or change score automatically.
+Maintain the configured active-account portfolio limit, review cadence,
+website/careers freshness, target campaign/role metadata, governance evidence,
+and human-path status. These remain separate from vacancy fit and permission to
+contact a person.
 
 ## 7. Handle blockers
 

@@ -80,12 +80,19 @@ It provides:
   fail-closed post/ingest reconciliation;
 - Gmail HH and LinkedIn job-mail ingestion, with per-message reconciliation and
   authorized archive verification in the daily workflow;
-- a compact application funnel and structured follow-up rounds;
+- append-only durable lifecycle events independent from current work actions;
+- explicit drafted/authorized/attempted/visibly-confirmed/blocked external
+  action evidence, with no score-based permission semantics;
+- a capped, paginated WIP/SLA queue with overflow and overdue evidence;
 - evidence-backed recruiter and hiring-manager contacts;
 - structured employer interactions that distinguish automated acknowledgments
   from human replies without changing funnel stage;
-- vacancy-level 14/30-day conversion cohorts with deterministic first-touch
-  source attribution and canonical stream aliases;
+- vacancy-level 14/30-day outcome cohorts with precise interview states,
+  deterministic first-touch attribution, field completeness, and configured
+  campaign/resume/message breakdowns;
+- preserved raw source hits with explicit many-to-many normalized labels;
+- quarantine and explicit reprocessing for technical/non-vacancy records;
+- separate structural and fail-closed operational closeout doctors;
 - an explicit employer account radar, evidence-backed employer signals, and
   structured vacancy factors that remain separate from candidate-relative score;
 - generated `views/*.md`, `reports/*.md`, and `dashboard/index.html`;
@@ -193,6 +200,7 @@ The core CLI uses only the Python standard library.
 ```text
 init                      Create local settings, profile templates, and DB
 doctor --strict --json    Validate config, profile paths, and SQLite health
+operational-doctor        Check technical health and daily-closeout readiness
 ingest-json FILE          Import structured vacancy/evaluation rows
 ingest-gmail-json FILE    Import HH or LinkedIn vacancy links extracted from Gmail
 build-coverage-plan FILE  Generate deterministic HH URLs and manifest skeleton
@@ -201,8 +209,16 @@ build-telegram-plan       Generate per-channel first-backfill or delta plan
 check-telegram-coverage   Validate post/ingest evidence and advance cursors
 migrate-schema            Back up and upgrade an existing SQLite workspace
 update-vacancy            Change one vacancy and optionally its application
+set-current-action        Append current WIP/action state without lifecycle loss
+record-lifecycle-event    Append evidence-backed outcome/interview state
+record-external-action    Append authorization, attempt, and visible evidence
 record-employer-interaction Append a human or automated employer event
 conversion-report         Calculate vacancy-level 14/30-day cohorts
+outcome-scorecard         Calculate the first-class evidence outcome scorecard
+wip-queue                 Read the capped, paginated WIP/SLA queue
+quarantine-report         Audit quarantined ingestion records
+reprocess-quarantine      Retry one exact quarantine record
+false-negative-audit      Deterministically sample rejected/low-priority rows
 upsert-employer-account   Create or update an exact employer account
 record-employer-signal    Append an evidence-backed account signal
 link-vacancy-account      Explicitly link a vacancy to an account
@@ -242,6 +258,7 @@ tree.
 - [Project rules](PROJECT_RULES.md)
 - [Architecture](docs/architecture.md)
 - [Configuration](docs/configuration.md)
+- [Russian v6 operator guide](docs/operations-v6.ru.md)
 - [Privacy model](docs/privacy.md)
 - [Roadmap](docs/roadmap.md)
 - [Contributing](CONTRIBUTING.md)

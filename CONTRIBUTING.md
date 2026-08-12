@@ -28,12 +28,14 @@ Agents must execute the applicable checks, inspect failures, and report exact
 results. Do not run development tests against the live workspace or repair a
 test by weakening privacy, evidence, or review-only defaults.
 
-Schema contributions must also run an isolated synthetic migration from the
-previous supported version with the default backup enabled, followed by
+Schema contributions must also run isolated synthetic migrations from every
+supported prior version with the default backup enabled, followed by
 `rebuild --json`, `stats`, and `doctor --strict --json`. Verify row counts,
 `PRAGMA integrity_check`, `PRAGMA foreign_key_check`, backup creation, and
-idempotent repeated migration. Never use a real candidate database as migration
-proof.
+idempotent repeated migration. When operational state is affected, also run
+`operational-doctor`, the outcome scorecard, WIP pagination, generated-output
+language QA, and dashboard QA at desktop and narrow widths. Never use a real
+candidate database as migration proof.
 
 ## Pull requests
 

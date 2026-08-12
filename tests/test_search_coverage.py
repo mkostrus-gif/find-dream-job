@@ -85,8 +85,8 @@ class SearchCoverageUnitTests(unittest.TestCase):
         }
         result = validate_coverage_manifest(manifest, ("A", "B"))
         self.assertFalse(result["ok"])
-        self.assertTrue(any("required stream is blocked" in issue for issue in result["issues"]))
-        self.assertIn("missing required stream: B", result["issues"])
+        self.assertTrue(any("Обязательный поток заблокирован" in issue for issue in result["issues"]))
+        self.assertIn("Отсутствует обязательный поток: B.", result["issues"])
 
     def test_wrong_period_or_non_declarative_url_is_rejected(self) -> None:
         stream = completed_stream("A")
@@ -104,8 +104,8 @@ class SearchCoverageUnitTests(unittest.TestCase):
         result = validate_coverage_manifest(manifest, ("A",))
         self.assertFalse(result["ok"])
         joined = "\n".join(result["issues"])
-        self.assertIn("deprecated period", joined)
-        self.assertIn("declarative OR/search_period plan", joined)
+        self.assertIn("устаревший параметр period", joined)
+        self.assertIn("декларативному плану OR/search_period", joined)
 
     def test_partial_lazy_load_is_rejected(self) -> None:
         stream = completed_stream("A")
@@ -122,7 +122,7 @@ class SearchCoverageUnitTests(unittest.TestCase):
         }
         result = validate_coverage_manifest(manifest, ("A",))
         self.assertFalse(result["ok"])
-        self.assertTrue(any("expected 100 after lazy-load" in issue for issue in result["issues"]))
+        self.assertTrue(any("ожидалось 100" in issue for issue in result["issues"]))
 
     def test_semantic_fingerprint_normalizes_reposts_conservatively(self) -> None:
         description = "<p>Lead a product and own P&amp;L. </p>" + "Build and scale teams. " * 8
@@ -258,7 +258,7 @@ class SearchCoverageIntegrationTests(unittest.TestCase):
                 4,
             )
         report = (self.workspace / "reports" / "search_coverage.md").read_text(encoding="utf-8")
-        self.assertIn("Run 2026-01-15 / hh: completed", report)
+        self.assertIn("Последний запуск: 2026-01-15 / hh: завершён", report)
 
     def test_schema_migration_requires_and_creates_backup(self) -> None:
         self.run_cli("init", "--json")
@@ -274,7 +274,7 @@ class SearchCoverageIntegrationTests(unittest.TestCase):
         self.assertNotEqual(blocked.returncode, 0)
         migrated = json.loads(self.run_cli("migrate-schema", "--json").stdout)
         self.assertEqual(migrated["from_version"], 1)
-        self.assertEqual(migrated["to_version"], 5)
+        self.assertEqual(migrated["to_version"], 6)
         self.assertTrue(migrated["backup"])
         self.assertTrue(list(database.parent.glob("job_search.sqlite.bak-schema-v1-*")))
         doctor = json.loads(self.run_cli("doctor", "--strict", "--json").stdout)

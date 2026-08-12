@@ -77,5 +77,11 @@ candidate. Do not translate uncertainty into a confident answer.
 - Hard requirements and practical constraints are explicit.
 - Unknown facts remain unresolved rather than guessed.
 - The final document passed parse and render QA.
-- Submission is authorized by local policy.
-- Visible success exists before SQLite is updated to applied.
+- The exact action has a durable `authorized` record with the current
+  authorization evidence; a score, draft, or `auto_apply` setting is not
+  authorization.
+- Record `attempted`, `blocked`, or `failed` after the attempt as applicable.
+- Visible success exists before a `visibly_confirmed` action creates the
+  durable `application_confirmed` event.
+- Record the actual submitted resume and message variant; do not replace them
+  with the planned versions.

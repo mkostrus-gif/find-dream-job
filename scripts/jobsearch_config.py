@@ -19,7 +19,8 @@ from urllib.parse import urlsplit
 
 DEFAULT_CHANNEL_LABELS = {
     "hh": "HH",
-    "email": "Email",
+    "company_site": "Сайт работодателя",
+    "email": "Почта",
     "telegram": "Telegram",
     "max": "Max",
     "linkedin": "LinkedIn",
@@ -106,7 +107,43 @@ class SearchSettings:
     required_streams: tuple[str, ...]
     default_period_days: int
     items_per_page: int
-    stream_aliases: dict[str, str]
+    stream_aliases: dict[str, tuple[str, ...]]
+    personal_recommendations_enabled: bool
+    personal_recommendation_stream: str
+
+
+@dataclass(frozen=True)
+class DecisionSettings:
+    campaign_ids: tuple[str, ...]
+    role_families: tuple[str, ...]
+    resume_ids: tuple[str, ...]
+    message_variants: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class WipBucketSettings:
+    key: str
+    label: str
+    limit: int
+    sla_days: int
+    active: bool
+
+
+@dataclass(frozen=True)
+class WipSettings:
+    page_size: int
+    buckets: tuple[WipBucketSettings, ...]
+
+
+@dataclass(frozen=True)
+class PolicySettings:
+    active_version: str
+    effective_date: str
+
+
+@dataclass(frozen=True)
+class AccountSettings:
+    active_portfolio_limit: int
 
 
 @dataclass(frozen=True)
@@ -123,81 +160,170 @@ class Settings:
     mail: MailSettings
     telegram: TelegramSettings
     search: SearchSettings
+    decision: DecisionSettings
+    wip: WipSettings
+    policy: PolicySettings
+    account: AccountSettings
     channel_labels: dict[str, str]
 
 
 def _table(data: dict[str, Any], key: str) -> dict[str, Any]:
     value = data.get(key, {})
     if not isinstance(value, dict):
-        raise ValueError(f"[{key}] must be a TOML table")
+        raise ValueError(f"Раздел [{key}] должен быть таблицей TOML.")
     return value
 
 
 def _string(table: dict[str, Any], key: str, default: str) -> str:
     value = table.get(key, default)
     if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{key} must be a non-empty string")
+        raise ValueError(f"{key}: требуется непустая строка.")
     return value.strip()
 
 
 def _boolean(table: dict[str, Any], key: str, default: bool) -> bool:
     value = table.get(key, default)
     if not isinstance(value, bool):
-        raise ValueError(f"{key} must be true or false")
+        raise ValueError(f"{key}: требуется значение true или false.")
     return value
 
 
 def _integer(table: dict[str, Any], key: str, default: int, minimum: int) -> int:
     value = table.get(key, default)
     if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
-        raise ValueError(f"{key} must be an integer >= {minimum}")
+        raise ValueError(f"{key}: требуется целое число не меньше {minimum}.")
     return value
 
 
 def _strings(table: dict[str, Any], key: str, default: list[str]) -> tuple[str, ...]:
     value = table.get(key, default)
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
-        raise ValueError(f"{key} must be an array of strings")
+        raise ValueError(f"{key}: требуется массив строк.")
     normalized = [item.strip().lower() for item in value if item.strip()]
     if not normalized:
-        raise ValueError(f"{key} must contain at least one value")
+        raise ValueError(f"{key}: требуется хотя бы одно значение.")
     if len(normalized) != len(set(normalized)):
-        raise ValueError(f"{key} must not contain duplicates")
+        raise ValueError(f"{key}: повторяющиеся значения запрещены.")
     return tuple(normalized)
 
 
 def _stream_names(table: dict[str, Any], key: str, default: list[str]) -> tuple[str, ...]:
     value = table.get(key, default)
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
-        raise ValueError(f"{key} must be an array of strings")
+        raise ValueError(f"{key}: требуется массив строк.")
     normalized = [item.strip() for item in value if item.strip()]
     if not normalized:
-        raise ValueError(f"{key} must contain at least one value")
+        raise ValueError(f"{key}: требуется хотя бы одно значение.")
     folded = [item.casefold() for item in normalized]
     if len(folded) != len(set(folded)):
-        raise ValueError(f"{key} must not contain duplicates")
+        raise ValueError(f"{key}: повторяющиеся значения запрещены.")
     return tuple(normalized)
 
 
-def _stream_aliases(table: dict[str, Any]) -> dict[str, str]:
-    aliases: dict[str, str] = {}
+def _stream_aliases(table: dict[str, Any]) -> dict[str, tuple[str, ...]]:
+    """Parse exact raw aliases without ever guessing separators.
+
+    A scalar keeps backward compatibility.  An array provides explicit
+    multi-label attribution; arbitrary plus signs and other punctuation are
+    never split implicitly.
+    """
+
+    aliases: dict[str, tuple[str, ...]] = {}
     original_keys: dict[str, str] = {}
     for raw_alias, canonical_key in table.items():
         if not isinstance(raw_alias, str) or not raw_alias.strip():
-            raise ValueError("source_stream_aliases keys must be non-empty strings")
-        if not isinstance(canonical_key, str) or not canonical_key.strip():
+            raise ValueError("Ключи source_stream_aliases должны быть непустыми строками.")
+        if isinstance(canonical_key, str):
+            values = [canonical_key]
+        elif isinstance(canonical_key, list) and all(
+            isinstance(item, str) for item in canonical_key
+        ):
+            values = canonical_key
+        else:
             raise ValueError(
-                "source_stream_aliases values must be non-empty canonical keys"
+                "Значения source_stream_aliases должны быть каноническим ключом или массивом ключей."
+            )
+        cleaned = [item.strip() for item in values if item.strip()]
+        if not cleaned:
+            raise ValueError(
+                "Значения source_stream_aliases должны содержать непустой канонический ключ."
+            )
+        folded_values = [item.casefold() for item in cleaned]
+        if len(folded_values) != len(set(folded_values)):
+            raise ValueError(
+                "Значения source_stream_aliases не должны содержать повторяющиеся канонические ключи."
             )
         folded = raw_alias.strip().casefold()
         if folded in aliases:
             raise ValueError(
-                "source_stream_aliases contains case-insensitive duplicate keys: "
-                f"{original_keys[folded]!r} and {raw_alias.strip()!r}"
+                "В source_stream_aliases есть ключи, совпадающие без учёта регистра: "
+                f"{original_keys[folded]!r} и {raw_alias.strip()!r}."
             )
-        aliases[folded] = canonical_key.strip()
+        aliases[folded] = tuple(
+            value for _, value in sorted(zip(folded_values, cleaned), key=lambda pair: pair[0])
+        )
         original_keys[folded] = raw_alias.strip()
     return aliases
+
+
+def _configured_values(
+    table: dict[str, Any], key: str, *, allow_empty: bool = True
+) -> tuple[str, ...]:
+    value = table.get(key, [])
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError(f"{key}: требуется массив строк.")
+    cleaned = [item.strip() for item in value if item.strip()]
+    if not allow_empty and not cleaned:
+        raise ValueError(f"{key}: требуется хотя бы одно значение.")
+    folded = [item.casefold() for item in cleaned]
+    if len(folded) != len(set(folded)):
+        raise ValueError(f"{key}: повторяющиеся значения запрещены.")
+    return tuple(cleaned)
+
+
+DEFAULT_WIP_BUCKETS: tuple[tuple[str, str, int, int, bool], ...] = (
+    ("urgent", "Срочный ответ работодателю или данные от пользователя", 20, 1, True),
+    ("due_follow_up", "Наступивший срок повторного обращения", 30, 2, True),
+    ("deep_review", "Углублённая проверка сильной возможности", 20, 5, True),
+    ("account_research", "Исследование целевого работодателя", 10, 7, True),
+    ("backlog", "Резерв вне активного лимита", 0, 30, False),
+)
+
+
+def _wip_settings(table: dict[str, Any]) -> WipSettings:
+    page_size = _integer(table, "page_size", 50, 1)
+    if page_size > 500:
+        raise ValueError("Значение queue.page_size должно быть от 1 до 500.")
+    limits = table.get("limits", {})
+    sla_days = table.get("sla_days", {})
+    labels = table.get("labels", {})
+    if not isinstance(limits, dict) or not isinstance(sla_days, dict) or not isinstance(labels, dict):
+        raise ValueError("Разделы queue.limits, queue.sla_days и queue.labels должны быть таблицами TOML.")
+    buckets: list[WipBucketSettings] = []
+    known = {item[0] for item in DEFAULT_WIP_BUCKETS}
+    unknown = (set(limits) | set(sla_days) | set(labels)) - known
+    if unknown:
+        raise ValueError("В queue указаны неподдерживаемые ключи групп: " + ", ".join(sorted(unknown)))
+    for key, default_label, default_limit, default_sla, active in DEFAULT_WIP_BUCKETS:
+        limit = limits.get(key, default_limit)
+        sla = sla_days.get(key, default_sla)
+        label = labels.get(key, default_label)
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
+            raise ValueError(f"queue.limits.{key}: требуется целое число не меньше 0.")
+        if not isinstance(sla, int) or isinstance(sla, bool) or sla < 1:
+            raise ValueError(f"queue.sla_days.{key}: требуется целое число не меньше 1.")
+        if not isinstance(label, str) or not label.strip():
+            raise ValueError(f"queue.labels.{key}: требуется непустая строка.")
+        buckets.append(
+            WipBucketSettings(
+                key=key,
+                label=label.strip(),
+                limit=limit,
+                sla_days=sla,
+                active=active,
+            )
+        )
+    return WipSettings(page_size=page_size, buckets=tuple(buckets))
 
 
 TELEGRAM_HANDLE_RE = re.compile(r"^[A-Za-z0-9_]{5,32}$")
@@ -206,7 +332,7 @@ TELEGRAM_HANDLE_RE = re.compile(r"^[A-Za-z0-9_]{5,32}$")
 def _telegram_channels(table: dict[str, Any]) -> tuple[TelegramChannelSettings, ...]:
     value = table.get("channels", [])
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
-        raise ValueError("telegram.channels must be an array of public t.me URLs")
+        raise ValueError("Поле telegram.channels должно быть массивом публичных адресов t.me.")
 
     channels: list[TelegramChannelSettings] = []
     seen: set[str] = set()
@@ -221,23 +347,23 @@ def _telegram_channels(table: dict[str, Any]) -> tuple[TelegramChannelSettings, 
             "www.t.me",
         }:
             raise ValueError(
-                f"telegram channel must use a public t.me URL: {candidate!r}"
+                f"Канал Telegram должен использовать публичный адрес t.me: {candidate!r}."
             )
         if parsed.query or parsed.fragment:
             raise ValueError(
-                f"telegram channel URL must not contain a query or fragment: {candidate!r}"
+                f"Адрес канала Telegram не должен содержать запрос или фрагмент: {candidate!r}."
             )
         parts = [part for part in parsed.path.split("/") if part]
         if len(parts) == 2 and parts[0].casefold() == "s":
             parts = parts[1:]
         if len(parts) != 1 or not TELEGRAM_HANDLE_RE.fullmatch(parts[0]):
             raise ValueError(
-                "telegram channel URL must identify one public channel handle, "
-                f"not a post or invite link: {candidate!r}"
+                "Адрес Telegram должен указывать на один публичный канал, "
+                f"а не на публикацию или приглашение: {candidate!r}."
             )
         handle = parts[0].casefold()
         if handle in seen:
-            raise ValueError(f"telegram.channels contains duplicate handle: {handle}")
+            raise ValueError(f"В telegram.channels повторяется имя канала: {handle}.")
         seen.add(handle)
         channels.append(
             TelegramChannelSettings(
@@ -265,10 +391,10 @@ def _path_value(
 def _profile_files(table: dict[str, Any], workspace_root: Path) -> tuple[Path, ...]:
     value = table.get("files", ["private/profile.md"])
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
-        raise ValueError("profile.files must be an array of paths")
+        raise ValueError("Поле profile.files должно быть массивом путей.")
     files = tuple(_path(workspace_root, item) for item in value if item.strip())
     if not files:
-        raise ValueError("profile.files must contain at least one path")
+        raise ValueError("Поле profile.files должно содержать хотя бы один путь.")
     return files
 
 
@@ -297,7 +423,7 @@ def load_settings(code_root: Path, config_path: Path | None = None) -> Settings:
         with resolved_config.open("rb") as handle:
             loaded = tomllib.load(handle)
         if not isinstance(loaded, dict):
-            raise ValueError("settings.toml must contain TOML tables")
+            raise ValueError("Файл settings.toml должен содержать таблицы TOML.")
         data = loaded
 
     project = _table(data, "project")
@@ -308,6 +434,10 @@ def load_settings(code_root: Path, config_path: Path | None = None) -> Settings:
     mail = _table(data, "mail")
     telegram = _table(data, "telegram")
     search = _table(data, "search")
+    decision = _table(data, "decision")
+    queue = _table(data, "queue")
+    policy = _table(data, "policy")
+    account = _table(data, "account")
     source_stream_aliases = _table(data, "source_stream_aliases")
     labels = _table(data, "channel_labels")
 
@@ -316,12 +446,12 @@ def load_settings(code_root: Path, config_path: Path | None = None) -> Settings:
     )
     primary_channel = _string(follow_up, "primary_channel", "email").lower()
     if primary_channel in direct_channels:
-        raise ValueError("follow_up.primary_channel must not also be a direct channel")
+        raise ValueError("Канал follow_up.primary_channel не должен одновременно входить в прямые каналы.")
 
     channel_labels = dict(DEFAULT_CHANNEL_LABELS)
     for channel, label in labels.items():
         if not isinstance(channel, str) or not isinstance(label, str) or not label.strip():
-            raise ValueError("channel_labels entries must map strings to non-empty strings")
+            raise ValueError("Элементы channel_labels должны сопоставлять строки с непустыми строками.")
         channel_labels[channel.strip().lower()] = label.strip()
 
     mail_settings = MailSettings(
@@ -335,7 +465,7 @@ def load_settings(code_root: Path, config_path: Path | None = None) -> Settings:
         and not mail_settings.scan_linkedin_inbox
     ):
         raise ValueError(
-            "mail.archive_processed_linkedin requires mail.scan_linkedin_inbox = true"
+            "Для mail.archive_processed_linkedin требуется mail.scan_linkedin_inbox = true."
         )
 
     telegram_settings = TelegramSettings(
@@ -346,10 +476,10 @@ def load_settings(code_root: Path, config_path: Path | None = None) -> Settings:
         channels=_telegram_channels(telegram),
     )
     if telegram_settings.initial_lookback_days > 366:
-        raise ValueError("telegram.initial_lookback_days must be between 1 and 366")
+        raise ValueError("Значение telegram.initial_lookback_days должно быть от 1 до 366.")
     if telegram_settings.enabled and not telegram_settings.channels:
         raise ValueError(
-            "telegram.enabled = true requires at least one public channel URL"
+            "Для telegram.enabled = true требуется хотя бы один адрес публичного канала."
         )
 
     settings = Settings(
@@ -359,7 +489,7 @@ def load_settings(code_root: Path, config_path: Path | None = None) -> Settings:
         config_loaded=resolved_config.exists(),
         project=ProjectSettings(
             title=_string(project, "title", "Find Dream Job"),
-            locale=_string(project, "locale", "en"),
+            locale=_string(project, "locale", "ru"),
         ),
         paths=PathSettings(
             database=_path_value(paths, "database", "data/job_search.sqlite", workspace_root),
@@ -414,14 +544,46 @@ def load_settings(code_root: Path, config_path: Path | None = None) -> Settings:
             ),
             items_per_page=_integer(search, "items_per_page", 100, 1),
             stream_aliases=_stream_aliases(source_stream_aliases),
+            personal_recommendations_enabled=_boolean(
+                search, "personal_recommendations_enabled", False
+            ),
+            personal_recommendation_stream=_string(
+                search,
+                "personal_recommendation_stream",
+                "personal_recommendations",
+            ),
+        ),
+        decision=DecisionSettings(
+            campaign_ids=_configured_values(decision, "campaign_ids"),
+            role_families=_configured_values(decision, "role_families"),
+            resume_ids=_configured_values(decision, "resume_ids"),
+            message_variants=_configured_values(decision, "message_variants"),
+        ),
+        wip=_wip_settings(queue),
+        policy=PolicySettings(
+            active_version=_string(policy, "active_version", "engine-safe-default-v1"),
+            effective_date=_string(policy, "effective_date", "2026-01-01"),
+        ),
+        account=AccountSettings(
+            active_portfolio_limit=_integer(
+                account, "active_portfolio_limit", 20, 1
+            )
         ),
         channel_labels=channel_labels,
     )
 
     if settings.automation.apply_threshold > 100:
-        raise ValueError("automation.apply_threshold must be between 0 and 100")
+        raise ValueError("Значение automation.apply_threshold должно быть от 0 до 100.")
     if settings.search.items_per_page > 100:
-        raise ValueError("search.items_per_page must be between 1 and 100")
+        raise ValueError("Значение search.items_per_page должно быть от 1 до 100.")
+    try:
+        effective_date = __import__("datetime").date.fromisoformat(
+            settings.policy.effective_date
+        )
+    except ValueError as exc:
+        raise ValueError("Поле policy.effective_date должно быть датой в формате ГГГГ-ММ-ДД.") from exc
+    if effective_date.year < 2000:
+        raise ValueError("Год в policy.effective_date должен быть не раньше 2000.")
     return settings
 
 

@@ -18,6 +18,8 @@ Default local paths:
 - `views/today.md` — newest vacancies;
 - `views/funnel.md` — funnel by source channel;
 - `views/followups.md` — due follow-ups and contact-search state;
+- `views/wip_queue.md` and numbered `wip_queue_page_*.md` files — capped,
+  deterministic WIP/SLA queue with explicit overflow;
 - `views/outreach_contacts.md` — verified direct contacts;
 - `views/employer_accounts.md` — account radar and latest employer signals;
 - `views/vacancy_factors.md` — structured evidence factors;
@@ -25,6 +27,11 @@ Default local paths:
 - `reports/source_streams.md` — raw-to-canonical stream diagnostics;
 - `reports/source_checkpoints.md` — durable cursors for incremental sources;
 - `reports/conversion_cohorts.md` — vacancy-level application conversion;
+- `reports/outcome_scorecard.md` — evidence-first 14/30-day outcome scorecard;
+- `reports/quarantine.md` and numbered pages — auditable non-vacancy and
+  technical ingestion results;
+- `reports/false_negative_audit.md` — deterministic review of rejected and
+  low-priority screening decisions;
 - `reports/data_quality.md` — import diagnostics.
 
 All paths can be moved with `JOB_SEARCH_HOME` or `config/settings.toml`.
@@ -43,13 +50,21 @@ none exists. These checks establish technical health; they do not prove that
 candidate templates are factually complete. The onboarding evidence review is
 still required.
 
+`doctor --strict` checks structural health. `operational-doctor --strict`
+separately checks whether all exact daily-closeout preconditions are current.
+A structurally healthy database can correctly report
+`ready_for_daily_closeout = false` when required source coverage is stale or
+incomplete.
+
 Never ingest the public example vacancies into a candidate's real database.
 Use a disposable `JOB_SEARCH_HOME` for smoke tests.
 
 ## Data model
 
 - `vacancies` — canonical vacancy and latest state;
-- `source_hits` — discovery events by source and stream;
+- `source_hits` — raw discovery events whose `source_stream` is never rewritten;
+- `source_labels` / `source_hit_labels` — normalized many-to-many attribution
+  derived from current exact aliases;
 - `search_runs` / `search_coverage` — fail-closed daily-run manifests and
   per-stream page/query checkpoints;
 - `source_checkpoints` — per-source/per-stream cursors that advance only after
@@ -59,8 +74,18 @@ Use a disposable `JOB_SEARCH_HOME` for smoke tests.
 - `vacancy_fingerprints` — conservative semantic repost aliases based on
   company, title, and normalized description;
 - `evaluations` — screening/review decisions;
-- `applications` — application-level history;
-- `stage_events` — append-only stage/status evidence;
+- `applications` — backward-compatible application rows linked to lifecycle
+  evidence when known;
+- `lifecycle_events` — append-only durable application, rejection, interview,
+  no-show, cancellation, and offer facts;
+- `action_events` — append-only current review/input/follow-up/WIP state,
+  independent from lifecycle;
+- `external_actions` — drafted/authorized/attempted/confirmed/blocked/failed
+  evidence for actions affecting external systems;
+- `vacancy_decision_metadata` — configured campaigns, role families, evidence
+  confidence, hard gates, open questions, resume IDs, message variant, and
+  human-path state;
+- `stage_events` — legacy append-only stage/status compatibility evidence;
 - `employer_interactions` — append-only inbound/outbound employer interactions,
   separate from funnel stage changes;
 - `interview_summaries` — links to private local notes;
@@ -72,6 +97,10 @@ Use a disposable `JOB_SEARCH_HOME` for smoke tests.
   evidence-backed employer observations;
 - `vacancy_employer_accounts` — explicit vacancy-to-account links;
 - `vacancy_factors` — structured evidence that never changes score automatically;
+- `quarantine_records` — raw technical/non-vacancy evidence and retry state;
+- `policy_versions` / `screening_decisions` — one active dated policy plus
+  reproducible rule-level screening history;
+- `migration_log` — auditable schema-upgrade record;
 - `import_issues` — ingestion diagnostics.
 
 Supported funnel stages are `seen`, `needs_input`, `follow_up`, `applied`,
@@ -82,10 +111,13 @@ The evidence vocabulary is intentionally non-interchangeable:
 | Concept | Durable evidence | What it does not prove |
 |---|---|---|
 | Screening signal | `source_hits.raw_status` / evaluation evidence | Application or employer interest |
-| Application | Confirmed `applications` row after visible submission success | Human response |
+| Current work item | Latest `action_events` row | Application, rejection, interview, or offer |
+| Application | Earliest `application_confirmed` lifecycle event linked to a visibly confirmed action | Human response |
 | Automated acknowledgment | Inbound automated `employer_interactions` row | Human reply |
 | Human reply | Inbound human `employer_interactions` row after application | Interview or stage change |
-| Interview | Evidence-backed `interview_1` stage event | Offer or candidate fit by itself |
+| Interview invitation | `interview_invited` lifecycle event and round | Scheduled or completed interview |
+| Scheduled interview | `interview_scheduled` event with scheduled time | Completed interview |
+| Completed interview | Explicit `interview_completed` event or a summary that passes the documented evidence rule | Offer or candidate fit by itself |
 | Verified contact | Active confirmed/strong `employer_contacts` row | Reply or hiring authority beyond stored evidence |
 | Employer signal | Evidence-backed `employer_account_signals` row | Candidate experience or fit |
 | Candidate evidence | Configured private profile/Q&A source | Employer quality or hiring reality |
@@ -135,6 +167,21 @@ Accepted top-level JSON forms are an array or an object containing
 The command deduplicates, writes the appropriate history rows, and regenerates
 the read models.
 
+Decision metadata fields (`campaign_id`, `role_family`, `master_resume_id`,
+`planned_resume_id`, `actual_resume_id`, and `message_variant`) accept only
+values declared in the local `[decision]` configuration. `confidence` uses the
+controlled vocabulary `low`, `medium`, `high`, `confirmed`, or `unknown`.
+`hard_gates` and `unresolved_questions` are structured arrays. Missing history
+stays unknown; ingestion never guesses a campaign, resume, gate result, or
+human path.
+
+CAPTCHA pages, logged-out or access-error pages, malformed URLs/payloads, and
+source-aware missing required fields are written to `quarantine_records` with
+raw evidence and retry context. They do not create `vacancies`, enter WIP, or
+affect vacancy/source/outcome denominators. Use `quarantine-report`, an exact
+`reprocess-quarantine --id ...`, or the non-mutating
+`classify-legacy-records --dry-run`; no age-based bulk mutation exists.
+
 When a source provides a description or snippet, include it in the JSON row.
 The engine resolves a row in deterministic order: canonical
 `vacancies.external_id`, stored external-ID alias in the same channel,
@@ -173,12 +220,15 @@ because of a factor, an AI label, or an employer signal.
 ## Canonical source streams
 
 `source_hits.source_stream` always preserves the raw source value. Optional
-local `[source_stream_aliases]` entries map raw aliases case-insensitively to a
-canonical reporting key. New hits also store the canonical key effective at
-ingest time; reports resolve every raw value against the current local mapping,
-so a mapping change takes effect on rebuild without rewriting history. An
-unmapped value keeps its raw key. Inspect `reports/source_streams.md` before
-assuming that a legacy spelling or case variant belongs to another stream.
+local `[source_stream_aliases]` entries map one exact raw alias
+case-insensitively to one canonical reporting key or an explicit array of
+several keys. The engine never splits arbitrary plus signs or other
+punctuation. `source_hit_labels` stores the derived many-to-many links, while
+the raw hit remains one row. Reports refresh links from the current aliases on
+rebuild, so a mapping change is predictable and does not rewrite history.
+Downstream application cohorts still receive one deterministic first touch:
+the first configured label of the selected raw hit. An unmapped value keeps its
+raw identity. Inspect `reports/source_streams.md` before consolidating streams.
 
 Search coverage still validates the exact configured
 `search.required_streams` manifest fail-closed. Stream aliases consolidate
@@ -275,39 +325,49 @@ python3 scripts/jobctl.py record-employer-interaction \
   --json
 ```
 
-Supported types are `human_reply`, `automated_ack`, `screening_request`,
-`interview_invite`, `rejection`, and `other`. An inbound event requires an
-evidence note. `automated_ack` must be automated and never counts as a human
-reply. Exact repeats are idempotent; an external reference, when supplied, is
-the strongest duplicate key. Recording an interaction never changes
-`vacancies.latest_stage`. Record `interview_1` or `rejected` separately with
-`update-vacancy` and a non-empty evidence note after external state is visibly
-confirmed. Historical interactions are never inferred from free-form status
-text.
+Supported interaction types are `human_reply`, `automated_ack`,
+`screening_request`, `interview_invite`, `rejection`, and `other`. An inbound
+event requires an evidence note. `automated_ack` must be automated and never
+counts as a human reply. Exact repeats are idempotent; an external reference,
+when supplied, is the strongest duplicate key. Recording an interaction never
+changes lifecycle or current action state. Historical interactions are never
+inferred from free-form status text.
+
+Use `record-lifecycle-event` for `rejected`, `interview_invited`,
+`interview_scheduled`, `interview_completed`, `interview_cancelled`, candidate
+or employer no-show, later rounds, and `offer_received`. Interview events
+require a positive round number; a scheduled event also requires its event
+time. An invitation or scheduled slot never counts as completed. The only
+summary shortcut is `attach-interview-summary --confirms-completion`: the file
+must contain at least 80 non-whitespace characters and three meaningful lines,
+and the command requires a separate completion-evidence note.
 
 Run a reproducible cohort calculation with:
 
 ```bash
 python3 scripts/jobctl.py conversion-report --as-of 2026-02-28 --json
+python3 scripts/jobctl.py outcome-scorecard --as-of 2026-02-28 --json
 ```
 
-The grain is one unique vacancy. Its application date is the earliest
-confirmed application row; repeated rows for that vacancy do not multiply the
-cohort. The 14-day human-reply denominator contains applications at least 14
-calendar days old at `as_of`. Its numerator contains cohort vacancies with an
-inbound human interaction after the application date. Automated
-acknowledgments are excluded. The 30-day interview denominator uses the same
-rule at 30 days; its numerator requires an `interview_1` stage event with a
-non-empty evidence note. Verified-contact and completed-contact-search
-coverage use all unique applications as their denominator.
+`conversion-report` remains a compatibility projection. The supported
+first-class report is `outcome-scorecard`, also generated as
+`reports/outcome_scorecard.md`. Its grain is one canonical vacancy plus its
+earliest `application_confirmed` lifecycle event; mutable application/action
+rows cannot multiply or erase the cohort. The 14-day human-reply denominator
+contains applications at least 14 calendar days old at `as_of`; automated
+acknowledgments are excluded. The 30-day completed-first-interview numerator
+requires explicit completion evidence, not an invite or scheduled slot.
 
 Source-stream attribution is deterministic first touch: the earliest
 `source_hit` on or before the first application date, with `source_hits.id` as
-the tie-breaker. Missing pre-application hits are attributed to `unknown`.
-Breakdowns are produced by source channel, canonical source stream, and
-application month. Every rate is shown with numerator and denominator; a tiny
-sample is not ranked as a proven winner. If no structured employer interaction
-exists, human-reply counts and rates are `n/a`, not a false zero.
+the tie-breaker, unless an application source is explicitly linked. Missing
+pre-application hits are unknown. Breakdowns cover configured campaign, role
+family, normalized source stream, source channel, employer account, actual
+resume, message variant, and application month. The scorecard also reports
+invitations, scheduled/completed/later interviews, offers, contact-search and
+verified-human-path coverage, and field completeness. Every rate carries its
+numerator and denominator. Incomplete migrated history is `n/a`, not a
+fabricated zero, and samples below ten receive an explicit warning.
 
 ## Employer account radar and vacancy factors
 
@@ -338,6 +398,13 @@ AI adoption and a candidate's use of AI tools do not prove enterprise AI
 transformation experience. Candidate claims require private candidate evidence,
 and candidate-relative scores remain the result of private policy.
 
+Accounts also support a configured active-portfolio limit, account status and
+priority, review cadence/next date, website and careers-page freshness,
+configured campaign/role-family targets, owner/sponsor/governance evidence, and
+human-path status. Signals have dates and controlled confidence. Account
+signals, vacancy fit, candidate score, and authorization to contact a person
+remain four separate concepts.
+
 ## Schema upgrades
 
 Schema upgrades are explicit and create a timestamped backup by default:
@@ -347,13 +414,16 @@ JOB_SEARCH_HOME="/path/to/private-workspace" \
   python3 scripts/jobctl.py migrate-schema --json
 ```
 
-Schema v5 retains schema v4 and adds generic incremental `source_checkpoints`.
-It does not invent a Telegram cursor or mark any source initialized: the first
-successful manifest creates that state. Schema v4 itself retains the schema-v3
-external-ID model and adds canonical stream keys, employer interactions,
-account radar tables, and vacancy factors. Older workspaces are upgraded
-without rewriting raw stream values or inventing historical replies, accounts,
-signals, links, factors, or source completion.
+Schema v6 upgrades every supported schema v1–v5. It retains the v5 incremental
+checkpoints and adds lifecycle/action events, external-action evidence,
+decision metadata, many-to-many source labels, quarantine, versioned screening
+policy, and migration audit state. Existing confirmed application rows become
+`application_confirmed` events marked `history_complete = 0` and
+`authorization_status = legacy_unknown`; this preserves evidence without
+inventing prior authorization or complete reply/interview history. Evidence-
+backed legacy rejections are preserved, while ambiguous historical rows are
+not auto-quarantined or assigned campaigns, resumes, replies, interviews,
+offers, source completion, or human paths.
 
 Do not use `--no-backup` on a live candidate database. After migration, use the
 same workspace selection for:
@@ -371,23 +441,67 @@ Rollback is recovery from the timestamped
 `job_search.sqlite.bak-schema-v<old>-<timestamp>` copy: stop writers, preserve
 the failed/current database for diagnosis, restore the backup to the configured
 database path, and use the prior compatible Engine version. There is no
-destructive reverse migration. Repeating `migrate-schema` on schema v5 is
+destructive reverse migration. Repeating `migrate-schema` on schema v6 is
 idempotent and creates no additional backup.
 
-## Exact state changes
+## Lifecycle, current action, and external-action evidence
 
 Use the internal ID when available:
 
 ```bash
-python3 scripts/jobctl.py update-vacancy \
-  --id 42 --stage applied --status APPLIED_CONFIRMED \
-  --note "Visible confirmation captured" --sync-application
+python3 scripts/jobctl.py set-current-action \
+  --id 42 --action-state needs_input --bucket urgent \
+  --due-date 2026-01-21 --priority 100 \
+  --priority-reason "Questionnaire needs one verified answer"
 ```
 
 `--url` or `--external-id` may be used when the ID is unknown. All commands
 accepting `--external-id` resolve both the canonical ID and any stored alias;
 stored alias URLs are also resolvable through `--url`. Resolve the target before
-writing. Never infer external success from this command itself.
+writing. A current action never erases a lifecycle fact. A rejection remains
+terminal for that canonical vacancy; later legacy cleanup to `seen` cannot
+regress it.
+
+Record an external action as an append-only state sequence. The score and
+`auto_apply` configuration are irrelevant to authorization:
+
+```bash
+python3 scripts/jobctl.py record-external-action \
+  --id 42 --action-key application-42-v1 --action-type application \
+  --state authorized --authorization-note "Exact current authorization" \
+  --source operator
+python3 scripts/jobctl.py record-external-action \
+  --id 42 --action-key application-42-v1 --action-type application \
+  --state attempted --evidence-note "Submission attempted" --source operator
+python3 scripts/jobctl.py record-external-action \
+  --id 42 --action-key application-42-v1 --action-type application \
+  --state visibly_confirmed --evidence-note "Acceptance page visible" \
+  --external-reference synthetic-confirmation-42 --source operator \
+  --campaign-id "Campaign Alpha" --actual-resume-id "Resume Alpha"
+```
+
+Only the last command may create `application_confirmed`. Replaying the same
+visible reference is idempotent. `record-lifecycle-event` deliberately refuses
+direct `application_confirmed` writes.
+
+## WIP, SLA, quarantine, and operational closeout
+
+```bash
+python3 scripts/jobctl.py wip-queue --page 1 --page-size 100 --json
+python3 scripts/jobctl.py quarantine-report --page 1 --json
+python3 scripts/jobctl.py false-negative-audit --as-of 2026-02-28 --json
+python3 scripts/jobctl.py operational-doctor --as-of 2026-02-28 --strict --json
+```
+
+The queue orders configured buckets, overdue state, overdue age, priority, due
+date, event time, and vacancy ID deterministically. Limits mark overflow; they
+never archive or mutate old backlog rows. Numbered Markdown pages cover the
+whole result rather than truncating the first 200 records.
+
+`operational-doctor` returns per-check `pass`, `warn`, or `fail`, independent
+`technical_health`, and `ready_for_daily_closeout`. Current exact search
+coverage and enabled personal/incremental source checkpoints are closeout
+gates. A green structural `doctor` alone is not closeout permission.
 
 ## Contacts and follow-ups
 
@@ -412,9 +526,10 @@ python3 scripts/jobctl.py record-contact-search \
 
 `record-followup` accepts a local JSON payload with `contact_search` and
 `touchpoints`. A sent touchpoint requires exact text and visible delivery
-evidence. Direct touchpoints also require a stored contact ID. Follow-up limit,
-interval, primary channel, and preferred direct channels come from local
-settings.
+evidence plus an `external_action_key` whose matching `message` or `follow_up`
+action is already `visibly_confirmed`. Direct touchpoints also require a stored
+contact ID. Follow-up limit, interval, primary channel, and preferred direct
+channels come from local settings.
 
 ## Private profile and prompts
 

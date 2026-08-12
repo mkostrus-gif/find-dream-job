@@ -63,7 +63,7 @@ class JobctlIntegrationTests(unittest.TestCase):
         self.assertFalse(doctor["archive_processed_linkedin"])
 
         with sqlite3.connect(self.workspace / "data" / "job_search.sqlite") as conn:
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 5)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 6)
             self.assertEqual(conn.execute("PRAGMA quick_check").fetchone()[0], "ok")
 
     def test_ingest_update_and_inline_json_escaping(self) -> None:
@@ -125,8 +125,9 @@ class JobctlIntegrationTests(unittest.TestCase):
         self.assertNotIn("](javascript:alert(1))", today_view)
 
         stats = json.loads(self.run_cli("stats").stdout)
-        self.assertEqual(stats["vacancies"], 2)
-        self.assertEqual(stats["applied"], 1)
+        self.assertEqual(stats["vacancies"], 1)
+        self.assertEqual(stats["applied"], 0)
+        self.assertEqual(stats["quarantine_pending"], 1)
 
     def test_linkedin_gmail_ingest_uses_stable_job_identity_and_supports_screening(self) -> None:
         self.run_cli("init", "--json")
@@ -347,6 +348,41 @@ max_direct_messages_per_round = 1
             contact_id = conn.execute("SELECT id FROM employer_contacts").fetchone()[0]
 
         outreach = self.workspace / "tmp" / "outreach.json"
+        action_key = "synthetic-follow-up-message"
+        self.run_cli(
+            "record-external-action",
+            "--id",
+            str(vacancy_id),
+            "--action-key",
+            action_key,
+            "--action-type",
+            "follow_up",
+            "--state",
+            "authorized",
+            "--authorization-note",
+            "Synthetic test authorization",
+            "--source",
+            "synthetic_test",
+            *config_args,
+        )
+        self.run_cli(
+            "record-external-action",
+            "--id",
+            str(vacancy_id),
+            "--action-key",
+            action_key,
+            "--action-type",
+            "follow_up",
+            "--state",
+            "visibly_confirmed",
+            "--evidence-note",
+            "Synthetic visible sent marker",
+            "--external-reference",
+            "synthetic-message-1",
+            "--source",
+            "synthetic_test",
+            *config_args,
+        )
         outreach.write_text(
             json.dumps(
                 {
@@ -362,6 +398,7 @@ max_direct_messages_per_round = 1
                             "message_text": "Hello from the synthetic test.",
                             "delivery_status": "sent",
                             "evidence_note": "Visible sent marker",
+                            "external_action_key": action_key,
                         }
                     ],
                 }

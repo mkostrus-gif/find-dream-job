@@ -86,6 +86,45 @@ items_per_page = 100
         path.write_text(json.dumps(rows), encoding="utf-8")
         self.run_cli("ingest-json", str(path), *self.config_args, "--json")
 
+    def confirm_application(self, external_id: str, *, at: str, key: str) -> None:
+        common = (
+            "--external-id",
+            external_id,
+            "--action-key",
+            key,
+            "--action-type",
+            "application",
+            "--source",
+            "synthetic_test",
+            *self.config_args,
+        )
+        self.run_cli(
+            "record-external-action",
+            *common,
+            "--state",
+            "authorized",
+            "--at",
+            at,
+            "--authorization-note",
+            "Synthetic test authorization",
+            "--json",
+        )
+        self.run_cli(
+            "record-external-action",
+            *common,
+            "--state",
+            "visibly_confirmed",
+            "--at",
+            at,
+            "--evidence-at",
+            at,
+            "--evidence-note",
+            "Synthetic visible confirmation",
+            "--external-reference",
+            f"{key}-confirmation",
+            "--json",
+        )
+
     @staticmethod
     def vacancy_row(
         external_id: str,
@@ -118,7 +157,7 @@ items_per_page = 100
             row["factors"] = factors
         return row
 
-    def test_new_workspace_uses_schema_v5_and_safe_defaults(self) -> None:
+    def test_new_workspace_uses_schema_v6_and_safe_defaults(self) -> None:
         expected = {
             "employer_interactions",
             "employer_accounts",
@@ -128,7 +167,7 @@ items_per_page = 100
             "source_checkpoints",
         }
         with sqlite3.connect(self.database) as conn:
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 5)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 6)
             tables = {
                 row[0]
                 for row in conn.execute(
@@ -145,6 +184,14 @@ items_per_page = 100
         )
         self.assertTrue(doctor["ok"])
         self.assertFalse(doctor["auto_apply"])
+        doctor_details = " ".join(check["detail"] for check in doctor["checks"])
+        for legacy_english in (
+            "present",
+            "valid",
+            "visible confirmation required",
+            "disabled",
+        ):
+            self.assertNotIn(legacy_english, doctor_details)
 
     def test_interactions_conversion_deduplication_and_first_touch(self) -> None:
         external_id = "company_site:conversion-a"
@@ -192,6 +239,16 @@ items_per_page = 100
             "Own synthetic service operations, capacity, and quality systems. " * 8
         )
         self.ingest("05-recent-application.json", [recent_application])
+        self.confirm_application(
+            external_id,
+            at="2026-01-02T00:00:00",
+            key="synthetic-application-conversion-a",
+        )
+        self.confirm_application(
+            "company_site:conversion-recent",
+            at="2026-02-10T12:00:00",
+            key="synthetic-application-conversion-recent",
+        )
 
         automated = json.loads(
             self.run_cli(
@@ -269,7 +326,7 @@ items_per_page = 100
                 ).fetchone()[0],
                 "applied",
             )
-            self.assertEqual(conn.execute("SELECT COUNT(*) FROM applications").fetchone()[0], 3)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM lifecycle_events WHERE event_type = 'application_confirmed'").fetchone()[0], 2)
             self.assertEqual(
                 conn.execute("SELECT COUNT(*) FROM employer_interactions").fetchone()[0],
                 2,
@@ -329,6 +386,25 @@ items_per_page = 100
             "Synthetic calendar invitation evidence",
             *self.config_args,
         )
+        self.run_cli(
+            "record-lifecycle-event",
+            "--external-id",
+            external_id,
+            "--event-type",
+            "interview_completed",
+            "--at",
+            "2026-01-10T12:00:00",
+            "--evidence-at",
+            "2026-01-10T13:00:00",
+            "--evidence-note",
+            "Synthetic completed first interview evidence",
+            "--source",
+            "synthetic_test",
+            "--round-no",
+            "1",
+            *self.config_args,
+            "--json",
+        )
 
         report = json.loads(
             self.run_cli(
@@ -369,23 +445,39 @@ items_per_page = 100
         self.assertIn("product_roles", source_quality)
         self.assertIn("1/1 (100.0%)", source_quality)
         self.assertIn("Unmapped Stream", diagnostics)
-        self.assertIn("unmapped/identity", diagnostics)
-        self.assertIn("earliest source hit", conversion_md)
+        self.assertIn("тождественное сопоставление", diagnostics)
+        self.assertIn("первое касание", conversion_md)
 
     def test_missing_interaction_history_is_reported_as_na(self) -> None:
+        external_id = "company_site:no-history"
         self.ingest(
-            "application-without-interactions.json",
-            [
-                self.vacancy_row(
-                    "company_site:no-history",
-                    date="2026-01-01",
-                    source_stream="Legacy Product",
-                    kind="application",
-                    stage="applied",
-                    status="APPLIED_CONFIRMED",
-                )
-            ],
+            "legacy-vacancy.json",
+            [self.vacancy_row(external_id, date="2026-01-01", source_stream="Legacy Product")],
         )
+        with sqlite3.connect(self.database) as conn:
+            vacancy_id = conn.execute(
+                "SELECT id FROM vacancies WHERE external_id = ?", (external_id,)
+            ).fetchone()[0]
+            conn.execute(
+                """
+                INSERT INTO applications (
+                    vacancy_id, applied_date, status, stage, score,
+                    origin_file, line_no
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    vacancy_id,
+                    "2026-01-01",
+                    "APPLIED_CONFIRMED",
+                    "applied",
+                    80,
+                    "synthetic-legacy-import",
+                    1,
+                ),
+            )
+            conn.execute("PRAGMA user_version = 5")
+            conn.commit()
+        self.run_cli("migrate-schema", *self.config_args, "--json")
         report = json.loads(
             self.run_cli(
                 "conversion-report",
@@ -401,7 +493,7 @@ items_per_page = 100
         dashboard = (self.workspace / "dashboard" / "index.html").read_text(
             encoding="utf-8"
         )
-        self.assertIn("Historical employer interactions are absent", dashboard)
+        self.assertIn("Структурированная история ответов неполна", dashboard)
 
     def test_interaction_validation_and_alias_resolution(self) -> None:
         canonical_id = "company_site:interaction-canonical"
@@ -472,7 +564,7 @@ items_per_page = 100
             check=False,
         )
         self.assertNotEqual(unresolved.returncode, 0)
-        self.assertIn("Vacancy not found", unresolved.stderr)
+        self.assertIn("Вакансия не найдена", unresolved.stderr)
 
     def test_accounts_signals_and_factors_do_not_change_score_or_fuzzy_link(self) -> None:
         external_id = "company_site:account-factor"
@@ -561,7 +653,7 @@ items_per_page = 100
             check=False,
         )
         self.assertNotEqual(ambiguous_relink.returncode, 0)
-        self.assertIn("already linked", ambiguous_relink.stderr)
+        self.assertIn("уже связана", ambiguous_relink.stderr)
         self.run_cli(
             "record-employer-signal",
             "--account-id",
@@ -613,12 +705,18 @@ items_per_page = 100
         dashboard = (self.workspace / "dashboard" / "index.html").read_text(
             encoding="utf-8"
         )
-        self.assertIn("Employer Account Radar", accounts_view)
+        self.assertIn("Портфель целевых работодателей", accounts_view)
+        self.assertIn("| высокий | целевой |", accounts_view)
+        self.assertIn("внедрение ИИ · подтверждена", accounts_view)
+        self.assertIn("подтверждена", factors_view)
         self.assertNotIn("</script><script>alert(1)</script>", accounts_view)
         self.assertNotIn("</script><script>alert(1)</script>", factors_view)
         self.assertIn("&lt;/script&gt;", factors_view)
         self.assertNotIn("</script><script>alert(1)</script>", dashboard)
         self.assertIn("\\u003c/script\\u003e", dashboard)
+        self.assertIn("high: 'высокий'", dashboard)
+        self.assertIn("ai_adoption: 'внедрение ИИ'", dashboard)
+        self.assertIn('"company_site": "Сайт работодателя"', dashboard)
 
     def test_v3_migration_preserves_rows_creates_backup_and_is_idempotent(self) -> None:
         self.ingest(
@@ -649,7 +747,7 @@ items_per_page = 100
             self.run_cli("migrate-schema", *self.config_args, "--json").stdout
         )
         self.assertEqual(migrated["from_version"], 3)
-        self.assertEqual(migrated["to_version"], 5)
+        self.assertEqual(migrated["to_version"], 6)
         self.assertEqual(migrated["backfilled_source_streams"], 1)
         self.assertTrue(migrated["backup"])
         backups = list(self.database.parent.glob("job_search.sqlite.bak-schema-v3-*"))
@@ -662,7 +760,7 @@ items_per_page = 100
                 ).fetchone()
             )
         with sqlite3.connect(self.database) as conn:
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 5)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 6)
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM vacancies").fetchone()[0], 1)
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM source_hits").fetchone()[0], 1)
             self.assertEqual(

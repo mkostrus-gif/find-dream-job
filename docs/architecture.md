@@ -58,26 +58,43 @@ first/last observation dates. The canonical `vacancies.external_id` and
 alias by `last_seen_date` represents the latest observed repost URL. This
 preserves both semantic deduplication and complete scan-ID reconciliation.
 
-External actions follow the reverse evidence flow:
+External actions follow an authorization-and-evidence flow:
 
 ```text
-visible external success -> evidence note -> jobctl state update -> read models
+draft -> explicit authorization -> attempt -> visible success/block/failure
+                                      |-> external_actions
+visible application success ----------`-> application_confirmed lifecycle event
 ```
 
-A SQLite write never proves that an external action occurred.
+A score, draft, threshold, or SQLite write never authorizes an external action
+and never proves that it occurred.
 
-Employer outcomes use two independent append-only paths:
+Employer outcomes and work state use three independent append-only paths:
 
 ```text
-automated/human employer event -> employer_interactions -> conversion cohorts
-visible funnel outcome evidence -> stage_events          -> current stage
+durable outcome evidence        -> lifecycle_events      -> outcome cohorts
+current operator work           -> action_events         -> capped WIP/SLA queue
+automated/human employer event  -> employer_interactions -> reply metrics
 ```
 
-Recording an interaction never changes stage. Conversion first reduces
-applications to one earliest confirmed row per vacancy, then attaches the
-earliest eligible human interaction, interview evidence, contact coverage, and
-one deterministic first-touch source hit. This vacancy-level reduction prevents
-many-to-many joins from multiplying denominators.
+Recording an interaction or changing a current action never changes durable
+lifecycle. Outcome reporting first reduces lifecycle evidence to the earliest
+confirmed application event per canonical vacancy, then attaches the earliest
+eligible human interaction, precise interview evidence, contact coverage, and
+one deterministic explicit/first-touch source hit. This vacancy-level
+reduction prevents many-to-many joins from multiplying denominators.
+
+Raw source hits and normalized attribution also remain separate:
+
+```text
+one preserved raw source hit -> configured exact alias -> one or many labels
+                                             `-> one deterministic first touch
+```
+
+Arbitrary punctuation is never parsed as a delimiter. Alias changes rebuild
+derived labels without rewriting raw history. CAPTCHA, login, access-error,
+malformed, and source-invalid records instead enter `quarantine_records`, stay
+auditable, and remain outside vacancy KPIs until explicit reprocessing.
 
 Employer accounts and signals are explicit account-level evidence. Vacancy
 links are explicit and no fuzzy company matcher runs. Vacancy factors are also
@@ -111,15 +128,16 @@ workspaces.
 
 ## SQLite lifecycle
 
-The schema has an explicit `PRAGMA user_version`; schema v5 retains schema v4
-and adds generic success-gated incremental source checkpoints. Schema v4
-retains external-ID aliases and adds canonical source streams, employer
-interactions, employer accounts/signals/links, and vacancy factors. The CLI
+The schema has an explicit `PRAGMA user_version`; schema v6 upgrades supported
+versions v1–v5 and adds lifecycle/action/external-action evidence, configured
+decision metadata, normalized source labels, quarantine, versioned screening
+policy, and migration audit state. Legacy confirmed applications are preserved
+conservatively with incomplete-history/unknown-authorization markers. The CLI
 refuses databases newer than the supported schema. Connections
 enable foreign-key enforcement and a bounded busy timeout. Generated output is
 rebuilt from a consistent snapshot. Explicit migrations create a recoverable
 backup by default, create tables and indexes idempotently, and backfill only
-known canonical identities.
+facts already supported by legacy evidence.
 
 The current code intentionally remains a single control-plane module plus a
 small configuration module. This keeps deployment dependency-free. If the CLI

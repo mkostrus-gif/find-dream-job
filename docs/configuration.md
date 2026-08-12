@@ -34,12 +34,15 @@ candidate sources.
 ## Automation
 
 `automation.auto_apply` is `false` in the public template. Enabling it is a
-local authorization decision, not a scoring shortcut. Even when enabled,
-`require_visible_confirmation = true` means the system must observe external
-success before recording a submission.
+local workflow policy, not authorization for any particular action and not a
+scoring shortcut. Every external action still needs its own durable
+`authorized` record. Even when enabled, `require_visible_confirmation = true`
+means the system must observe external success before recording a submission.
 
-`apply_threshold` is available to prompts and diagnostic output. The CLI stores
-scores but does not itself click an application button.
+`apply_threshold` is available only for review prioritization and diagnostic
+output. It never authorizes an application, message, follow-up, mailbox change,
+or publication. The CLI stores scores but does not itself click an application
+button.
 
 An agent may edit `auto_apply` only when the user explicitly authorizes
 application submission. A general request to deploy, search, score, recommend,
@@ -100,7 +103,10 @@ send a message, or authorize an application.
   must cover;
 - `default_period_days` becomes HH's `search_period` value;
 - `items_per_page` controls both generated HH URLs and lazy-load validation and
-  cannot exceed 100.
+  cannot exceed 100;
+- `personal_recommendations_enabled` adds a separate fail-closed operational
+  check for `personal_recommendation_stream` rather than treating it as normal
+  search coverage.
 
 Keep role names and candidate-specific stream definitions in the ignored local
 configuration and preferences. The public template contains generic examples.
@@ -110,21 +116,54 @@ missing.
 
 ## Source stream aliases
 
-Optional `[source_stream_aliases]` entries map a raw historical stream label to
-a canonical reporting key. Matching is case-insensitive, so one entry can
-consolidate case variants:
+Optional `[source_stream_aliases]` entries map one whole raw historical stream
+label to one or several canonical reporting keys. Matching is case-insensitive,
+but punctuation is never split implicitly:
 
 ```toml
 [source_stream_aliases]
 "Legacy Product Stream" = "product_roles"
+"Campaign Alpha + Campaign Beta" = ["campaign_alpha", "campaign_beta"]
 ```
 
 The engine always preserves `source_hits.source_stream`. Generated source and
 conversion reports apply the current mapping; unmapped values retain their raw
 key and appear in `reports/source_streams.md`. Changing the mapping changes
 future report grouping on rebuild but does not rewrite historical raw values.
+For a multi-label hit, the raw row remains one discovery event and the derived
+many-to-many links are refreshed. The first configured label is the stable
+compatibility/first-touch label. Reordering an alias is therefore an explicit
+attribution change.
 This mapping does not alter the exact fail-closed `search.required_streams`
 coverage contract.
+
+## Decision metadata
+
+`[decision]` supplies controlled local vocabularies for `campaign_id`,
+`role_family`, resume identifiers, and message variants. Empty arrays are the
+safe default: missing data remains unknown, and any non-empty unconfigured
+value is rejected. `confidence` uses the built-in evidence vocabulary `low`,
+`medium`, `high`, `confirmed`, and `unknown`. The Engine never assumes a number
+of resumes, campaigns, role families, languages, locations, or preferences.
+
+## WIP and SLA
+
+`[queue]` configures page size plus the exact `limits`, `sla_days`, and Russian
+`labels` for `urgent`, `due_follow_up`, `deep_review`, `account_research`, and
+`backlog`. Limits mark overflow; they do not archive, delete, or downgrade old
+rows. `backlog` is outside active WIP by design. Page size must be 1–500.
+
+## Screening policy and employer portfolio
+
+`[policy]` declares one `active_version` and ISO `effective_date`. Changing a
+screening rule requires an intentional version/date update, so obsolete policy
+rows cannot silently compete in false-negative audits.
+
+`[account].active_portfolio_limit` caps the number of employer accounts whose
+status is `target` or `active`. Individual accounts may also store an exact
+portfolio limit, review cadence, freshness dates, configured campaign/role
+targets, governance evidence, and human-path status. None of these fields
+changes vacancy score or authorizes contact.
 
 An agent should configure only channels both chosen by the candidate and
 available in the intended workflow. Configuration is policy, not proof of a
@@ -149,6 +188,7 @@ After every configuration change, run:
 ```bash
 python3 scripts/jobctl.py doctor --strict --json
 python3 scripts/jobctl.py rebuild --json
+python3 scripts/jobctl.py operational-doctor --strict --json
 ```
 
 Report the selected workspace, config path, `auto_apply` state, threshold,

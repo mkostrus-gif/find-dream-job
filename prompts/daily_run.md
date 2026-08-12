@@ -155,6 +155,9 @@ authorized scope.
   in the coverage manifest. With `items_on_page=100`, a visible first batch such
   as 20/100 is not a complete page.
 - Normalize each result into JSON and import it with `ingest-json`.
+- Treat CAPTCHA pages, logged-out pages, access errors, malformed payloads, and
+  source-aware missing required fields as quarantine records, not low-fit
+  vacancies. Review `reports/quarantine.md`; reprocess only an exact record.
 - Include the source description or snippet when available. The engine uses a
   conservative company/title/normalized-description fingerprint to merge exact
   reposts that received a new external ID.
@@ -178,24 +181,28 @@ python3 scripts/jobctl.py ingest-json tmp/daily_scan_YYYY-MM-DD.json \
 ## Review and applications
 
 - Follow `prompts/scoring.md` and `prompts/ats_application_playbook.md`.
-- `automation.apply_threshold` is a recommendation threshold.
-- Submit only when `automation.auto_apply = true`, the current user has
-  authorized that workflow, all factual fields are known, and the final score
-  remains above the configured threshold after caps.
+- `automation.apply_threshold` only prioritizes review. It never authorizes an
+  external action, regardless of `automation.auto_apply`.
+- Before any submission, record the exact action as `authorized` with the
+  current authorization note. Record `attempted`, `blocked`, or `failed` after
+  the attempt and `visibly_confirmed` only after visible external success.
 - Preserve the external draft when blocked by an unknown field.
-- After submission, verify visible success first. Then update SQLite with the
-  exact resume version, short cover-letter record, stage, status, and evidence.
-- If visible confirmation is absent, do not record the application as sent.
+- Only the visibly confirmed action may create `application_confirmed`. Store
+  the actual submitted resume and message variant separately from the plan.
+- A later questionnaire creates a current `needs_input` action; it does not
+  erase the durable confirmed-application event.
 
 ## Follow-ups
 
-- Process due rows in `views/followups.md` only after checking fresh replies.
+- Process the capped `views/wip_queue.md` and due rows in
+  `views/followups.md` only after checking fresh replies.
 - Follow the configured limit, interval, primary channel, direct-channel order,
   and maximum direct messages per round.
 - Reuse current verified contacts. Do not message weak or ambiguous matches.
 - Record negative contact research with `record-contact-search`.
-- For sent rounds, persist exact text and visible delivery evidence through
-  `record-followup --outreach-json`.
+- For sent rounds, first record the exact external action through
+  `record-external-action`; then pass its `external_action_key` with exact text
+  and visible delivery evidence to `record-followup --outreach-json`.
 
 ## Reusable answers
 
@@ -226,17 +233,21 @@ Run:
 
 ```bash
 python3 scripts/jobctl.py rebuild --json
-python3 scripts/jobctl.py conversion-report --as-of YYYY-MM-DD --json
+python3 scripts/jobctl.py outcome-scorecard --as-of YYYY-MM-DD --json
+python3 scripts/jobctl.py wip-queue --as-of YYYY-MM-DD --json
 python3 scripts/jobctl.py stats
 python3 scripts/jobctl.py doctor --strict --json
+python3 scripts/jobctl.py operational-doctor --as-of YYYY-MM-DD --strict --json
 ```
 
 Report verified counts for discovered, reviewed, needs-input, applied,
-follow-up, interviews, and rejections; list blockers and external actions with
-their evidence state. Include unique applications, matured 14/30-day
-denominators, human replies versus automated acknowledgments, interview-1
-conversion, verified-contact coverage, completed-contact-search coverage, and
-the current interaction-history caveat. Report LinkedIn mail counts for found, processed,
+follow-up, interviews, offers, rejections, quarantine, WIP overflow, and SLA
+overflow; list blockers and every external-action evidence state. Include
+unique confirmed applications, matured 14/30-day denominators, human replies
+versus automated acknowledgments, invited/scheduled/completed interview states,
+verified-human-path coverage, contact-search coverage, field completeness, and
+the current history caveat. A structurally green `doctor` is insufficient:
+`ready_for_daily_closeout` must be true. Report LinkedIn mail counts for found, processed,
 archived, archive-verified, and blocked messages plus vacancy links found,
 unique, known, new, scored, and unresolved. Include the persisted source
 coverage/checkpoints from `reports/search_coverage.md` and

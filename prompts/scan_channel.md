@@ -37,8 +37,9 @@ stable `telegram:<handle>:<post_id>` identities, then run
 history, unresolved post classification, or missing SQLite ingest evidence.
 
 Do not create channel-specific Markdown journals. Do not apply merely because a
-scan found a high score; application authorization comes from local settings
-and the current user request.
+scan found a high score. Local settings and the current request define the
+available workflow, but every exact application still needs its own durable
+`authorized` record before any attempt.
 
 ## Report
 

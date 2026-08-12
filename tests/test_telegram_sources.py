@@ -271,7 +271,7 @@ items_per_page = 100
         self.assertNotEqual(result.returncode, 0)
         checked = json.loads(result.stdout)
         self.assertTrue(
-            any("not resolved in SQLite" in issue for issue in checked["issues"]),
+            any("не найден в SQLite" in issue for issue in checked["issues"]),
             checked["issues"],
         )
         with sqlite3.connect(self.database) as conn:
@@ -299,11 +299,11 @@ items_per_page = 100
             self.run_cli("migrate-schema", *self.config_args, "--json").stdout
         )
         self.assertEqual(migrated["from_version"], 4)
-        self.assertEqual(migrated["to_version"], 5)
+        self.assertEqual(migrated["to_version"], 6)
         self.assertTrue(migrated["backup"])
         self.assertTrue(list(self.database.parent.glob("job_search.sqlite.bak-schema-v4-*")))
         with sqlite3.connect(self.database) as conn:
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 5)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 6)
             self.assertIsNotNone(
                 conn.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name='source_checkpoints'"

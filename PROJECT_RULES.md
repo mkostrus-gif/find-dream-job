@@ -20,6 +20,9 @@ order, while this file defines constraints that apply in every operating mode.
 - SQLite is the durable source of truth.
 - Write vacancy, application, contact, and follow-up state through
   `scripts/jobctl.py`; do not edit generated Markdown or dashboard data.
+- Keep durable lifecycle events independent from current action events. A new
+  questionnaire or review task must not erase an earlier confirmed application,
+  rejection, interview, or offer.
 - Treat `views/`, generated `reports/`, and `dashboard/index.html` as disposable
   read models that may be rebuilt at any time.
 - Resolve an exact vacancy ID, URL, or external ID before changing its state.
@@ -43,8 +46,14 @@ order, while this file defines constraints that apply in every operating mode.
 - Never invent candidate facts or form answers. Stop at the exact unknown field.
 - Do not mark an application, message, or follow-up as sent without visible
   success evidence from the external system.
+- Store external-action states separately as `drafted`, `authorized`,
+  `attempted`, `visibly_confirmed`, `blocked`, or `failed`. Only a visibly
+  confirmed action may create a confirmed application or sent-message fact.
 - A database write is not proof of an external action; record external evidence
   first, then synchronize SQLite.
+- A score or threshold may prioritize review but must never grant permission to
+  apply, message, follow up, mutate mail, or publish—even when
+  `automation.auto_apply` is enabled.
 - Do not contact a person on an ambiguous identity match. Direct outreach needs
   a current professional relationship to the vacancy and stored evidence.
 - Respect the local `automation.auto_apply` setting. Review-only is the public

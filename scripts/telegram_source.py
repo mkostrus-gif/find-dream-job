@@ -22,45 +22,45 @@ def _clean_text(value: Any) -> str:
 def _iso_date(value: Any, label: str) -> dt.date:
     text = _clean_text(value)
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
-        raise ValueError(f"{label} must use YYYY-MM-DD")
+        raise ValueError(f"{label}: требуется формат ГГГГ-ММ-ДД.")
     try:
         return dt.date.fromisoformat(text)
     except ValueError as exc:
-        raise ValueError(f"{label} must be a valid calendar date") from exc
+        raise ValueError(f"{label}: требуется существующая календарная дата.") from exc
 
 
 def _post_date(value: Any, label: str) -> dt.date:
     text = _clean_text(value)
     if not text:
-        raise ValueError(f"{label} is required")
+        raise ValueError(f"Требуется значение {label}.")
     try:
         if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
             return dt.date.fromisoformat(text)
         return dt.datetime.fromisoformat(text.replace("Z", "+00:00")).date()
     except ValueError as exc:
-        raise ValueError(f"{label} must be an ISO date or datetime") from exc
+        raise ValueError(f"{label}: требуется дата или отметка времени в формате ISO.") from exc
 
 
 def _positive_int(value: Any, label: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-        raise ValueError(f"{label} must be a positive integer")
+        raise ValueError(f"{label}: требуется положительное целое число.")
     return value
 
 
 def _non_negative_int(value: Any, label: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-        raise ValueError(f"{label} must be a non-negative integer")
+        raise ValueError(f"{label}: требуется неотрицательное целое число.")
     return value
 
 
 def _string_list(value: Any, label: str, *, required: bool = False) -> list[str]:
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
-        raise ValueError(f"{label} must be an array of strings")
+        raise ValueError(f"{label}: требуется массив строк.")
     result = [_clean_text(item) for item in value if _clean_text(item)]
     if required and not result:
-        raise ValueError(f"{label} must contain at least one value")
+        raise ValueError(f"{label}: требуется хотя бы одно значение.")
     if len(result) != len({item.casefold() for item in result}):
-        raise ValueError(f"{label} must not contain duplicates")
+        raise ValueError(f"{label}: повторяющиеся значения запрещены.")
     return result
 
 
@@ -71,7 +71,7 @@ def _checkpoint_cursor(checkpoint: Mapping[str, Any] | None) -> int | None:
     if not raw:
         return None
     if not raw.isdigit() or int(raw) < 1:
-        raise ValueError("stored Telegram cursor must be a positive post ID")
+        raise ValueError("Сохранённый курсор Telegram должен быть положительным идентификатором публикации.")
     return int(raw)
 
 
@@ -88,9 +88,9 @@ def build_telegram_plan(
     if not isinstance(initial_lookback_days, int) or isinstance(
         initial_lookback_days, bool
     ) or not 1 <= initial_lookback_days <= 366:
-        raise ValueError("initial_lookback_days must be between 1 and 366")
+        raise ValueError("Значение initial_lookback_days должно быть от 1 до 366.")
     if not channels:
-        raise ValueError("at least one configured Telegram channel is required")
+        raise ValueError("Требуется хотя бы один настроенный канал Telegram.")
 
     required: list[str] = []
     streams: list[dict[str, Any]] = []
@@ -187,7 +187,7 @@ def validate_telegram_manifest(
     if not isinstance(payload, dict):
         return {
             "ok": False,
-            "issues": ["manifest must be a JSON object"],
+            "issues": ["Манифест должен быть объектом JSON."],
             "streams": [],
             "totals": {"unique": 0, "known": 0, "new": 0},
         }
@@ -210,7 +210,7 @@ def validate_telegram_manifest(
 
     source = _clean_text(payload.get("source")).casefold()
     if source != TELEGRAM_SOURCE:
-        issues.append("source must be telegram")
+        issues.append("Поле source должно иметь значение telegram.")
 
     configured_keys = list(expected_plan["required_streams"])
     configured_folded = {key.casefold(): key for key in configured_keys}
@@ -224,10 +224,10 @@ def validate_telegram_manifest(
     declared_folded = {key.casefold() for key in declared_required}
     for key in configured_keys:
         if key.casefold() not in declared_folded:
-            issues.append(f"required_streams omits configured Telegram channel: {key}")
+            issues.append(f"В required_streams отсутствует настроенный канал Telegram: {key}.")
     for key in declared_required:
         if key.casefold() not in configured_folded:
-            issues.append(f"required_streams contains unconfigured Telegram channel: {key}")
+            issues.append(f"В required_streams указан ненастроенный канал Telegram: {key}.")
 
     expected_streams = {
         stream["key"].casefold(): stream for stream in expected_plan.get("streams", [])
@@ -235,7 +235,7 @@ def validate_telegram_manifest(
     raw_streams = payload.get("streams")
     if not isinstance(raw_streams, list):
         raw_streams = []
-        issues.append("streams must be an array")
+        issues.append("Поле streams должно быть массивом.")
 
     normalized_streams: list[dict[str, Any]] = []
     seen_streams: set[str] = set()
@@ -244,41 +244,41 @@ def validate_telegram_manifest(
 
     for stream_index, raw in enumerate(raw_streams):
         if not isinstance(raw, dict):
-            issues.append(f"streams[{stream_index}] must be an object")
+            issues.append(f"Элемент streams[{stream_index}] должен быть объектом.")
             continue
         key = _clean_text(raw.get("key"))
         folded_key = key.casefold()
         if not key:
-            issues.append(f"streams[{stream_index}].key is required")
+            issues.append(f"Требуется поле streams[{stream_index}].key.")
             continue
         if folded_key in seen_streams:
-            issues.append(f"duplicate stream key: {key}")
+            issues.append(f"Повторяется ключ потока: {key}.")
             continue
         seen_streams.add(folded_key)
         expected = expected_streams.get(folded_key)
         stream_issues: list[str] = []
         if expected is None:
-            stream_issues.append("stream is not a configured Telegram channel")
+            stream_issues.append("Поток не соответствует настроенному каналу Telegram.")
 
         status = _clean_text(raw.get("status")).casefold()
         if status not in {"completed", "blocked"}:
-            stream_issues.append("status must be completed or blocked")
+            stream_issues.append("Поле status должно иметь значение completed или blocked.")
         error = _clean_text(raw.get("error"))
         if status == "blocked":
-            stream_issues.append("required Telegram channel is blocked")
+            stream_issues.append("Обязательный канал Telegram заблокирован.")
             if not error:
-                stream_issues.append("blocked stream must include error")
+                stream_issues.append("Для заблокированного потока требуется поле error.")
 
         query = raw.get("query")
         if not isinstance(query, dict):
             query = {}
-            stream_issues.append("query must be an object")
+            stream_issues.append("Поле query должно быть объектом.")
         expected_query = expected.get("query", {}) if expected else {}
         for field in ("handle", "channel_url", "url", "mode", "since_date"):
             if _clean_text(query.get(field)) != _clean_text(expected_query.get(field)):
-                stream_issues.append(f"query.{field} does not match the generated plan")
+                stream_issues.append(f"Поле query.{field} не соответствует сформированному плану.")
         if query.get("after_post_id") != expected_query.get("after_post_id"):
-            stream_issues.append("query.after_post_id does not match the stored checkpoint")
+            stream_issues.append("Поле query.after_post_id не соответствует сохранённой контрольной точке.")
 
         handle = _clean_text(expected_query.get("handle"))
         mode = _clean_text(expected_query.get("mode"))
@@ -293,29 +293,29 @@ def validate_telegram_manifest(
         pages = raw.get("pages")
         if not isinstance(pages, list):
             pages = []
-            stream_issues.append("pages must be an array")
+            stream_issues.append("Поле pages должно быть массивом.")
         if status == "completed" and not pages:
-            stream_issues.append("completed stream must include at least one fetched page")
+            stream_issues.append("Завершённый поток должен содержать хотя бы одну загруженную страницу.")
         page_urls: set[str] = set()
         page_post_ids: set[int] = set()
         base_page_present = False
         for page_index, page in enumerate(pages):
             if not isinstance(page, dict):
-                stream_issues.append(f"pages[{page_index}] must be an object")
+                stream_issues.append(f"Элемент pages[{page_index}] должен быть объектом.")
                 continue
             page_url = _clean_text(page.get("url"))
             if not _valid_preview_page_url(page_url, handle):
                 stream_issues.append(
-                    f"pages[{page_index}].url must be the configured public preview or its before page"
+                    f"Адрес pages[{page_index}].url должен указывать на настроенную публичную ленту или её страницу before."
                 )
             if page_url in page_urls:
-                stream_issues.append(f"duplicate fetched page URL: {page_url}")
+                stream_issues.append(f"Повторяется адрес загруженной страницы: {page_url}.")
             page_urls.add(page_url)
             if not urlsplit(page_url).query:
                 base_page_present = True
             post_ids = page.get("post_ids")
             if not isinstance(post_ids, list):
-                stream_issues.append(f"pages[{page_index}].post_ids must be an array")
+                stream_issues.append(f"Поле pages[{page_index}].post_ids должно быть массивом.")
                 continue
             local_ids: set[int] = set()
             for post_index, raw_post_id in enumerate(post_ids):
@@ -328,17 +328,17 @@ def validate_telegram_manifest(
                     continue
                 if post_id in local_ids:
                     stream_issues.append(
-                        f"pages[{page_index}] contains duplicate post ID: {post_id}"
+                        f"В pages[{page_index}] повторяется идентификатор публикации: {post_id}."
                     )
                 local_ids.add(post_id)
                 page_post_ids.add(post_id)
         if status == "completed" and not base_page_present:
-            stream_issues.append("scan must start from the channel's current preview page")
+            stream_issues.append("Просмотр должен начинаться с текущей страницы публичной ленты канала.")
 
         posts = raw.get("posts")
         if not isinstance(posts, list):
             posts = []
-            stream_issues.append("posts must be an array")
+            stream_issues.append("Поле posts должно быть массивом.")
         post_ids_seen: set[int] = set()
         post_dates: dict[int, dt.date] = {}
         in_scope_posts: set[int] = set()
@@ -346,7 +346,7 @@ def validate_telegram_manifest(
         stream_canonical_ids: set[int] = set()
         for post_index, post in enumerate(posts):
             if not isinstance(post, dict):
-                stream_issues.append(f"posts[{post_index}] must be an object")
+                stream_issues.append(f"Элемент posts[{post_index}] должен быть объектом.")
                 continue
             try:
                 post_id = _positive_int(post.get("post_id"), f"posts[{post_index}].post_id")
@@ -354,7 +354,7 @@ def validate_telegram_manifest(
                 stream_issues.append(str(exc))
                 continue
             if post_id in post_ids_seen:
-                stream_issues.append(f"duplicate post checkpoint: {post_id}")
+                stream_issues.append(f"Повторяется контрольная точка публикации: {post_id}.")
                 continue
             post_ids_seen.add(post_id)
             try:
@@ -370,7 +370,7 @@ def validate_telegram_manifest(
             expected_post_url = f"https://t.me/{handle}/{post_id}"
             if post_url.rstrip("/") != expected_post_url:
                 stream_issues.append(
-                    f"post {post_id} URL must be {expected_post_url}"
+                    f"Адрес публикации {post_id} должен быть {expected_post_url}."
                 )
 
             if mode == "backfill":
@@ -387,12 +387,12 @@ def validate_telegram_manifest(
             classification = _clean_text(post.get("classification")).casefold()
             if classification not in TELEGRAM_POST_CLASSIFICATIONS:
                 stream_issues.append(
-                    f"post {post_id} classification must be vacancy, non_vacancy, or out_of_scope"
+                    f"Классификация публикации {post_id} должна иметь значение vacancy, non_vacancy или out_of_scope."
                 )
             if in_scope and classification == "out_of_scope":
-                stream_issues.append(f"in-scope post {post_id} cannot be out_of_scope")
+                stream_issues.append(f"Публикация {post_id} в пределах просмотра не может иметь классификацию out_of_scope.")
             if not in_scope and classification != "out_of_scope":
-                stream_issues.append(f"boundary post {post_id} must be out_of_scope")
+                stream_issues.append(f"Граничная публикация {post_id} должна иметь классификацию out_of_scope.")
 
             try:
                 external_ids = _string_list(
@@ -404,35 +404,35 @@ def validate_telegram_manifest(
                 external_ids = []
             if classification == "vacancy" and in_scope and not external_ids:
                 stream_issues.append(
-                    f"vacancy post {post_id} must list every imported vacancy external ID"
+                    f"Для публикации с вакансией {post_id} нужно перечислить внешние идентификаторы всех импортированных вакансий."
                 )
             if classification != "vacancy" and external_ids:
                 stream_issues.append(
-                    f"post {post_id} may list vacancy external IDs only when classified as vacancy"
+                    f"У публикации {post_id} внешние идентификаторы вакансий допустимы только при классификации vacancy."
                 )
 
             for external_id in external_ids:
                 if not _telegram_external_id_ok(external_id, handle, post_id):
                     stream_issues.append(
-                        f"external ID {external_id!r} must use telegram:{handle}:{post_id}"
-                        " with an optional stable item suffix"
+                        f"Внешний идентификатор {external_id!r} должен начинаться с telegram:{handle}:{post_id}"
+                        " и может содержать устойчивый суффикс элемента."
                     )
                 stream_external_ids.add(external_id)
                 all_external_ids.add(external_id)
                 evidence = vacancy_evidence.get(external_id)
                 if not evidence:
                     stream_issues.append(
-                        f"external ID {external_id!r} is not resolved in SQLite after ingest"
+                        f"После импорта внешний идентификатор {external_id!r} не найден в SQLite."
                     )
                     continue
                 if _clean_text(evidence.get("url")).rstrip("/") != expected_post_url:
                     stream_issues.append(
-                        f"external ID {external_id!r} does not preserve its Telegram post URL"
+                        f"Для внешнего идентификатора {external_id!r} не сохранён адрес публикации Telegram."
                     )
                 score = evidence.get("score")
                 if not isinstance(score, int) or isinstance(score, bool) or not 0 <= score <= 100:
                     stream_issues.append(
-                        f"external ID {external_id!r} has no completed 0..100 score"
+                        f"У внешнего идентификатора {external_id!r} нет заполненного балла от 0 до 100."
                     )
                 source_streams = {
                     _clean_text(item).casefold()
@@ -440,7 +440,7 @@ def validate_telegram_manifest(
                 }
                 if key.casefold() not in source_streams:
                     stream_issues.append(
-                        f"external ID {external_id!r} has no source hit for {key}"
+                        f"У внешнего идентификатора {external_id!r} нет попадания источника для {key}."
                     )
                 vacancy_id = evidence.get("vacancy_id")
                 if isinstance(vacancy_id, int) and not isinstance(vacancy_id, bool):
@@ -452,12 +452,12 @@ def validate_telegram_manifest(
             unproven_posts = sorted(post_ids_seen - page_post_ids)
             if missing_posts:
                 stream_issues.append(
-                    "fetched page posts lack classification checkpoints: "
+                    "Для публикаций с загруженных страниц нет контрольных точек классификации: "
                     + ", ".join(map(str, missing_posts))
                 )
             if unproven_posts:
                 stream_issues.append(
-                    "post checkpoints are absent from fetched page evidence: "
+                    "Контрольные точки публикаций отсутствуют в доказательствах загруженных страниц: "
                     + ", ".join(map(str, unproven_posts))
                 )
 
@@ -465,17 +465,17 @@ def validate_telegram_manifest(
         if not isinstance(boundary, dict):
             boundary = {}
             if status == "completed":
-                stream_issues.append("boundary must be an object")
+                stream_issues.append("Поле boundary должно быть объектом.")
         boundary_kind = _clean_text(boundary.get("kind")).casefold()
         boundary_value = boundary.get("value")
         if status == "completed":
             if boundary.get("reached") is not True:
-                stream_issues.append("scan boundary was not reached")
+                stream_issues.append("Граница просмотра не достигнута.")
             elif boundary_kind == "channel_start":
                 pass
             elif isinstance(after_post_id, int):
                 if boundary_kind != "post_id":
-                    stream_issues.append("delta scan boundary.kind must be post_id or channel_start")
+                    stream_issues.append("Для добавочного просмотра boundary.kind должен иметь значение post_id или channel_start.")
                 else:
                     try:
                         boundary_post_id = _positive_int(
@@ -483,27 +483,27 @@ def validate_telegram_manifest(
                         )
                         if boundary_post_id > after_post_id:
                             stream_issues.append(
-                                "delta boundary post must be at or before the stored cursor"
+                                "Граничная публикация добавочного просмотра должна быть не новее сохранённого курсора."
                             )
                         if boundary_post_id not in post_ids_seen:
                             stream_issues.append(
-                                "delta boundary post must appear in fetched post evidence"
+                                "Граничная публикация добавочного просмотра должна присутствовать среди загруженных доказательств."
                             )
                     except ValueError as exc:
                         stream_issues.append(str(exc))
             else:
                 if boundary_kind != "date":
-                    stream_issues.append("date scan boundary.kind must be date or channel_start")
+                    stream_issues.append("Для просмотра по дате boundary.kind должен иметь значение date или channel_start.")
                 else:
                     try:
                         boundary_date = _iso_date(boundary_value, "boundary.value")
                         if boundary_date >= since_date:
                             stream_issues.append(
-                                "date boundary must be older than the inclusive scan start"
+                                "Дата границы должна быть раньше включённой даты начала просмотра."
                             )
                         if boundary_date not in post_dates.values():
                             stream_issues.append(
-                                "date boundary must appear in fetched post evidence"
+                                "Дата границы должна присутствовать среди доказательств загруженных публикаций."
                             )
                     except ValueError as exc:
                         stream_issues.append(str(exc))
@@ -516,7 +516,7 @@ def validate_telegram_manifest(
                     stream_issues.append(str(exc))
                 return 0
             if status == "completed" and expected_count is not None and count != expected_count:
-                stream_issues.append(f"{name} must equal {expected_count}")
+                stream_issues.append(f"Поле {name} должно быть равно {expected_count}.")
             return count
 
         found_count = checked_count("found", len(in_scope_posts))
@@ -524,7 +524,7 @@ def validate_telegram_manifest(
         known_count = checked_count("known")
         new_count = checked_count("new")
         if status == "completed" and known_count + new_count != unique_count:
-            stream_issues.append("known + new must equal unique")
+            stream_issues.append("Сумма known и new должна равняться unique.")
 
         previous = checkpoints.get(key) or {}
         try:
@@ -578,12 +578,12 @@ def validate_telegram_manifest(
 
     for key in configured_keys:
         if key.casefold() not in seen_streams:
-            issues.append(f"missing configured Telegram channel: {key}")
+            issues.append(f"Отсутствует настроенный канал Telegram: {key}.")
 
     totals = payload.get("totals")
     normalized_totals = {"unique": 0, "known": 0, "new": 0}
     if not isinstance(totals, dict):
-        issues.append("totals must be an object")
+        issues.append("Поле totals должно быть объектом.")
     else:
         for name in normalized_totals:
             try:
@@ -593,10 +593,10 @@ def validate_telegram_manifest(
             except ValueError as exc:
                 issues.append(str(exc))
         if normalized_totals["known"] + normalized_totals["new"] != normalized_totals["unique"]:
-            issues.append("totals.known + totals.new must equal totals.unique")
+            issues.append("Сумма totals.known и totals.new должна равняться totals.unique.")
         if normalized_totals["unique"] != len(all_canonical_ids):
             issues.append(
-                f"totals.unique must equal {len(all_canonical_ids)} resolved canonical vacancies"
+                f"Поле totals.unique должно быть равно числу найденных канонических вакансий: {len(all_canonical_ids)}."
             )
 
     return {
