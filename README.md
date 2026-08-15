@@ -257,6 +257,7 @@ tree.
 - [System contract](JOB_SYSTEM.md)
 - [Project rules](PROJECT_RULES.md)
 - [Architecture](docs/architecture.md)
+- [Evidence corrections](docs/evidence-corrections.md)
 - [Configuration](docs/configuration.md)
 - [Russian v6 operator guide](docs/operations-v6.ru.md)
 - [Privacy model](docs/privacy.md)

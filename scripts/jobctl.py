@@ -35,7 +35,7 @@ from telegram_source import build_telegram_plan, validate_telegram_manifest
 
 
 CODE_ROOT = Path(__file__).resolve().parents[1]
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SETTINGS: Settings
 ROOT: Path
@@ -264,6 +264,7 @@ EXPECTED_TABLES = {
     "employer_accounts",
     "employer_account_signals",
     "employer_interactions",
+    "employer_interaction_invalidations",
     "evaluations",
     "followup_rounds",
     "import_issues",
@@ -292,6 +293,8 @@ EXPECTED_TABLES = {
 EXPECTED_INDEXES = {
     "idx_action_events_vacancy",
     "idx_employer_account_signals_account",
+    "idx_employer_interaction_invalidations_vacancy",
+    "idx_employer_interactions_identity",
     "idx_employer_interactions_vacancy",
     "idx_external_actions_vacancy",
     "idx_lifecycle_events_vacancy",
@@ -1207,6 +1210,54 @@ def ensure_v6_schema(conn: sqlite3.Connection) -> None:
     )
 
 
+def ensure_v7_schema(conn: sqlite3.Connection) -> None:
+    """Create append-only evidence corrections and deterministic read models."""
+
+    conn.executescript(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_employer_interactions_identity
+            ON employer_interactions(id, vacancy_id);
+
+        CREATE TABLE IF NOT EXISTS employer_interaction_invalidations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            interaction_id INTEGER NOT NULL,
+            vacancy_id INTEGER NOT NULL,
+            corrected_at TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            evidence_note TEXT NOT NULL,
+            source TEXT NOT NULL,
+            operator_context TEXT NOT NULL,
+            dedupe_key TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (interaction_id, vacancy_id)
+                REFERENCES employer_interactions(id, vacancy_id) ON DELETE CASCADE,
+            UNIQUE(interaction_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_employer_interaction_invalidations_vacancy
+            ON employer_interaction_invalidations(vacancy_id, corrected_at, id);
+
+        CREATE VIEW IF NOT EXISTS effective_employer_interactions AS
+        SELECT interaction.*
+        FROM employer_interactions interaction
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM employer_interaction_invalidations invalidation
+            WHERE invalidation.interaction_id = interaction.id
+        );
+
+        CREATE VIEW IF NOT EXISTS effective_applications AS
+        SELECT application.*
+        FROM applications application
+        WHERE application.id = (
+            SELECT MAX(candidate.id)
+            FROM applications candidate
+            WHERE candidate.vacancy_id = application.vacancy_id
+        );
+        """
+    )
+
+
 def schema_v6_issues(conn: sqlite3.Connection) -> list[str]:
     required_columns = {
         "lifecycle_events": {
@@ -1272,6 +1323,38 @@ def schema_v6_issues(conn: sqlite3.Connection) -> list[str]:
             issues.append(
                 f"{table}: отсутствуют столбцы {','.join(sorted(missing))}"
             )
+    return issues
+
+
+def schema_v7_issues(conn: sqlite3.Connection) -> list[str]:
+    required_columns = {
+        "interaction_id",
+        "vacancy_id",
+        "corrected_at",
+        "reason",
+        "evidence_note",
+        "source",
+        "operator_context",
+        "dedupe_key",
+        "created_at",
+    }
+    present = table_columns(conn, "employer_interaction_invalidations")
+    issues: list[str] = []
+    missing = required_columns - present
+    if missing:
+        issues.append(
+            "employer_interaction_invalidations: отсутствуют столбцы "
+            + ",".join(sorted(missing))
+        )
+    views = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'view'"
+        ).fetchall()
+    }
+    for view in ("effective_employer_interactions", "effective_applications"):
+        if view not in views:
+            issues.append(f"{view}: представление отсутствует")
     return issues
 
 
@@ -1412,11 +1495,18 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             raise RuntimeError(
                 "Нарушен контракт схемы базы данных v6: " + "; ".join(v6_issues)
             )
+        v7_issues = schema_v7_issues(conn)
+        if v7_issues:
+            raise RuntimeError(
+                "Нарушен контракт схемы базы данных v7: " + "; ".join(v7_issues)
+            )
 
 
 def reset_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(
         """
+        DROP VIEW IF EXISTS effective_applications;
+        DROP VIEW IF EXISTS effective_employer_interactions;
         DROP TABLE IF EXISTS migration_log;
         DROP TABLE IF EXISTS screening_decisions;
         DROP TABLE IF EXISTS policy_versions;
@@ -1434,6 +1524,7 @@ def reset_schema(conn: sqlite3.Connection) -> None:
         DROP TABLE IF EXISTS employer_account_signals;
         DROP TABLE IF EXISTS vacancy_employer_accounts;
         DROP TABLE IF EXISTS employer_accounts;
+        DROP TABLE IF EXISTS employer_interaction_invalidations;
         DROP TABLE IF EXISTS employer_interactions;
         DROP TABLE IF EXISTS vacancy_factors;
         DROP TABLE IF EXISTS source_checkpoints;
@@ -1815,6 +1906,7 @@ def reset_schema(conn: sqlite3.Connection) -> None:
         """
     )
     ensure_v6_schema(conn)
+    ensure_v7_schema(conn)
     ensure_active_policy(conn)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
@@ -2098,6 +2190,7 @@ def ensure_auxiliary_schema(conn: sqlite3.Connection) -> None:
         """
     )
     ensure_v6_schema(conn)
+    ensure_v7_schema(conn)
     ensure_active_policy(conn)
     conn.commit()
 
@@ -4024,14 +4117,14 @@ def build_legacy_conversion_report_data(
     interactions = conn.execute(
         """
         SELECT vacancy_id, event_at
-        FROM employer_interactions
+        FROM effective_employer_interactions
         WHERE direction = 'inbound' AND is_human = 1
         ORDER BY event_at, id
         """
     ).fetchall()
     interaction_history_available = bool(
         conn.execute(
-            "SELECT 1 FROM employer_interactions WHERE event_at <= ? LIMIT 1",
+            "SELECT 1 FROM effective_employer_interactions WHERE event_at <= ? LIMIT 1",
             (as_of.isoformat() + "T23:59:59",),
         ).fetchone()
     )
@@ -4273,6 +4366,7 @@ def first_confirmed_application_cohorts(
             cohort["vacancy_id"], "unknown"
         )
         cohort["first_human_reply_at"] = None
+        cohort["screening_request"] = False
         cohort["automated_acknowledgments"] = 0
         cohort["interview_invited"] = False
         cohort["interview_scheduled"] = False
@@ -4314,6 +4408,7 @@ def aggregate_outcome_group(rows: list[dict[str, Any]]) -> dict[str, Any]:
     all_complete = all(row["history_complete"] for row in rows)
 
     human_replies_count = sum(bool(row["first_human_reply_at"]) for row in matured_14)
+    screening_request_count = sum(bool(row["screening_request"]) for row in rows)
     reply_times = [
         (
             parse_iso_datetime(row["first_human_reply_at"], label="event_at")
@@ -4357,6 +4452,7 @@ def aggregate_outcome_group(rows: list[dict[str, Any]]) -> dict[str, Any]:
     possible = confirmed * (len(completeness_fields) + 2)
 
     human_replies = conservative_count(human_replies_count, reply_complete)
+    screening_requests = conservative_count(screening_request_count, all_complete)
     completed_first = conservative_count(completed_first_count, interview_complete)
     invitations = conservative_count(invitation_count, all_complete)
     scheduled = conservative_count(scheduled_count, all_complete)
@@ -4368,6 +4464,7 @@ def aggregate_outcome_group(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "confirmed_applications": confirmed,
         "matured_for_human_reply_14d": len(matured_14),
         "recorded_inbound_human_replies": human_replies,
+        "screening_requests": screening_requests,
         "first_human_reply_sample": len(reply_times),
         "median_time_to_first_human_reply_days": (
             round(statistics.median(reply_times), 2) if reply_times else None
@@ -4423,7 +4520,7 @@ def build_outcome_scorecard_data(
     for interaction in conn.execute(
         """
         SELECT vacancy_id, event_at, direction, event_type, is_human
-        FROM employer_interactions
+        FROM effective_employer_interactions
         ORDER BY event_at, id
         """
     ).fetchall():
@@ -4440,6 +4537,13 @@ def build_outcome_scorecard_data(
             cohort["automated_acknowledgments"] += 1
         elif interaction["direction"] == "inbound" and cohort["first_human_reply_at"] is None:
             cohort["first_human_reply_at"] = event_at.isoformat()
+            if interaction["event_type"] == "screening_request":
+                cohort["screening_request"] = True
+        elif (
+            interaction["direction"] == "inbound"
+            and interaction["event_type"] == "screening_request"
+        ):
+            cohort["screening_request"] = True
 
     for event in conn.execute(
         """
@@ -4580,6 +4684,7 @@ def build_conversion_report_data(
             "applications_unique": item["confirmed_applications"],
             "matured_applications_14d": item["matured_for_human_reply_14d"],
             "human_replies": item["recorded_inbound_human_replies"],
+            "screening_requests": item["screening_requests"],
             "human_reply_rate_14d": reply["percent"],
             "matured_applications_30d": item["matured_for_interview_outcomes_30d"],
             "interview_1_ever": item["completed_first_interviews"],
@@ -5117,7 +5222,7 @@ def build_snapshot(
             """
             SELECT v.id, v.channel, v.company, v.title, v.url, v.score, a.status,
                    a.follow_up_date, a.why_applied, a.risks
-            FROM applications a
+            FROM effective_applications a
             JOIN vacancies v ON v.id = a.vacancy_id
             WHERE COALESCE(a.follow_up_date, '') NOT IN ('', '-', '—')
               AND LOWER(a.status) NOT LIKE '%reject%'
@@ -5310,6 +5415,7 @@ def build_snapshot(
                 "matured_applications_14d"
             ],
             "human_replies": conversion_overall["human_replies"],
+            "screening_requests": conversion_overall["screening_requests"],
             "human_reply_rate_14d": conversion_overall["human_reply_rate_14d"],
             "interview_1_rate_30d": conversion_overall[
                 "interview_1_rate_30d"
@@ -5473,6 +5579,13 @@ def render_outcome_scorecard_markdown(scorecard: dict[str, Any]) -> str:
             + (
                 str(overall["recorded_inbound_human_replies"])
                 if overall["recorded_inbound_human_replies"] is not None
+                else "n/a"
+            )
+            + " |",
+            "| Запросы на скрининг | "
+            + (
+                str(overall["screening_requests"])
+                if overall["screening_requests"] is not None
                 else "n/a"
             )
             + " |",
@@ -5871,6 +5984,7 @@ def generate_views(
                 if overall["human_replies"] is None
                 else f"{overall['human_replies']} |"
             ),
+            f"| запросы на скрининг | {overall['screening_requests'] if overall['screening_requests'] is not None else 'n/a'} |",
             "| доля ответов людей за 14 дней | "
             + ratio_label(
                 overall["human_replies"],
@@ -7153,6 +7267,7 @@ def render_dashboard(snapshot: dict[str, Any]) -> str:
         ['Подтверждённые отклики', DATA.kpis.applied],
         ['Созрело за 14 дней', DATA.kpis.matured_applications_14d],
         ['Ответы людей', DATA.kpis.human_replies === null ? 'n/a' : DATA.kpis.human_replies],
+        ['Запросы на скрининг', DATA.kpis.screening_requests === null ? 'n/a' : DATA.kpis.screening_requests],
         ['Доля ответов людей', percentMetric(DATA.kpis.human_reply_rate_14d)],
         ['Завершённые интервью', percentMetric(DATA.kpis.interview_1_rate_30d)],
         ['Покрытие контактов', percentMetric(DATA.kpis.verified_contact_coverage)],
@@ -7530,7 +7645,7 @@ def migrate_schema(args: argparse.Namespace) -> None:
         raise FileNotFoundError(f"База данных не найдена: {args.db}")
     with sqlite3.connect(args.db) as probe:
         current_version = int(probe.execute("PRAGMA user_version").fetchone()[0])
-    if current_version not in {1, 2, 3, 4, 5, SCHEMA_VERSION}:
+    if current_version not in {1, 2, 3, 4, 5, 6, SCHEMA_VERSION}:
         raise RuntimeError(
             f"Неподдерживаемый путь переноса: {current_version} → {SCHEMA_VERSION}."
         )
@@ -7549,6 +7664,7 @@ def migrate_schema(args: argparse.Namespace) -> None:
             "applications",
             "stage_events",
             "employer_interactions",
+            "employer_interaction_invalidations",
             "employer_accounts",
             "source_checkpoints",
         )
@@ -7569,7 +7685,7 @@ def migrate_schema(args: argparse.Namespace) -> None:
         refreshed_source_labels = refresh_source_hit_labels(conn)
         v6_backfill = (
             backfill_v6_evidence(conn)
-            if current_version < SCHEMA_VERSION
+            if current_version < 6
             else {
                 "lifecycle_applications": 0,
                 "lifecycle_rejections": 0,
@@ -7591,7 +7707,13 @@ def migrate_schema(args: argparse.Namespace) -> None:
                     now_iso(),
                     db_label(backup_path) if backup_path else "",
                     json.dumps(row_counts_before, ensure_ascii=False, sort_keys=True),
-                    "Консервативный перенос: неизвестные исторические поля не заполнялись.",
+                    (
+                        "Добавлены аудируемые исправления взаимодействий и эффективные проекции; "
+                        "исторические строки не изменялись."
+                        if current_version == 6
+                        else "Консервативный перенос: неизвестные исторические поля не заполнялись; "
+                        "добавлены эффективные проекции без автоматических исправлений."
+                    ),
                 ),
             )
         conn.commit()
@@ -8490,6 +8612,116 @@ def record_employer_interaction(args: argparse.Namespace) -> None:
     else:
         state = "Записано" if created else "Сохранён существующий повтор"
         print(f"{state}: взаимодействие №{interaction_id}, вакансия №{vacancy_id}.")
+
+
+def invalidate_employer_interaction(args: argparse.Namespace) -> None:
+    reason = clean_cell(args.reason)
+    evidence_note = clean_cell(args.evidence_note)
+    source = clean_cell(args.source)
+    operator_context = clean_cell(args.operator_context) or source
+    if not reason:
+        raise SystemExit("Для исправления требуется непустой --reason.")
+    if not evidence_note:
+        raise SystemExit("Для исправления требуется непустой --evidence-note.")
+    if not source or not operator_context:
+        raise SystemExit("Для исправления требуются источник и контекст оператора.")
+    corrected_at = parse_iso_datetime(
+        args.corrected_at or now_iso(), label="--corrected-at"
+    ).isoformat()
+
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        interaction = conn.execute(
+            "SELECT id, vacancy_id FROM employer_interactions WHERE id = ?",
+            (args.interaction_id,),
+        ).fetchone()
+        if not interaction:
+            raise SystemExit(f"Взаимодействие №{args.interaction_id} не найдено.")
+        vacancy_id = int(interaction["vacancy_id"])
+
+        if args.vacancy_id is not None or args.vacancy_url or args.vacancy_external_id:
+            expected_vacancy = resolve_vacancy_row(
+                conn,
+                argparse.Namespace(
+                    id=args.vacancy_id,
+                    url=args.vacancy_url,
+                    external_id=args.vacancy_external_id,
+                ),
+            )
+            if int(expected_vacancy["id"]) != vacancy_id:
+                raise SystemExit(
+                    "Указанное взаимодействие относится к другой вакансии; исправление отменено."
+                )
+
+        dedupe_key = dedupe_hash(
+            {
+                "correction_type": "invalidate_employer_interaction",
+                "interaction_id": int(args.interaction_id),
+            }
+        )
+        existing = conn.execute(
+            """
+            SELECT * FROM employer_interaction_invalidations
+            WHERE interaction_id = ?
+            """,
+            (args.interaction_id,),
+        ).fetchone()
+        created = False
+        if existing:
+            existing_context = (
+                clean_cell(existing["reason"]),
+                clean_cell(existing["evidence_note"]),
+                clean_cell(existing["source"]),
+                clean_cell(existing["operator_context"]),
+            )
+            requested_context = (reason, evidence_note, source, operator_context)
+            if existing_context != requested_context:
+                raise SystemExit(
+                    "Взаимодействие уже исправлено с другими метаданными; "
+                    "неоднозначное повторное исправление отклонено."
+                )
+            invalidation_id = int(existing["id"])
+            corrected_at = str(existing["corrected_at"])
+            dedupe_key = str(existing["dedupe_key"])
+        else:
+            cursor = conn.execute(
+                """
+                INSERT INTO employer_interaction_invalidations (
+                    interaction_id, vacancy_id, corrected_at, reason,
+                    evidence_note, source, operator_context, dedupe_key, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(args.interaction_id),
+                    vacancy_id,
+                    corrected_at,
+                    reason,
+                    evidence_note,
+                    source,
+                    operator_context,
+                    dedupe_key,
+                    now_iso(),
+                ),
+            )
+            invalidation_id = int(cursor.lastrowid)
+            created = True
+        conn.commit()
+
+    render_outputs(args.db)
+    result = {
+        "invalidation_id": invalidation_id,
+        "interaction_id": int(args.interaction_id),
+        "vacancy_id": vacancy_id,
+        "corrected_at": corrected_at,
+        "dedupe_key": dedupe_key,
+        "created": created,
+        "effective": False,
+    }
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        state = "Исправление записано" if created else "Исправление уже существовало"
+        print(f"{state}: взаимодействие №{args.interaction_id} исключено из проекций.")
 
 
 def conversion_report_command(args: argparse.Namespace) -> None:
@@ -10196,6 +10428,7 @@ def doctor(args: argparse.Namespace) -> None:
                 v4_contract_issues = schema_v4_issues(conn)
                 v5_contract_issues = schema_v5_issues(conn)
                 v6_contract_issues = schema_v6_issues(conn)
+                v7_contract_issues = schema_v7_issues(conn)
                 foreign_key_issues = len(conn.execute("PRAGMA foreign_key_check").fetchall())
                 missing_canonical_streams = (
                     int(
@@ -10283,6 +10516,11 @@ def doctor(args: argparse.Namespace) -> None:
                 "database_schema_v6_contract",
                 not v6_contract_issues,
                 "; ".join(v6_contract_issues) or "Контракт v6 соблюдён.",
+            )
+            add(
+                "database_schema_v7_contract",
+                not v7_contract_issues,
+                "; ".join(v7_contract_issues) or "Контракт v7 соблюдён.",
             )
             add(
                 "database_canonical_source_streams",
@@ -11133,6 +11371,24 @@ def build_parser() -> argparse.ArgumentParser:
     interaction_parser.add_argument("--external-action-key", default="")
     interaction_parser.add_argument("--json", action="store_true")
     interaction_parser.set_defaults(func=record_employer_interaction)
+
+    invalidation_parser = sub.add_parser(
+        "invalidate-employer-interaction",
+        help="Добавить аудируемое исправление ошибочного взаимодействия",
+    )
+    invalidation_parser.add_argument("--db", type=Path, default=DB_PATH)
+    invalidation_parser.add_argument("--interaction-id", type=int, required=True)
+    vacancy_guard = invalidation_parser.add_mutually_exclusive_group()
+    vacancy_guard.add_argument("--vacancy-id", type=int, default=None)
+    vacancy_guard.add_argument("--vacancy-url", default="")
+    vacancy_guard.add_argument("--vacancy-external-id", default="")
+    invalidation_parser.add_argument("--corrected-at", default="")
+    invalidation_parser.add_argument("--reason", required=True)
+    invalidation_parser.add_argument("--evidence-note", required=True)
+    invalidation_parser.add_argument("--source", required=True)
+    invalidation_parser.add_argument("--operator-context", default="")
+    invalidation_parser.add_argument("--json", action="store_true")
+    invalidation_parser.set_defaults(func=invalidate_employer_interaction)
 
     account_parser = sub.add_parser(
         "upsert-employer-account", help="Создать или обновить точную карточку работодателя"

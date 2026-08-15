@@ -75,14 +75,22 @@ Employer outcomes and work state use three independent append-only paths:
 durable outcome evidence        -> lifecycle_events      -> outcome cohorts
 current operator work           -> action_events         -> capped WIP/SLA queue
 automated/human employer event  -> employer_interactions -> reply metrics
+correction of false interaction -> interaction invalidation -> effective reply metrics
 ```
 
 Recording an interaction or changing a current action never changes durable
 lifecycle. Outcome reporting first reduces lifecycle evidence to the earliest
 confirmed application event per canonical vacancy, then attaches the earliest
-eligible human interaction, precise interview evidence, contact coverage, and
+eligible effective human interaction, precise interview evidence, contact coverage, and
 one deterministic explicit/first-touch source hit. This vacancy-level
 reduction prevents many-to-many joins from multiplying denominators.
+
+Raw employer interactions remain immutable. An explicit invalidation references
+one exact interaction and matching vacancy; projections exclude it through the
+`effective_employer_interactions` view. Legacy application rows also remain
+auditable, while `effective_applications` selects the latest row ID per
+canonical vacancy for generated follow-up state. Durable application counts
+never come from that compatibility projection.
 
 Raw source hits and normalized attribution also remain separate:
 
@@ -128,8 +136,9 @@ workspaces.
 
 ## SQLite lifecycle
 
-The schema has an explicit `PRAGMA user_version`; schema v6 upgrades supported
-versions v1–v5 and adds lifecycle/action/external-action evidence, configured
+The schema has an explicit `PRAGMA user_version`; schema v7 upgrades supported
+versions v1–v6. It adds interaction invalidations and effective projections on
+top of schema v6, which added lifecycle/action/external-action evidence, configured
 decision metadata, normalized source labels, quarantine, versioned screening
 policy, and migration audit state. Legacy confirmed applications are preserved
 conservatively with incomplete-history/unknown-authorization markers. The CLI

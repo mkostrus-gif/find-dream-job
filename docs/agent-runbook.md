@@ -123,12 +123,14 @@ JOB_SEARCH_HOME="/path/to/private-workspace" \
   python3 scripts/jobctl.py stats
 ```
 
-Never use `--no-backup` on a live database. Schema v6 upgrades supported
-versions v1–v5 and preserves raw source hits, canonical vacancy identity,
+Never use `--no-backup` on a live database. Schema v7 upgrades supported
+versions v1–v6 and preserves raw source hits, canonical vacancy identity,
 aliases, applications, interactions, accounts, factors, and checkpoints. A
 legacy confirmed application becomes a durable event with explicitly
 incomplete history and unknown legacy authorization; no campaign, resume,
 reply, interview, offer, quarantine reason, or source completion is invented.
+Schema v7 adds interaction invalidations and effective interaction/application
+read models; see [`evidence-corrections.md`](evidence-corrections.md).
 Restore the timestamped backup with the prior Engine version for rollback;
 there is no destructive reverse migration. Russian operator recovery guidance
 is in [`operations-v6.ru.md`](operations-v6.ru.md).

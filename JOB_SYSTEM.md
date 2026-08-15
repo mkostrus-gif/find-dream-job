@@ -88,6 +88,8 @@ Use a disposable `JOB_SEARCH_HOME` for smoke tests.
 - `stage_events` — legacy append-only stage/status compatibility evidence;
 - `employer_interactions` — append-only inbound/outbound employer interactions,
   separate from funnel stage changes;
+- `employer_interaction_invalidations` — append-only, evidence-backed
+  invalidations of exact erroneous interaction rows;
 - `interview_summaries` — links to private local notes;
 - `employer_contacts` — evidence-backed recruiter/hiring contacts;
 - `contact_searches` — positive, negative, and ambiguous lookup history;
@@ -333,6 +335,28 @@ when supplied, is the strongest duplicate key. Recording an interaction never
 changes lifecycle or current action state. Historical interactions are never
 inferred from free-form status text.
 
+If a stored interaction is later proven erroneous, preserve the original row
+and append an explicit invalidation:
+
+```bash
+python3 scripts/jobctl.py invalidate-employer-interaction \
+  --interaction-id 42 \
+  --reason "The event was recorded against evidence that does not exist" \
+  --evidence-note "Operator rechecked the authorized source and found no message" \
+  --source operator_review \
+  --operator-context manual_reconciliation \
+  --json
+```
+
+The target interaction must exist. Optional `--vacancy-id`, `--vacancy-url`, or
+`--vacancy-external-id` acts as an exact guard and fails when the interaction
+belongs to another vacancy. Reason, evidence, and source are mandatory. An
+exact repeat returns the existing invalidation; a repeat with conflicting
+metadata fails closed. Raw audit queries continue to use
+`employer_interactions`; KPI and generated-output queries use
+`effective_employer_interactions`, which excludes invalidated rows. See
+[`docs/evidence-corrections.md`](docs/evidence-corrections.md).
+
 Use `record-lifecycle-event` for `rejected`, `interview_invited`,
 `interview_scheduled`, `interview_completed`, `interview_cancelled`, candidate
 or employer no-show, later rounds, and `offer_received`. Interview events
@@ -414,8 +438,10 @@ JOB_SEARCH_HOME="/path/to/private-workspace" \
   python3 scripts/jobctl.py migrate-schema --json
 ```
 
-Schema v6 upgrades every supported schema v1–v5. It retains the v5 incremental
-checkpoints and adds lifecycle/action events, external-action evidence,
+Schema v7 upgrades every supported schema v1–v6. It retains the v6 evidence
+model and adds append-only employer-interaction invalidations plus effective
+interaction and application projections. Schema v6 retained the v5 incremental
+checkpoints and added lifecycle/action events, external-action evidence,
 decision metadata, many-to-many source labels, quarantine, versioned screening
 policy, and migration audit state. Existing confirmed application rows become
 `application_confirmed` events marked `history_complete = 0` and
@@ -441,7 +467,7 @@ Rollback is recovery from the timestamped
 `job_search.sqlite.bak-schema-v<old>-<timestamp>` copy: stop writers, preserve
 the failed/current database for diagnosis, restore the backup to the configured
 database path, and use the prior compatible Engine version. There is no
-destructive reverse migration. Repeating `migrate-schema` on schema v6 is
+destructive reverse migration. Repeating `migrate-schema` on schema v7 is
 idempotent and creates no additional backup.
 
 ## Lifecycle, current action, and external-action evidence
@@ -566,6 +592,13 @@ after per-message reconciliation, and verify removal of the `INBOX` label.
 Every write command regenerates the dashboard and reports. Manual changes to
 generated files will be lost. Use `watch` only when another process writes the
 SQLite database directly:
+
+Generated follow-up rows read `effective_applications`, which selects the
+highest application row ID for each canonical vacancy. Compatibility rows stay
+auditable, while an older duplicate cannot restore stale status, questions, or
+follow-up dates after the latest row has been reconciled. Durable application
+counts continue to come from the earliest visibly confirmed
+`application_confirmed` lifecycle event per canonical vacancy.
 
 ```bash
 python3 scripts/jobctl.py watch

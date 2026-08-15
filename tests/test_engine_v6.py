@@ -1079,7 +1079,10 @@ linkedin = "LinkedIn"
 
     def _downgrade_to_v5_shape(self) -> None:
         with sqlite3.connect(self.database) as conn:
+            conn.execute("DROP VIEW effective_applications")
+            conn.execute("DROP VIEW effective_employer_interactions")
             for table in (
+                "employer_interaction_invalidations",
                 "source_hit_labels",
                 "source_labels",
                 "vacancy_decision_metadata",
@@ -1124,7 +1127,7 @@ linkedin = "LinkedIn"
             self.run_cli("migrate-schema", *self.config_args, "--json").stdout
         )
         self.assertEqual(migrated["from_version"], 5)
-        self.assertEqual(migrated["to_version"], 6)
+        self.assertEqual(migrated["to_version"], 7)
         self.assertTrue(migrated["backup"])
         backups = list(self.database.parent.glob("job_search.sqlite.bak-schema-v5-*"))
         self.assertEqual(len(backups), 1)
@@ -1141,7 +1144,7 @@ linkedin = "LinkedIn"
                 for table in before
             }
             self.assertEqual(before, after)
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 6)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 7)
             self.assertEqual(conn.execute("PRAGMA quick_check").fetchone()[0], "ok")
             self.assertEqual(conn.execute("PRAGMA foreign_key_check").fetchall(), [])
             lifecycle = conn.execute(
@@ -1171,7 +1174,7 @@ linkedin = "LinkedIn"
         migrated = json.loads(
             self.run_cli("migrate-schema", *self.config_args, "--json").stdout
         )
-        self.assertEqual(migrated["to_version"], 6)
+        self.assertEqual(migrated["to_version"], 7)
         self.ingest(
             "escaped.json",
             [

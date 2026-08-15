@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Added schema v7 append-only employer-interaction invalidations, effective
+  interaction metrics, deterministic one-row-per-vacancy application state for
+  follow-up projections, a fail-closed idempotent correction CLI, and backed-up
+  migration from schema v6.
 - Added schema v6 append-only lifecycle, current-action, and external-action
   evidence; precise interview progression; configurable decision metadata;
   multi-label source attribution; import quarantine and reprocessing; outcome,
