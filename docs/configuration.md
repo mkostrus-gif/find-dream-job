@@ -12,9 +12,10 @@ file.
 
 ## Project and paths
 
-`[project]` controls the dashboard title and HTML locale. `[paths]` controls the
-database and generated output. Relative paths resolve against `JOB_SEARCH_HOME`
-or the checkout root when that variable is absent.
+`[project]` задаёт заголовок панели, локаль HTML и часовой пояс IANA `timezone`,
+который фиксируется в долговечном плане ежедневного запуска. `[paths]` задаёт
+пути к базе и генерируемым результатам. Относительные пути отсчитываются от
+`JOB_SEARCH_HOME`, а при отсутствии этой переменной — от корня checkout.
 
 From schema v8, configured generated-output paths remain stable compatibility
 paths while their contents resolve through `.jobctl/projections/current`.
@@ -119,6 +120,39 @@ configuration and preferences. The public template contains generic examples.
 `build-coverage-plan` refuses plans that omit a configured stream, while
 `check-coverage` exits non-zero when a stream, page, or expected card count is
 missing.
+
+## Дополнительные обязательные условия ежедневного запуска
+
+`[daily_run]` позволяет приватной рабочей области объявить дополнительные
+обязательные условия без изменения публичного Engine. Ключи непрозрачны для
+Engine и поэтому в публичном шаблоне не должны содержать частные факты.
+
+```toml
+[daily_run]
+
+[[daily_run.required_gates]]
+key = "additional_source"
+kind = "workspace_gate"
+order = 100
+depends_on = ["hh_coverage"]
+required = true
+enabled = true
+require_remote_boundary = true
+```
+
+`key` стабилен в пределах рабочей области; `kind` выбирает типизированный
+контракт доказательства; `order` задаёт детерминированный порядок;
+`depends_on` ссылается на встроенный ключ шага либо ключ другого условия.
+`enabled = false` фиксируется в снимке плана как доказанное
+`not_applicable`. Включённое обязательное условие нельзя вручную обойти через
+`skip`. Если настройка меняется во время запуска, статус показывает изменение,
+а финализация отказывает до явного `refresh-daily-run-plan --reason ...` с
+записью причины в журнал.
+
+`require_remote_boundary = true` требует в завершающем манифесте одновременно
+`remote_boundary_verified = true` и точную `completion_boundary`. Это контракт
+предоставленного доказательства, а не утверждение, что Engine сам проверил
+удалённую систему.
 
 ## Source stream aliases
 

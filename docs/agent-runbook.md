@@ -123,28 +123,35 @@ JOB_SEARCH_HOME="/path/to/private-workspace" \
   python3 scripts/jobctl.py stats
 ```
 
-Never use `--no-backup` on a live database. Schema v8 upgrades supported
-versions v1–v7 and preserves raw source hits, canonical vacancy identity,
-aliases, applications, interactions, accounts, factors, and checkpoints. A
-legacy confirmed application becomes a durable event with explicitly
-incomplete history and unknown legacy authorization; no campaign, resume,
-reply, interview, offer, quarantine reason, or source completion is invented.
-Schema v8 adds transactional projection freshness, bounded writer/render locks,
-atomic generated-output generations, and one expiring daily-run lease. It does
-not change v7 evidence rows. Schema v7 added interaction invalidations and
-effective interaction/application read models; see
-[`evidence-corrections.md`](evidence-corrections.md).
-Restore the timestamped backup with the prior Engine version for rollback;
-there is no destructive reverse migration. Russian operator recovery guidance
-is in [`operations-v6.ru.md`](operations-v6.ru.md).
+Никогда не используйте `--no-backup` для рабочей базы. Схема v9 обновляет
+поддерживаемые версии v1–v8 и сохраняет исходные находки, каноническую
+идентичность вакансий, псевдонимы, отклики, взаимодействия, карточки
+работодателей, факторы и контрольные точки. Старый подтверждённый отклик
+становится долговечным событием с явно неполной историей и неизвестным прежним
+разрешением; миграция не выдумывает кампанию, резюме, ответ, интервью, оффер,
+причину карантина или полноту источника. Схема v9 добавляет только структуры
+плана, шагов, единиц работы, манифестов и переходов, а также корректное состояние
+освобождённого `lease`; доказательства и поколения проекций v8 не
+перезаписываются. Схема v8 добавила транзакционную актуальность проекций,
+ограниченные блокировки записи и `render`, атомарные поколения результатов и
+один истекающий `lease` ежедневного запуска, не изменяя доказательства v7.
+Схема v7 добавила инвалидации и эффективные состояния взаимодействий и
+откликов; см. [`evidence-corrections.md`](evidence-corrections.md).
+После v9 не открывайте обновлённую базу старой версией Engine. Для отката
+восстановите резервную копию с отметкой времени и используйте предыдущую
+совместимую версию; разрушающей обратной миграции нет. Инструкция по
+восстановлению для оператора приведена в
+[`operations-v6.ru.md`](operations-v6.ru.md).
 
 ## 5. Execute one search cycle
 
 Use [`prompts/daily_run.md`](../prompts/daily_run.md) as the canonical order:
 
 1. load settings and private evidence;
-2. validate `projection-status`, recover an older dirty run when necessary,
-   then acquire `begin-daily-run` and retain its token;
+2. выполнить `daily-run-status --json`; возобновить незавершённый долговечный
+   запуск и обрабатывать только ожидающие или инвалидированные элементы либо,
+   если открытого запуска нет, выполнить `projection-status`, а затем
+   `begin-daily-run`;
 3. reconcile inbound replies and external statuses; record each automated or
    human employer event with `record-employer-interaction`, then append precise
    lifecycle evidence separately;
@@ -164,15 +171,29 @@ Use [`prompts/daily_run.md`](../prompts/daily_run.md) as the canonical order:
    before any attempt—score and `auto_apply` are not authorization;
 10. append attempted/blocked/failed evidence and verify visible success before
     adding `visibly_confirmed`;
-11. run every enabled fail-closed source check with the same deferred flags,
-    execute one `finalize-daily-run --run-lease <token>`, validate, and report.
+11. сохранять каждую проверенную частичную единицу через
+    `checkpoint-daily-run-work`; при внешней блокировке чисто приостановить
+    запуск;
+12. выполнить все включённые проверки источников с отказом при неполноте и теми
+    же флагами отложенного `render`, один раз вызвать
+    `finalize-daily-run --run-lease <token>`, проверить точный запуск через
+    `operational-doctor --run-id <run_id>` и подготовить отчёт.
 
-Deferred writes commit SQLite and its dirty revision in one transaction while
-leaving the previously published dashboard untouched. If finalization is
-interrupted or its bounded lock wait expires, rerun that exact finalization
-with the same token. Do not start a second run, clear a lease manually, or
-interpret a dirty read model as lost evidence. The CLI rejects an ordinary
-`rebuild` and any non-deferred mutation while the lease is active.
+Отложенные записи фиксируют SQLite и её ревизию `dirty` одной транзакцией, не
+затрагивая ранее опубликованную панель. Если финализация прервана или истекло
+ограниченное ожидание блокировки, повторите ту же финализацию с тем же токеном
+либо после истечения `lease` получите новый токен через `resume-daily-run`.
+Срок жизни запуска не зависит от срока жизни `lease`. Не начинайте второй
+запуск, не очищайте `lease` вручную и не принимайте состояние `dirty` за потерю
+доказательств. При активном `lease` CLI отклоняет обычный `rebuild` и любое
+изменение без отложенного `render`.
+
+При блокировке входом, CAPTCHA или источником зафиксируйте точную причину через
+`block-daily-run-work` или `mark-daily-run-work-uncertain`, затем выполните
+`pause-daily-run --reason ...`. Следующая задача начинает с компактного статуса
+и не повторяет завершённую работу. Если изменился отпечаток конфигурации, только
+`refresh-daily-run-plan --reason ...` может создать новую аудируемую ревизию
+плана; молчаливое сокращение объёма запрещено.
 
 Use [`prompts/scan_channel.md`](../prompts/scan_channel.md) when the task is
 limited to one company or source. Use

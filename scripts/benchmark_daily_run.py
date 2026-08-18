@@ -16,6 +16,18 @@ from pathlib import Path
 from typing import Any, Callable
 
 
+ORCHESTRATION_TABLES = (
+    "daily_run_leases",
+    "daily_runs",
+    "daily_run_plan_revisions",
+    "daily_run_steps",
+    "daily_run_step_dependencies",
+    "daily_run_work_items",
+    "daily_run_manifests",
+    "daily_run_transitions",
+)
+
+
 def run_cli(
     jobctl: Path,
     engine_root: Path,
@@ -142,6 +154,36 @@ def output_metrics(workspace: Path, jobctl: Path, engine_root: Path, env: dict[s
     }
 
 
+def orchestration_storage_metrics(database: Path) -> dict[str, int]:
+    """Measure both allocated SQLite pages and stored orchestration field payload."""
+    with contextlib.closing(sqlite3.connect(database)) as conn:
+        page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+        page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
+        freelist_count = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+        payload_bytes = 0
+        for table in ORCHESTRATION_TABLES:
+            columns = [
+                str(row[1])
+                for row in conn.execute(f'PRAGMA table_info("{table}")').fetchall()
+            ]
+            if not columns:
+                continue
+            expression = " + ".join(
+                f'COALESCE(length(CAST("{column}" AS BLOB)), 0)'
+                for column in columns
+            )
+            payload_bytes += int(
+                conn.execute(
+                    f'SELECT COALESCE(SUM({expression}), 0) FROM "{table}"'
+                ).fetchone()[0]
+            )
+    return {
+        "file_bytes": database.stat().st_size,
+        "live_page_bytes": max(page_count - freelist_count, 0) * page_size,
+        "payload_bytes": payload_bytes,
+    }
+
+
 def benchmark(
     *,
     engine_root: Path,
@@ -202,6 +244,108 @@ def benchmark(
     full_rebuild = elapsed(
         lambda: run_cli(jobctl, engine_root, env, "rebuild", "--json")
     )
+    rendered_metrics = output_metrics(workspace, jobctl, engine_root, env)
+    storage_before_orchestration = orchestration_storage_metrics(database)
+    begin_result: dict[str, Any] = {}
+
+    def begin_orchestration() -> None:
+        nonlocal begin_result
+        begin_result = json.loads(
+            run_cli(
+                jobctl,
+                engine_root,
+                env,
+                "begin-daily-run",
+                "--run-id",
+                "synthetic-benchmark-run",
+                "--run-date",
+                "2026-01-31",
+                "--timezone",
+                "UTC",
+                "--owner",
+                "synthetic-benchmark",
+                "--json",
+            ).stdout
+        )
+
+    orchestration_begin = elapsed(begin_orchestration)
+    lease = str(begin_result["run_lease"])
+    orchestration_status = elapsed(
+        lambda: run_cli(jobctl, engine_root, env, "daily-run-status", "--json")
+    )
+    orchestration_pause = elapsed(
+        lambda: run_cli(
+            jobctl,
+            engine_root,
+            env,
+            "pause-daily-run",
+            "--run-id",
+            "synthetic-benchmark-run",
+            "--reason",
+            "synthetic benchmark pause",
+            "--run-lease",
+            lease,
+            "--json",
+        )
+    )
+    resume_result: dict[str, Any] = {}
+
+    def resume_orchestration() -> None:
+        nonlocal resume_result
+        resume_result = json.loads(
+            run_cli(
+                jobctl,
+                engine_root,
+                env,
+                "resume-daily-run",
+                "--run-id",
+                "synthetic-benchmark-run",
+                "--owner",
+                "synthetic-benchmark-resume",
+                "--json",
+            ).stdout
+        )
+
+    orchestration_resume = elapsed(resume_orchestration)
+    resumed_status = elapsed(
+        lambda: run_cli(
+            jobctl,
+            engine_root,
+            env,
+            "daily-run-status",
+            "--run-id",
+            "synthetic-benchmark-run",
+            "--json",
+        )
+    )
+    run_cli(
+        jobctl,
+        engine_root,
+        env,
+        "pause-daily-run",
+        "--run-id",
+        "synthetic-benchmark-run",
+        "--reason",
+        "synthetic benchmark complete",
+        "--run-lease",
+        str(resume_result["run_lease"]),
+        "--json",
+    )
+    with sqlite3.connect(database) as conn:
+        history_rows = int(
+            conn.execute(
+                """
+                SELECT
+                    (SELECT COUNT(*) FROM daily_runs) +
+                    (SELECT COUNT(*) FROM daily_run_plan_revisions) +
+                    (SELECT COUNT(*) FROM daily_run_steps) +
+                    (SELECT COUNT(*) FROM daily_run_work_items) +
+                    (SELECT COUNT(*) FROM daily_run_manifests) +
+                    (SELECT COUNT(*) FROM daily_run_transitions)
+                """
+            ).fetchone()[0]
+        )
+    storage_after_orchestration = orchestration_storage_metrics(database)
     return {
         "engine_root": str(engine_root),
         "workspace": str(workspace),
@@ -213,7 +357,28 @@ def benchmark(
         "one_write_seconds": round(one_write, 6),
         "ten_writes_workflow_seconds": round(ten_writes, 6),
         "full_rebuild_seconds": round(full_rebuild, 6),
-        **output_metrics(workspace, jobctl, engine_root, env),
+        "orchestration_begin_seconds": round(orchestration_begin, 6),
+        "orchestration_status_seconds": round(orchestration_status, 6),
+        "orchestration_pause_seconds": round(orchestration_pause, 6),
+        "orchestration_resume_seconds": round(orchestration_resume, 6),
+        "resumed_status_seconds": round(resumed_status, 6),
+        "orchestration_history_rows": history_rows,
+        "orchestration_sqlite_bytes_added": max(
+            storage_after_orchestration["file_bytes"]
+            - storage_before_orchestration["file_bytes"],
+            0,
+        ),
+        "orchestration_sqlite_live_page_bytes_added": max(
+            storage_after_orchestration["live_page_bytes"]
+            - storage_before_orchestration["live_page_bytes"],
+            0,
+        ),
+        "orchestration_sqlite_payload_bytes_added": max(
+            storage_after_orchestration["payload_bytes"]
+            - storage_before_orchestration["payload_bytes"],
+            0,
+        ),
+        **rendered_metrics,
     }
 
 

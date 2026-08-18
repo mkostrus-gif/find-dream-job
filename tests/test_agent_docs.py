@@ -121,6 +121,38 @@ class AgentDocumentationTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertIn(text, daily)
 
+    def test_daily_run_documents_durable_v9_resume_contract(self) -> None:
+        daily = self.read("prompts/daily_run.md")
+        system = self.read("JOB_SYSTEM.md")
+        architecture = self.read("docs/architecture.md")
+        settings = self.read("config/settings.example.toml")
+        for text in (
+            "daily-run-status",
+            "resume-daily-run",
+            "pause-daily-run",
+            "checkpoint-daily-run-work",
+            "needs_verification",
+            "refresh-daily-run-plan",
+            "operational-doctor --run-id",
+        ):
+            with self.subTest(text=text):
+                self.assertIn(text, daily)
+        for text in (
+            "схема v9",
+            "daily_runs",
+            "daily_run_work_items",
+            "daily_run_manifests",
+            "daily_run_transitions",
+            "manifest_version",
+        ):
+            with self.subTest(text=text):
+                self.assertIn(text, system.lower())
+        normalized_architecture = " ".join(architecture.split())
+        self.assertIn("Срок жизни запуска", normalized_architecture)
+        self.assertIn("срока жизни `lease`", normalized_architecture)
+        self.assertIn("[daily_run]", settings)
+        self.assertIn("[[daily_run.required_gates]]", settings)
+
     def test_daily_run_requires_complete_linkedin_mail_processing(self) -> None:
         daily = self.read("prompts/daily_run.md")
         mail_workflow = self.read("prompts/gmail_hh_digest.md")

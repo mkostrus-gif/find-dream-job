@@ -42,6 +42,7 @@
 !/scripts/
 /scripts/*
 !/scripts/jobctl.py
+!/scripts/daily_run_orchestration.py
 !/scripts/jobsearch_config.py
 !/scripts/search_coverage.py
 !/scripts/telegram_source.py

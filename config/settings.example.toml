@@ -5,6 +5,8 @@
 title = "Мой поиск работы"
 # Language for agent communication and generated output where supported.
 locale = "ru"
+# Часовой пояс IANA неизменно сохраняется в каждом долговечном плане ежедневного запуска.
+timezone = "UTC"
 
 [paths]
 database = "data/job_search.sqlite"
@@ -61,6 +63,19 @@ items_per_page = 100
 # the selected source exposes one independently.
 personal_recommendations_enabled = false
 personal_recommendation_stream = "personal_recommendations"
+
+[daily_run]
+# Приватная рабочая область может добавить непрозрачные обязательные условия без
+# изменения Engine. Зависимости указывают встроенный ключ шага либо ключ другого
+# объявленного условия; публичные примеры остаются обобщёнными.
+# [[daily_run.required_gates]]
+# key = "additional_source"
+# kind = "workspace_gate"
+# order = 100
+# depends_on = ["hh_coverage"]
+# required = true
+# enabled = true
+# require_remote_boundary = true
 
 [decision]
 # All reusable metadata values are workspace-configured. Empty arrays are safe:

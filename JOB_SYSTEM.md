@@ -441,20 +441,23 @@ JOB_SEARCH_HOME="/path/to/private-workspace" \
   python3 scripts/jobctl.py migrate-schema --json
 ```
 
-Schema v8 upgrades every supported schema v1–v7. It retains the complete v7
-evidence model and adds only projection freshness revisions plus a bounded
-daily-run lease. Schema v7 retained the v6 evidence model and added append-only
-employer-interaction invalidations plus effective interaction and application
-projections. Schema v6 retained the v5 incremental
-checkpoints and added lifecycle/action events, external-action evidence,
-decision metadata, many-to-many source labels, quarantine, versioned screening
-policy, and migration audit state. Existing confirmed application rows become
-`application_confirmed` events marked `history_complete = 0` and
-`authorization_status = legacy_unknown`; this preserves evidence without
-inventing prior authorization or complete reply/interview history. Evidence-
-backed legacy rejections are preserved, while ambiguous historical rows are
-not auto-quarantined or assigned campaigns, resumes, replies, interviews,
-offers, source completion, or human paths.
+Схема v9 обновляет все поддерживаемые версии v1–v8. Она сохраняет полную модель
+доказательств и поколения проекций v8, добавляет для `lease` корректное
+состояние `released` и создаёт только таблицы долговечной оркестрации ежедневных
+запусков. Схема v8 сохранила модель доказательств v7 и добавила ревизии
+актуальности проекций и ограниченный по времени `lease`. Схема v7 сохранила
+модель v6 и добавила неизменяемые исправления взаимодействий с работодателями,
+а также эффективные проекции взаимодействий и откликов. Схема v6 сохранила
+инкрементальные контрольные точки v5 и добавила события жизненного цикла и
+действий, доказательства внешних действий, метаданные решений, множественные
+метки источников, карантин, версионированную политику отбора и журнал миграций.
+Существующие подтверждённые отклики становятся событиями
+`application_confirmed` с `history_complete = 0` и
+`authorization_status = legacy_unknown`: доказательство сохраняется без
+выдумывания прежнего разрешения или полной истории ответов и интервью.
+Подтверждённые старые отказы сохраняются, а неоднозначным историческим строкам
+автоматически не назначаются карантин, кампании, резюме, ответы, интервью,
+офферы, полнота источника или путь к человеку.
 
 Do not use `--no-backup` on a live candidate database. After migration, use the
 same workspace selection for:
@@ -468,15 +471,88 @@ JOB_SEARCH_HOME="/path/to/private-workspace" \
   python3 scripts/jobctl.py stats
 ```
 
-The first successful v8 rebuild imports any legacy generated directories into
-the generation store and replaces their public paths with compatibility
-symlinks. Schedule that one-time conversion with readers stopped; later
-publications switch one `current` pointer atomically. Rollback is recovery from the timestamped
-`job_search.sqlite.bak-schema-v<old>-<timestamp>` copy: stop writers, preserve
-the failed/current database for diagnosis, restore the backup to the configured
-database path, and use the prior compatible Engine version. There is no
-destructive reverse migration. Repeating `migrate-schema` on schema v8 is
-idempotent and creates no additional backup.
+Первая успешная пересборка v8 переносит прежние каталоги результатов в хранилище
+поколений и заменяет публичные пути совместимыми символическими ссылками. Эту
+одноразовую операцию выполняют при остановленных читателях; последующие
+публикации атомарно переключают один указатель `current`. Откат выполняется из
+копии `job_search.sqlite.bak-schema-v<old>-<timestamp>`: остановите процессы
+записи, сохраните текущую базу для диагностики, восстановите резервную копию по
+настроенному пути базы и используйте прежнюю совместимую версию Engine.
+Разрушающей обратной миграции нет. После обновления до v9 нельзя открывать базу
+старой версией Engine: она не знает долговечный план запуска и может нарушить
+координацию. Повторный `migrate-schema` для схемы v9 идемпотентен и не создаёт
+новую резервную копию.
+
+## Долговечная оркестрация ежедневного запуска
+
+Одна компактная команда статуса восстанавливает контекст после смены процесса
+или задачи:
+
+```bash
+python3 scripts/jobctl.py daily-run-status --json
+python3 scripts/jobctl.py resume-daily-run --run-id <run_id> --json
+```
+
+Запуск существует дольше своего `lease`. Команда `pause-daily-run` освобождает
+`lease`, но сохраняет SQLite и загрязнённое состояние проекций для продолжения.
+Истечение `lease` также не удаляет план, манифесты или историю переходов. Второй
+незавершённый запуск запрещён.
+
+Схема v9 хранит текущий снимок запуска в `daily_runs`, неизменяемые ревизии
+плана в `daily_run_plan_revisions`, граф в `daily_run_steps` и
+`daily_run_step_dependencies`, точные единицы работы в `daily_run_work_items`,
+доказательства в `daily_run_manifests`, а переходы — в
+`daily_run_transitions`.
+
+Полный цикл CLI:
+
+```text
+begin-daily-run
+daily-run-status [--run-id ID] [--verbose]
+resume-daily-run --run-id ID
+start-daily-run-work --step-key KEY [--item-key KEY]
+checkpoint-daily-run-work --manifest FILE
+complete-daily-run-work --manifest FILE
+block-daily-run-work --code CODE --reason TEXT --retryable|--not-retryable
+mark-daily-run-work-uncertain --reason TEXT
+invalidate-daily-run-work --reason TEXT
+refresh-daily-run-plan --reason TEXT
+pause-daily-run --reason TEXT
+finalize-daily-run
+```
+
+Все изменения после `begin-daily-run` требуют точные флаги
+`--defer-render --run-lease <token>`, проходят блокировку записи P0 и сразу
+фиксируются в SQLite. Они не запускают `render`. Обычный статус ограничен
+агрегатами, причинами блокировки, последними контрольными точками и следующими
+безопасными единицами работы; `--verbose` явно добавляет полный план, манифесты
+и историю.
+
+Манифест v1 (`manifest_version = 1`) содержит точные `run_id`, `step_key`,
+необязательный `item_key`, `kind`, `observed_at`, `captured_scope`, необязательные
+счётчики (`raw`, `unique`, `known`, `new`, `processed`, `reconciled`, `blocked`),
+`completion_boundary`, причины блокировки и `remote_boundary_verified`.
+Подробное доказательство задаётся относительным от рабочей области `path` и
+SHA-256. Engine проверяет контракт, но не утверждает, что сам видел полноту
+удалённого Inbox или браузерной страницы. Без видимо подтверждённой границы
+удалённый шаг не завершается.
+
+Типизированные результаты HH и Telegram автоматически связываются с элементами
+зафиксированного плана. Успешный поток или канал закрывается, частичный результат
+сохраняет последнюю проверенную страницу или курсор, а заблокированный остаётся
+незавершённым с точной причиной. Попытка внешнего действия без видимого успеха
+переходит в `needs_verification`; безопасное продолжение по умолчанию — сверка,
+а не повторная отправка.
+
+`finalize-daily-run` заново перечисляет всю обязательную очередь наступивших
+повторных обращений без ограничения WIP и квоты сообщений, сверяет
+нетерминальные внешние действия, покрытие источников, дополнительные условия,
+отпечаток конфигурации, `PRAGMA quick_check` и внешние ключи. Только после этого
+запуск входит в `finalizing`, публикует одно поколение P0 и становится
+`completed`. Если обязательные входные данные изменились во время прерванной
+финализации, код с записью в журнал возвращает запуск в `running`, `blocked` или
+`needs_verification` и требует повторной проверки. Повторная финализация уже
+завершённого запуска ничего не меняет и не выполняет второй `render`.
 
 ## Lifecycle, current action, and external-action evidence
 

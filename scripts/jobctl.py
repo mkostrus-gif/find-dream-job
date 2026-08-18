@@ -15,6 +15,7 @@ import html
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import sqlite3
@@ -27,6 +28,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Iterator
 from urllib.parse import urlsplit, urlunsplit
+from zoneinfo import ZoneInfo
 
 try:  # POSIX is the primary deployment target; Windows uses the stdlib fallback.
     import fcntl
@@ -47,11 +49,56 @@ from search_coverage import (
 from telegram_source import build_telegram_plan, validate_telegram_manifest
 
 
+_DAILY_RUN_API: Any | None = None
+
+
+def _daily_run_api() -> Any:
+    """Load P1 orchestration only for commands that actually need it."""
+    global _DAILY_RUN_API
+    if _DAILY_RUN_API is None:
+        import daily_run_orchestration
+
+        _DAILY_RUN_API = daily_run_orchestration
+    return _DAILY_RUN_API
+
+
+def _lazy_daily_run(name: str) -> Any:
+    def call(*args: Any, **kwargs: Any) -> Any:
+        return getattr(_daily_run_api(), name)(*args, **kwargs)
+
+    return call
+
+
+append_daily_run_transition = _lazy_daily_run("append_transition")
+bind_daily_run_lease = _lazy_daily_run("bind_lease")
+block_daily_run_work = _lazy_daily_run("block_work")
+daily_run_closeout_readiness = _lazy_daily_run("closeout_readiness")
+complete_daily_run_work = _lazy_daily_run("complete_work")
+create_durable_daily_run = _lazy_daily_run("create_run")
+ensure_v9_schema = _lazy_daily_run("ensure_v9_schema")
+enter_daily_run_finalizing = _lazy_daily_run("enter_finalizing")
+final_render_already_published = _lazy_daily_run("final_render_already_published")
+get_durable_daily_run = _lazy_daily_run("get_run")
+integrate_coverage_result = _lazy_daily_run("integrate_coverage_result")
+invalidate_daily_run_work = _lazy_daily_run("invalidate_work")
+mark_daily_run_completed = _lazy_daily_run("mark_completed")
+mark_daily_run_work_uncertain = _lazy_daily_run("mark_uncertain")
+note_expired_lease = _lazy_daily_run("note_expired_lease")
+note_external_action_event = _lazy_daily_run("note_external_action_event")
+checkpoint_daily_run_work = _lazy_daily_run("record_checkpoint")
+refresh_durable_daily_run_plan = _lazy_daily_run("refresh_plan")
+refresh_durable_daily_run_snapshot = _lazy_daily_run("refresh_run_snapshot")
+release_daily_run_lease = _lazy_daily_run("release_lease")
+durable_daily_run_status = _lazy_daily_run("run_status")
+start_daily_run_work = _lazy_daily_run("start_work")
+
+
 CODE_ROOT = Path(__file__).resolve().parents[1]
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 DEFAULT_LOCK_TIMEOUT_SECONDS = 30.0
 DEFAULT_DAILY_RUN_LEASE_SECONDS = 4 * 60 * 60
 MAX_DAILY_RUN_LEASE_SECONDS = 24 * 60 * 60
+DAILY_RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 DASHBOARD_VACANCY_LIMIT = 1000
 PROJECTION_GENERATIONS_TO_KEEP = 2
 
@@ -290,6 +337,13 @@ EXPECTED_TABLES = {
     "lifecycle_events",
     "external_actions",
     "daily_run_leases",
+    "daily_runs",
+    "daily_run_plan_revisions",
+    "daily_run_steps",
+    "daily_run_step_dependencies",
+    "daily_run_work_items",
+    "daily_run_manifests",
+    "daily_run_transitions",
     "migration_log",
     "outreach_messages",
     "policy_versions",
@@ -314,6 +368,12 @@ EXPECTED_INDEXES = {
     "idx_action_events_vacancy",
     "idx_daily_run_leases_one_active",
     "idx_daily_run_leases_status",
+    "idx_daily_runs_one_open",
+    "idx_daily_runs_status",
+    "idx_daily_run_steps_state",
+    "idx_daily_run_work_items_state",
+    "idx_daily_run_manifests_lookup",
+    "idx_daily_run_transitions_lookup",
     "idx_employer_account_signals_account",
     "idx_employer_interaction_invalidations_vacancy",
     "idx_employer_interactions_identity",
@@ -1581,6 +1641,30 @@ def schema_v8_issues(conn: sqlite3.Connection) -> list[str]:
     return issues
 
 
+def schema_v9_issues(conn: sqlite3.Connection) -> list[str]:
+    """Validate the compact v9 contract without loading the orchestration module."""
+    required = {
+        "daily_runs": {"run_id", "run_date", "status", "plan_fingerprint"},
+        "daily_run_plan_revisions": {"run_id", "revision", "scope_json"},
+        "daily_run_steps": {"run_id", "step_key", "state", "manifest_hash"},
+        "daily_run_step_dependencies": {
+            "run_id",
+            "step_key",
+            "depends_on_step_key",
+        },
+        "daily_run_work_items": {"run_id", "step_key", "item_key", "state"},
+        "daily_run_manifests": {"run_id", "payload_hash", "record_type"},
+        "daily_run_transitions": {"run_id", "event_hash", "event_type"},
+    }
+    issues: list[str] = []
+    for table, columns in required.items():
+        present = table_columns(conn, table)
+        missing = sorted(columns - present)
+        if missing:
+            issues.append(f"{table}: отсутствуют столбцы {', '.join(missing)}")
+    return issues
+
+
 def ensure_active_policy(conn: sqlite3.Connection) -> None:
     """Persist one unambiguous active policy version from local configuration."""
 
@@ -1734,6 +1818,11 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             raise RuntimeError(
                 "Нарушен контракт схемы базы данных v8: " + "; ".join(v8_issues)
             )
+        v9_issues = schema_v9_issues(conn)
+        if v9_issues:
+            raise RuntimeError(
+                "Нарушен контракт схемы базы данных v9: " + "; ".join(v9_issues)
+            )
 
 
 def reset_schema(conn: sqlite3.Connection) -> None:
@@ -1741,6 +1830,13 @@ def reset_schema(conn: sqlite3.Connection) -> None:
         """
         DROP VIEW IF EXISTS effective_applications;
         DROP VIEW IF EXISTS effective_employer_interactions;
+        DROP TABLE IF EXISTS daily_run_transitions;
+        DROP TABLE IF EXISTS daily_run_manifests;
+        DROP TABLE IF EXISTS daily_run_work_items;
+        DROP TABLE IF EXISTS daily_run_step_dependencies;
+        DROP TABLE IF EXISTS daily_run_steps;
+        DROP TABLE IF EXISTS daily_run_plan_revisions;
+        DROP TABLE IF EXISTS daily_runs;
         DROP TABLE IF EXISTS daily_run_leases;
         DROP TABLE IF EXISTS projection_state;
         DROP TABLE IF EXISTS migration_log;
@@ -2144,6 +2240,7 @@ def reset_schema(conn: sqlite3.Connection) -> None:
     ensure_v6_schema(conn)
     ensure_v7_schema(conn)
     ensure_v8_schema(conn)
+    ensure_v9_schema(conn)
     ensure_active_policy(conn)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
@@ -2429,6 +2526,7 @@ def ensure_auxiliary_schema(conn: sqlite3.Connection) -> None:
     ensure_v6_schema(conn)
     ensure_v7_schema(conn)
     ensure_v8_schema(conn)
+    ensure_v9_schema(conn)
     ensure_active_policy(conn)
     conn.commit()
 
@@ -2489,7 +2587,7 @@ def mark_projections_rendered(
 ) -> None:
     current = projection_state_data(conn)
     if revision > int(current["dirty_revision"]):
-        raise RuntimeError("Нельзя опубликовать проекцию новее durable SQLite revision.")
+        raise RuntimeError("Нельзя опубликовать проекцию новее долговечной ревизии SQLite.")
     conn.execute(
         """
         UPDATE projection_state
@@ -2504,7 +2602,15 @@ def mark_projections_rendered(
 
 def expire_stale_daily_run_lease(conn: sqlite3.Connection) -> int:
     now = now_iso()
-    return int(
+    stale = conn.execute(
+        """
+        SELECT token, run_id FROM daily_run_leases
+        WHERE status = 'active' AND expires_at <= ?
+        ORDER BY acquired_at, token
+        """,
+        (now,),
+    ).fetchall()
+    changed = int(
         conn.execute(
             """
             UPDATE daily_run_leases
@@ -2515,6 +2621,9 @@ def expire_stale_daily_run_lease(conn: sqlite3.Connection) -> int:
             (now, now),
         ).rowcount
     )
+    for row in stale:
+        note_expired_lease(conn, str(row["run_id"]), str(row["token"]))
+    return changed
 
 
 def active_daily_run_lease(conn: sqlite3.Connection) -> sqlite3.Row | None:
@@ -2525,6 +2634,27 @@ def active_daily_run_lease(conn: sqlite3.Connection) -> sqlite3.Row | None:
         WHERE status = 'active'
         ORDER BY acquired_at DESC LIMIT 1
         """
+    ).fetchone()
+
+
+def durable_daily_run_row(
+    conn: sqlite3.Connection,
+    run_id: str | None = None,
+    *,
+    open_only: bool = False,
+) -> sqlite3.Row | None:
+    """Read the durable-run snapshot without importing the full P1 control plane."""
+    clauses: list[str] = []
+    params: list[str] = []
+    if run_id:
+        clauses.append("run_id = ?")
+        params.append(run_id)
+    if open_only:
+        clauses.append("status <> 'completed'")
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    return conn.execute(
+        "SELECT * FROM daily_runs" + where + " ORDER BY created_at DESC LIMIT 1",
+        params,
     ).fetchone()
 
 
@@ -2539,16 +2669,16 @@ def require_daily_run_lease(
     if active is None:
         if token:
             raise RuntimeError(
-                "Переданный daily-run lease не активен. Начните новый запуск через "
+                "Переданный lease ежедневного запуска не активен. Начните новый запуск через "
                 "begin-daily-run или уберите устаревший --run-lease."
             )
         return None
     if token != str(active["token"]):
         raise RuntimeError(
-            "Уже активен другой daily run: "
+            "Уже активен другой ежедневный запуск: "
             f"run_id={active['run_id']}, owner={active['owner']}, "
             f"expires_at={active['expires_at']}. Передайте его точный --run-lease "
-            "или дождитесь истечения; concurrent live run запрещён."
+            "или дождитесь истечения; одновременные активные запуски запрещены."
         )
     if heartbeat:
         now = dt.datetime.now().replace(microsecond=0)
@@ -8271,6 +8401,67 @@ def publish_projection_generation(stage: Path, generation_id: str) -> str:
     return generation_id
 
 
+def recover_published_finalizing_projection(
+    conn: sqlite3.Connection, *, run_id: str
+) -> str:
+    """Recover the narrow crash window after atomic publication but before SQLite ack."""
+
+    durable = get_durable_daily_run(conn, run_id)
+    if durable is None or durable["projection_revision_finalizing"] is None:
+        return ""
+    target_revision = int(durable["projection_revision_finalizing"])
+    state = projection_state_data(conn)
+    current_dirty_revision = int(state["dirty_revision"])
+    if not state["dirty"] or current_dirty_revision < target_revision:
+        return ""
+    store = projection_store_dir()
+    current = store / "current"
+    if not current.is_symlink():
+        return ""
+    try:
+        generation = current.resolve(strict=True)
+        generation.relative_to((store / "generations").resolve())
+        manifest_path = generation / "manifest.json"
+        dashboard_path = generation / "dashboard" / "index.html"
+        if not manifest_path.is_file() or not dashboard_path.is_file():
+            return ""
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if (
+            manifest.get("generation") != generation.name
+            or int(manifest.get("projection_revision", -1)) != target_revision
+            or int(manifest.get("schema_version", -1)) != SCHEMA_VERSION
+        ):
+            return ""
+        actual_file_count = sum(
+            1 for path in generation.rglob("*") if path.is_file()
+        )
+        if actual_file_count != int(manifest.get("file_count", -1)):
+            return ""
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return ""
+    mark_projections_rendered(
+        conn,
+        revision=current_dirty_revision,
+        generation=generation.name,
+    )
+    append_daily_run_transition(
+        conn,
+        run_id=run_id,
+        entity_type="run",
+        entity_key=run_id,
+        event_type="final_projection_recovered",
+        from_state="finalizing",
+        to_state="finalizing",
+        reason="complete_generation_was_published_before_process_interruption",
+        details={
+            "projection_revision": target_revision,
+            "acknowledged_revision": current_dirty_revision,
+            "generation": generation.name,
+        },
+    )
+    return generation.name
+
+
 def render_outputs(
     db_path: Path,
     *,
@@ -8295,11 +8486,19 @@ def render_outputs(
                     active_lease = active_daily_run_lease(conn)
                     if active_lease is not None:
                         raise RuntimeError(
-                            "Полный render запрещён во время active daily run: "
+                            "Полный render запрещён во время активного ежедневного запуска: "
                             f"run_id={active_lease['run_id']}, "
                             f"owner={active_lease['owner']}, "
                             f"expires_at={active_lease['expires_at']}. "
-                            "Завершите его через finalize-daily-run с точным lease."
+                            "Завершите его через finalize-daily-run с точным `lease`."
+                        )
+                    open_run = durable_daily_run_row(conn, open_only=True)
+                    if open_run is not None:
+                        raise RuntimeError(
+                            "Полный render запрещён, пока долговечный ежедневный запуск не завершён: "
+                            f"run_id={open_run['run_id']}, status={open_run['status']}. "
+                            "Возобновите его через resume-daily-run и завершите через "
+                            "finalize-daily-run; приостановка не разрешает отдельный rebuild."
                         )
                 before = conn.total_changes
                 ensure_active_policy(conn)
@@ -8354,6 +8553,10 @@ def render_outputs(
                 published_generation = publish_projection_generation(
                     stage, generation_id
                 )
+                if os.environ.get("JOBCTL_TEST_FAIL_RENDER_AFTER_PUBLISH") == "1":
+                    raise RuntimeError(
+                        "Синтетическое прерывание render после атомарной публикации."
+                    )
             except Exception:
                 if stage.exists():
                     shutil.rmtree(stage)
@@ -8395,7 +8598,7 @@ def read_projection_state(db_path: Path) -> dict[str, Any]:
 
 def projection_write_note(args: argparse.Namespace) -> str:
     if bool(getattr(args, "defer_render", False)):
-        return "SQLite durable; render отложен, проекции dirty."
+        return "Запись SQLite сохранена; render отложен, проекции имеют состояние dirty."
     return f"Обновлён файл {display_path(DASHBOARD_PATH, ROOT)}."
 
 
@@ -8510,29 +8713,61 @@ def projection_status_command(args: argparse.Namespace) -> None:
         return
     freshness = "dirty" if state["dirty"] else "fresh"
     print(
-        f"Проекции: {freshness}; revision "
+        f"Проекции: {freshness}; ревизия "
         f"{state['rendered_revision']}/{state['dirty_revision']}; "
-        f"generation={state['published_generation'] or 'нет'}."
+        f"поколение={state['published_generation'] or 'нет'}."
     )
     if active is not None:
         print(
-            f"  daily run: {active['run_id']} · owner={active['owner']} · "
-            f"expires_at={active['expires_at']}"
+            f"  ежедневный запуск: {active['run_id']} · владелец={active['owner']} · "
+            f"истекает={active['expires_at']}"
         )
 
 
 def begin_daily_run_command(args: argparse.Namespace) -> None:
     run_id = clean_cell(args.run_id)
-    if not run_id:
-        raise ValueError("Требуется непустой --run-id.")
+    if not DAILY_RUN_ID_RE.fullmatch(run_id):
+        raise ValueError(
+            "--run-id должен содержать 1–128 латинских букв, цифр, точек, "
+            "двоеточий, дефисов или подчёркиваний и начинаться с буквы или цифры."
+        )
     lease_seconds = int(args.lease_seconds)
     if lease_seconds < 60 or lease_seconds > MAX_DAILY_RUN_LEASE_SECONDS:
         raise ValueError("--lease-seconds должен быть от 60 до 86400.")
     owner = clean_cell(args.owner) or f"{socket.gethostname()}:{os.getpid()}"
     supplied_token = clean_cell(getattr(args, "run_lease", ""))
+    timezone = clean_cell(getattr(args, "timezone", "")) or SETTINGS.project.timezone
+    try:
+        zone = ZoneInfo(timezone)
+    except Exception as exc:
+        raise ValueError("--timezone должен содержать имя часового пояса IANA.") from exc
+    run_date = clean_cell(getattr(args, "run_date", "")) or dt.datetime.now(zone).date().isoformat()
+    parse_iso_date(run_date, label="run_date")
     with connect_db(args.db) as conn:
         ensure_schema(conn)
         active = active_daily_run_lease(conn)
+        durable = get_durable_daily_run(conn, run_id)
+        open_run = get_durable_daily_run(conn, None, open_only=True)
+        if durable is not None and durable["status"] == "completed":
+            state = projection_state_data(conn)
+            result = {
+                "run_id": run_id,
+                "run_lease": "",
+                "created": False,
+                "resumed": False,
+                "already_completed": True,
+                "projection_state": state,
+                "write_flags": [],
+            }
+            print(json.dumps(result, ensure_ascii=False, indent=2)) if args.json else print(
+                f"Ежедневный запуск {run_id} уже завершён; новый `lease` не создан."
+            )
+            return
+        if open_run is not None and str(open_run["run_id"]) != run_id:
+            raise RuntimeError(
+                "Нельзя начать второй ежедневный запуск: уже открыт долговечный запуск "
+                f"{open_run['run_id']}. Проверьте daily-run-status и возобновите его."
+            )
         if active is not None:
             if supplied_token and supplied_token == str(active["token"]) and run_id == str(
                 active["run_id"]
@@ -8543,20 +8778,28 @@ def begin_daily_run_command(args: argparse.Namespace) -> None:
                 conn.commit()
                 token = supplied_token
                 created = False
+                resumed = False
+                if durable is None:
+                    projection = projection_state_data(conn)
+                    create_durable_daily_run(
+                        conn,
+                        SETTINGS,
+                        run_id=run_id,
+                        run_date=run_date,
+                        timezone=timezone,
+                        projection_revision_start=int(projection["dirty_revision"]),
+                        lease_token=token,
+                    )
+                    commit_projection_write(conn)
+                    created = True
             else:
                 raise RuntimeError(
-                    "Нельзя начать второй daily run: "
+                    "Нельзя начать второй ежедневный запуск: "
                     f"run_id={active['run_id']}, owner={active['owner']}, "
                     f"expires_at={active['expires_at']}. Возобновите его с точным "
                     "--run-lease или дождитесь истечения."
                 )
         else:
-            projection = projection_state_data(conn)
-            if projection["dirty"]:
-                raise RuntimeError(
-                    "Проекции dirty до начала daily run. Сначала выполните resumable "
-                    "rebuild, затем повторите begin-daily-run."
-                )
             token = uuid.uuid4().hex
             now = dt.datetime.now().replace(microsecond=0)
             expires = now + dt.timedelta(seconds=lease_seconds)
@@ -8577,26 +8820,411 @@ def begin_daily_run_command(args: argparse.Namespace) -> None:
                     expires.isoformat(),
                 ),
             )
-            conn.commit()
+            if durable is None:
+                projection = projection_state_data(conn)
+                if projection["dirty"]:
+                    raise RuntimeError(
+                        "Проекции имеют состояние dirty до нового ежедневного запуска. "
+                        "Сначала выполните возобновляемый rebuild, затем повторите "
+                        "begin-daily-run."
+                    )
+                create_durable_daily_run(
+                    conn,
+                    SETTINGS,
+                    run_id=run_id,
+                    run_date=run_date,
+                    timezone=timezone,
+                    projection_revision_start=int(projection["dirty_revision"]),
+                    lease_token=token,
+                )
+                created = True
+                resumed = False
+            else:
+                bind_daily_run_lease(
+                    conn,
+                    run_id=run_id,
+                    lease_token=token,
+                    event_type="resumed",
+                    owner=owner,
+                    expires_at=expires.isoformat(),
+                )
+                refresh_durable_daily_run_snapshot(conn, run_id)
+                created = False
+                resumed = True
+            commit_projection_write(conn)
             active = conn.execute(
                 "SELECT * FROM daily_run_leases WHERE token = ?", (token,)
             ).fetchone()
-            created = True
     result = {
         "run_id": run_id,
         "run_lease": token,
         "owner": active["owner"],
         "expires_at": active["expires_at"],
         "created": created,
+        "resumed": resumed,
+        "run_date": run_date if durable is None else durable["run_date"],
+        "timezone": timezone if durable is None else durable["timezone"],
         "write_flags": ["--defer-render", f"--run-lease={token}"],
     }
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
         print(
-            f"Daily run {run_id} защищён lease до {active['expires_at']}. "
-            f"Передавайте --defer-render --run-lease={token} каждой write-команде."
+            f"Ежедневный запуск {run_id} сохранён и защищён `lease` до {active['expires_at']}. "
+            f"Передавайте --defer-render --run-lease={token} каждой команде записи."
         )
+
+
+def resume_daily_run_command(args: argparse.Namespace) -> None:
+    run_id = clean_cell(args.run_id)
+    owner = clean_cell(args.owner) or f"{socket.gethostname()}:{os.getpid()}"
+    lease_seconds = int(args.lease_seconds)
+    if lease_seconds < 60 or lease_seconds > MAX_DAILY_RUN_LEASE_SECONDS:
+        raise ValueError("--lease-seconds должен быть от 60 до 86400.")
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        run = get_durable_daily_run(conn, run_id or None, open_only=True)
+        if run is None:
+            raise RuntimeError("Незавершённый долговечный ежедневный запуск не найден.")
+        run_id = str(run["run_id"])
+        active = active_daily_run_lease(conn)
+        supplied = clean_cell(getattr(args, "run_lease", ""))
+        if active is not None:
+            if str(active["run_id"]) != run_id or supplied != str(active["token"]):
+                raise RuntimeError(
+                    "У ежедневного запуска уже есть активный `lease`. Для идемпотентного "
+                    "возобновления "
+                    "передайте его точный --run-lease или дождитесь истечения."
+                )
+            active = require_daily_run_lease(conn, supplied, heartbeat=True)
+            conn.commit()
+            token = supplied
+            resumed = False
+        else:
+            token = uuid.uuid4().hex
+            now = dt.datetime.now().replace(microsecond=0)
+            expires = now + dt.timedelta(seconds=lease_seconds)
+            conn.execute(
+                """
+                INSERT INTO daily_run_leases (
+                    token, run_id, owner, status, lease_seconds, acquired_at,
+                    heartbeat_at, expires_at
+                ) VALUES (?, ?, ?, 'active', ?, ?, ?, ?)
+                """,
+                (
+                    token,
+                    run_id,
+                    owner,
+                    lease_seconds,
+                    now.isoformat(),
+                    now.isoformat(),
+                    expires.isoformat(),
+                ),
+            )
+            bind_daily_run_lease(
+                conn,
+                run_id=run_id,
+                lease_token=token,
+                event_type="resumed",
+                owner=owner,
+                expires_at=expires.isoformat(),
+            )
+            refresh_durable_daily_run_snapshot(conn, run_id)
+            commit_projection_write(conn)
+            active = conn.execute(
+                "SELECT * FROM daily_run_leases WHERE token = ?", (token,)
+            ).fetchone()
+            resumed = True
+    result = {
+        "run_id": run_id,
+        "run_lease": token,
+        "resumed": resumed,
+        "owner": active["owner"],
+        "expires_at": active["expires_at"],
+        "write_flags": ["--defer-render", f"--run-lease={token}"],
+    }
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print(
+            f"Ежедневный запуск {run_id} возобновлён до {active['expires_at']}; "
+            f"используйте --defer-render --run-lease={token}."
+        )
+
+
+def pause_daily_run_command(args: argparse.Namespace) -> None:
+    token = clean_cell(getattr(args, "run_lease", ""))
+    reason = clean_cell(args.reason)
+    if not token:
+        raise ValueError("Для pause-daily-run требуется точный --run-lease.")
+    if not reason:
+        raise ValueError("Для pause-daily-run требуется --reason.")
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        active = require_daily_run_lease(conn, token, heartbeat=False)
+        if active is None:
+            raise RuntimeError("Активный daily-run lease не найден.")
+        if args.run_id and clean_cell(args.run_id) != str(active["run_id"]):
+            raise RuntimeError("--run-id не совпадает с активным lease.")
+        run_id = str(active["run_id"])
+        release_daily_run_lease(
+            conn, run_id=run_id, lease_token=token, reason=reason
+        )
+        released_at = now_iso()
+        conn.execute(
+            """
+            UPDATE daily_run_leases
+            SET status = 'released', released_at = ?, release_reason = ?
+            WHERE token = ? AND status = 'active'
+            """,
+            (released_at, reason, token),
+        )
+        commit_projection_write(conn)
+        state = projection_state_data(conn)
+    result = {
+        "run_id": run_id,
+        "paused": True,
+        "released_at": released_at,
+        "projection_state": state,
+        "resume_command": (
+            "python3 scripts/jobctl.py resume-daily-run --run-id "
+            f"{shlex.quote(run_id)} --json"
+        ),
+    }
+    print(json.dumps(result, ensure_ascii=False, indent=2)) if args.json else print(
+        f"Ежедневный запуск {run_id} приостановлен; `lease` освобождён, SQLite сохранена."
+    )
+
+
+def daily_run_status_command(args: argparse.Namespace) -> None:
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        status = durable_daily_run_status(
+            conn,
+            SETTINGS,
+            run_id=clean_cell(args.run_id) or None,
+            projection_state=projection_state_data(conn),
+            verbose=bool(args.verbose),
+            history_limit=int(args.history_limit),
+        )
+    result = status or {"open_run": None, "message": "Незавершённый долговечный ежедневный запуск не найден."}
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    if status is None:
+        print(result["message"])
+        return
+    counts = status["counts"]
+    print(
+        f"Ежедневный запуск {status['run_id']}: {status['status']}; "
+        f"готово {counts['completed']}/{counts['total_required']}; "
+        f"заблокировано={counts['blocked']}; требует проверки={counts['needs_verification']}."
+    )
+    projection = status["projection_state"]
+    print(
+        f"  проекции: {'dirty' if projection['dirty'] else 'fresh'} "
+        f"{projection['rendered_revision']}/{projection['dirty_revision']}"
+    )
+    if status["configuration_drift"]:
+        print("  конфигурация изменилась: требуется аудируемый refresh-daily-run-plan")
+    for item in status["next_safe_work"][:5]:
+        suffix = f"/{item['item_key']}" if item["item_key"] else ""
+        print(f"  дальше: {item['action']} · {item['step_key']}{suffix}")
+    if status["resume_command"]:
+        print(f"  возобновление: {status['resume_command']}")
+
+
+def _require_exact_durable_lease(
+    conn: sqlite3.Connection, args: argparse.Namespace
+) -> tuple[str, sqlite3.Row]:
+    token = clean_cell(getattr(args, "run_lease", ""))
+    if not token:
+        raise ValueError("Для изменения ежедневного запуска требуется точный --run-lease.")
+    lease = require_daily_run_lease(conn, token, heartbeat=True)
+    if lease is None:
+        raise RuntimeError("Активный daily-run lease не найден.")
+    run_id = clean_cell(getattr(args, "run_id", "")) or str(lease["run_id"])
+    if run_id != str(lease["run_id"]):
+        raise RuntimeError("--run-id не совпадает с активным lease.")
+    run = get_durable_daily_run(conn, run_id)
+    if run is None or run["status"] == "completed":
+        raise RuntimeError("Незавершённый долговечный ежедневный запуск не найден.")
+    return run_id, run
+
+
+def _daily_run_mutation_result(
+    args: argparse.Namespace, result: dict[str, Any]
+) -> None:
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print(result["message"])
+
+
+def start_daily_run_work_command(args: argparse.Namespace) -> None:
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        run_id, _ = _require_exact_durable_lease(conn, args)
+        changed = start_daily_run_work(
+            conn,
+            run_id=run_id,
+            step_key=args.step_key,
+            item_key=args.item_key,
+        )
+        revision = commit_projection_write(conn) if changed else projection_state_data(conn)["dirty_revision"]
+    _daily_run_mutation_result(
+        args,
+        {
+            "run_id": run_id,
+            "changed": changed,
+            "projection_revision": revision,
+            "message": "Работа запущена." if changed else "Состояние работы уже актуально.",
+        },
+    )
+
+
+def _load_daily_run_manifest(args: argparse.Namespace) -> dict[str, Any]:
+    path = args.manifest if args.manifest.is_absolute() else ROOT / args.manifest
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("Манифест должен быть объектом JSON.")
+    return payload
+
+
+def checkpoint_daily_run_work_command(args: argparse.Namespace) -> None:
+    manifest = _load_daily_run_manifest(args)
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        run_id, _ = _require_exact_durable_lease(conn, args)
+        changed = checkpoint_daily_run_work(
+            conn,
+            SETTINGS,
+            run_id=run_id,
+            step_key=args.step_key,
+            item_key=args.item_key,
+            manifest=manifest,
+        )
+        revision = commit_projection_write(conn) if changed else projection_state_data(conn)["dirty_revision"]
+    _daily_run_mutation_result(
+        args,
+        {
+            "run_id": run_id,
+            "changed": changed,
+            "projection_revision": revision,
+            "message": "Проверенная контрольная точка сохранена." if changed else "Идентичная контрольная точка уже сохранена.",
+        },
+    )
+
+
+def complete_daily_run_work_command(args: argparse.Namespace) -> None:
+    manifest = _load_daily_run_manifest(args)
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        run_id, _ = _require_exact_durable_lease(conn, args)
+        changed = complete_daily_run_work(
+            conn,
+            SETTINGS,
+            run_id=run_id,
+            step_key=args.step_key,
+            item_key=args.item_key,
+            manifest=manifest,
+        )
+        revision = commit_projection_write(conn) if changed else projection_state_data(conn)["dirty_revision"]
+    _daily_run_mutation_result(
+        args,
+        {
+            "run_id": run_id,
+            "changed": changed,
+            "projection_revision": revision,
+            "message": "Работа завершена по проверенному манифесту." if changed else "Идентичное завершение уже сохранено.",
+        },
+    )
+
+
+def block_daily_run_work_command(args: argparse.Namespace) -> None:
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        run_id, _ = _require_exact_durable_lease(conn, args)
+        changed = block_daily_run_work(
+            conn,
+            run_id=run_id,
+            step_key=args.step_key,
+            item_key=args.item_key,
+            code=args.code,
+            reason=args.reason,
+            retryable=bool(args.retryable),
+        )
+        revision = commit_projection_write(conn) if changed else projection_state_data(conn)["dirty_revision"]
+    _daily_run_mutation_result(
+        args,
+        {
+            "run_id": run_id,
+            "changed": changed,
+            "projection_revision": revision,
+            "message": "Точная блокировка сохранена." if changed else "Идентичная блокировка уже сохранена.",
+        },
+    )
+
+
+def uncertain_daily_run_work_command(args: argparse.Namespace) -> None:
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        run_id, _ = _require_exact_durable_lease(conn, args)
+        changed = mark_daily_run_work_uncertain(
+            conn,
+            run_id=run_id,
+            step_key=args.step_key,
+            item_key=args.item_key,
+            reason=args.reason,
+        )
+        revision = commit_projection_write(conn) if changed else projection_state_data(conn)["dirty_revision"]
+    _daily_run_mutation_result(
+        args,
+        {
+            "run_id": run_id,
+            "changed": changed,
+            "projection_revision": revision,
+            "next_safe_action": "reconcile_without_resend",
+            "message": "Работа требует проверки; автоматическая повторная отправка запрещена.",
+        },
+    )
+
+
+def invalidate_daily_run_work_command(args: argparse.Namespace) -> None:
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        run_id, _ = _require_exact_durable_lease(conn, args)
+        downstream = invalidate_daily_run_work(
+            conn,
+            run_id=run_id,
+            step_key=args.step_key,
+            item_key=args.item_key,
+            reason=args.reason,
+            reopen=not args.leave_invalidated,
+        )
+        revision = commit_projection_write(conn)
+    _daily_run_mutation_result(
+        args,
+        {
+            "run_id": run_id,
+            "projection_revision": revision,
+            "downstream_invalidated": downstream,
+            "message": "Работа и зависимые завершения аудируемо переоткрыты.",
+        },
+    )
+
+
+def refresh_daily_run_plan_command(args: argparse.Namespace) -> None:
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        run_id, _ = _require_exact_durable_lease(conn, args)
+        result = refresh_durable_daily_run_plan(
+            conn, SETTINGS, run_id=run_id, reason=args.reason
+        )
+        result["projection_revision"] = commit_projection_write(conn)
+    result["run_id"] = run_id
+    result["message"] = "Снимок плана обновлён; прежние обязательные элементы не удалены молча."
+    _daily_run_mutation_result(args, result)
 
 
 def finalize_daily_run_command(args: argparse.Namespace) -> None:
@@ -8608,6 +9236,11 @@ def finalize_daily_run_command(args: argparse.Namespace) -> None:
         existing = conn.execute(
             "SELECT * FROM daily_run_leases WHERE token = ?", (token,)
         ).fetchone()
+        durable = (
+            get_durable_daily_run(conn, str(existing["run_id"]))
+            if existing is not None
+            else None
+        )
         if existing is not None and existing["status"] == "finalized":
             state = projection_state_data(conn)
             result = {
@@ -8617,20 +9250,164 @@ def finalize_daily_run_command(args: argparse.Namespace) -> None:
                 "projection_state": state,
             }
             print(json.dumps(result, ensure_ascii=False, indent=2)) if args.json else print(
-                f"Daily run {existing['run_id']} уже финализирован; повторный render не выполнен."
+                f"Ежедневный запуск {existing['run_id']} уже финализирован; повторный render не выполнен."
+            )
+            return
+        if durable is not None and durable["status"] == "completed":
+            state = projection_state_data(conn)
+            result = {
+                "run_id": durable["run_id"],
+                "run_lease": token,
+                "already_finalized": True,
+                "projection_state": state,
+            }
+            print(json.dumps(result, ensure_ascii=False, indent=2)) if args.json else print(
+                f"Ежедневный запуск {durable['run_id']} уже завершён; повторный render не выполнен."
             )
             return
         active = require_daily_run_lease(conn, token, heartbeat=True)
         if active is None:
-            raise RuntimeError("Активный daily run для finalize не найден.")
-        conn.commit()
+            raise RuntimeError("Активный ежедневный запуск для finalize не найден.")
+        run_id = str(active["run_id"])
+        durable = get_durable_daily_run(conn, run_id)
+        if durable is None:
+            raise RuntimeError(
+                "У `lease` нет долговечного плана выполнения. Возобновите запуск через begin-daily-run."
+            )
+        if durable["status"] == "completed":
+            state = projection_state_data(conn)
+            result = {
+                "run_id": run_id,
+                "run_lease": token,
+                "already_finalized": True,
+                "projection_state": state,
+            }
+            print(json.dumps(result, ensure_ascii=False, indent=2)) if args.json else print(
+                f"Ежедневный запуск {run_id} уже завершён; повторный render не выполнен."
+            )
+            return
+        projection = projection_state_data(conn)
+        render_required = not final_render_already_published(
+            conn, run_id=run_id, projection_state=projection
+        )
+        readiness_changes_before = conn.total_changes
+        readiness = daily_run_closeout_readiness(
+            conn, SETTINGS, run_id=run_id, mutate_dynamic=True
+        )
+        readiness_mutated = conn.total_changes > readiness_changes_before
+        if not readiness["ready"]:
+            current_run = get_durable_daily_run(conn, run_id)
+            if current_run is not None and current_run["status"] == "finalizing":
+                blocker_states = {
+                    str(row[0])
+                    for row in conn.execute(
+                        """
+                        SELECT state FROM daily_run_work_items
+                        WHERE run_id = ? AND required = 1
+                        UNION ALL
+                        SELECT state FROM daily_run_steps step
+                        WHERE run_id = ? AND required = 1
+                          AND NOT EXISTS (
+                              SELECT 1 FROM daily_run_work_items item
+                              WHERE item.run_id = step.run_id
+                                AND item.step_key = step.step_key
+                          )
+                        """,
+                        (run_id, run_id),
+                    ).fetchall()
+                }
+                reopened_status = (
+                    "needs_verification"
+                    if "needs_verification" in blocker_states
+                    else "blocked"
+                    if "blocked" in blocker_states
+                    else "running"
+                )
+                conn.execute(
+                    """
+                    UPDATE daily_runs SET status = ?, projection_revision_finalizing = NULL,
+                        updated_at = ? WHERE run_id = ?
+                    """,
+                    (reopened_status, now_iso(), run_id),
+                )
+                append_daily_run_transition(
+                    conn,
+                    run_id=run_id,
+                    entity_type="run",
+                    entity_key=run_id,
+                    event_type="finalization_reopened",
+                    from_state="finalizing",
+                    to_state=reopened_status,
+                    reason="closeout_precondition_changed",
+                    details={"issues": readiness["issues"][:20]},
+                )
+                readiness_mutated = True
+            if readiness_mutated:
+                commit_projection_write(conn)
+            else:
+                conn.commit()
+            preview = readiness["issues"][:20]
+            extra = len(readiness["issues"]) - len(preview)
+            suffix = f"; ещё ошибок: {extra}" if extra > 0 else ""
+            raise RuntimeError(
+                "Ежедневный запуск не готов к закрытию: " + "; ".join(preview) + suffix
+            )
+        durable = get_durable_daily_run(conn, run_id)
+        assert durable is not None
+        recovered_generation = ""
+        if durable["status"] == "finalizing" and readiness_mutated:
+            next_revision = int(projection_state_data(conn)["dirty_revision"]) + 1
+            conn.execute(
+                """
+                UPDATE daily_runs SET projection_revision_finalizing = ?, updated_at = ?
+                WHERE run_id = ?
+                """,
+                (next_revision, now_iso(), run_id),
+            )
+            append_daily_run_transition(
+                conn,
+                run_id=run_id,
+                entity_type="run",
+                entity_key=run_id,
+                event_type="finalization_revision_advanced",
+                from_state="finalizing",
+                to_state="finalizing",
+                reason="durable_work_changed_during_finalization",
+                details={"projection_revision_finalizing": next_revision},
+            )
+            committed_revision = commit_projection_write(conn)
+            if committed_revision != next_revision:
+                raise RuntimeError("Не удалось обновить ревизию finalizing после долговечного изменения.")
+            render_required = True
+            durable = get_durable_daily_run(conn, run_id)
+            assert durable is not None
+        elif durable["status"] == "finalizing" and render_required:
+            recovered_generation = recover_published_finalizing_projection(
+                conn, run_id=run_id
+            )
+            if recovered_generation:
+                conn.commit()
+                render_required = False
+        if durable["status"] != "finalizing":
+            next_revision = int(projection_state_data(conn)["dirty_revision"]) + 1
+            enter_daily_run_finalizing(
+                conn, run_id=run_id, dirty_revision=next_revision
+            )
+            committed_revision = commit_projection_write(conn)
+            if committed_revision != next_revision:
+                raise RuntimeError("Не удалось зафиксировать детерминированную ревизию finalizing.")
+            render_required = True
+        else:
+            conn.commit()
 
-    snapshot = render_outputs(
-        args.db,
-        lock_timeout=command_lock_timeout(args),
-        writer_locked=True,
-        allowed_run_lease=token,
-    )
+    snapshot: dict[str, Any] | None = None
+    if render_required:
+        snapshot = render_outputs(
+            args.db,
+            lock_timeout=command_lock_timeout(args),
+            writer_locked=True,
+            allowed_run_lease=token,
+        )
     with connect_db(args.db) as conn:
         ensure_schema(conn)
         # The outer writer lock has been held continuously since the lease was
@@ -8642,8 +9419,17 @@ def finalize_daily_run_command(args: argparse.Namespace) -> None:
             (token,),
         ).fetchone()
         if active is None:
-            raise RuntimeError("Daily-run lease исчез до фиксации finalize.")
+            raise RuntimeError("`Lease` ежедневного запуска исчез до фиксации finalize.")
         released_at = now_iso()
+        state = projection_state_data(conn)
+        if state["dirty"]:
+            raise RuntimeError("Финальная атомарная проекция не опубликована.")
+        mark_daily_run_completed(
+            conn,
+            run_id=str(active["run_id"]),
+            lease_token=token,
+            projection_revision=int(state["rendered_revision"]),
+        )
         conn.execute(
             """
             UPDATE daily_run_leases
@@ -8655,22 +9441,38 @@ def finalize_daily_run_command(args: argparse.Namespace) -> None:
         )
         conn.commit()
         state = projection_state_data(conn)
+        status = durable_daily_run_status(
+            conn,
+            SETTINGS,
+            run_id=str(active["run_id"]),
+            projection_state=state,
+            verbose=False,
+        )
     result = {
         "run_id": active["run_id"],
         "run_lease": token,
         "finalized_at": released_at,
         "already_finalized": False,
-        "kpis": snapshot["kpis"],
+        "render_performed": render_required,
+        "recovered_generation": recovered_generation,
+        "kpis": snapshot["kpis"] if snapshot is not None else {},
+        "closeout_counts": status["counts"] if status else {},
         "projection_state": state,
     }
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
-        print_render_summary(
-            f"Daily run {active['run_id']} финализирован одним полным render.",
-            args.db,
-            snapshot,
-        )
+        if snapshot is not None:
+            print_render_summary(
+                f"Ежедневный запуск {active['run_id']} финализирован одним полным render.",
+                args.db,
+                snapshot,
+            )
+        else:
+            print(
+                f"Ежедневный запуск {active['run_id']} завершён по уже опубликованной ревизии finalizing; "
+                "повторный render не выполнен."
+            )
 
 
 def migrate_schema(args: argparse.Namespace) -> None:
@@ -8695,7 +9497,7 @@ def migrate_schema(args: argparse.Namespace) -> None:
             lease_conn.commit()
             if active_lease is not None:
                 raise RuntimeError(
-                    "migrate-schema недоступен во время active daily run: "
+                    "migrate-schema недоступен во время активного ежедневного запуска: "
                     f"run_id={active_lease['run_id']}, owner={active_lease['owner']}, "
                     f"expires_at={active_lease['expires_at']}. Сначала выполните "
                     "finalize-daily-run или дождитесь истечения lease."
@@ -8703,13 +9505,13 @@ def migrate_schema(args: argparse.Namespace) -> None:
 
     backup_path: Path | None = None
     if current_version < SCHEMA_VERSION and not args.no_backup:
-        stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         backup_path = args.db.with_name(f"{args.db.name}.bak-schema-v{current_version}-{stamp}")
         with sqlite3.connect(args.db) as source_conn, sqlite3.connect(backup_path) as backup_conn:
             source_conn.backup(backup_conn)
 
     with connect_db(args.db) as conn:
-        preserved_tables = (
+        preserved_tables: tuple[str, ...] = (
             "vacancies",
             "source_hits",
             "applications",
@@ -8719,6 +9521,18 @@ def migrate_schema(args: argparse.Namespace) -> None:
             "employer_accounts",
             "source_checkpoints",
         )
+        if current_version == 8:
+            preserved_tables += (
+                "lifecycle_events",
+                "action_events",
+                "followup_rounds",
+                "outreach_messages",
+                "search_runs",
+                "search_coverage",
+                "external_actions",
+                "daily_run_leases",
+                "projection_state",
+            )
         present_before = {
             str(row[0])
             for row in conn.execute(
@@ -8759,12 +9573,13 @@ def migrate_schema(args: argparse.Namespace) -> None:
                     db_label(backup_path) if backup_path else "",
                     json.dumps(row_counts_before, ensure_ascii=False, sort_keys=True),
                     (
-                        "Добавлены transactional dirty revision, daily-run lease и "
-                        "атомарная публикация read models; evidence-таблицы не изменялись."
-                        if current_version == 7
+                        "Добавлен долговечный контур управления ежедневным запуском v9; "
+                        "доказательства и опубликованные поколения проекций сохранены "
+                        "без переписывания."
+                        if current_version == 8
                         else "Консервативный перенос: неизвестные исторические поля не заполнялись; "
-                        "добавлены effective и projection-control структуры без "
-                        "автоматических исправлений evidence."
+                        "добавлены эффективные состояния, управление проекциями и "
+                        "долговечная оркестрация без автоматических исправлений доказательств."
                     ),
                 ),
             )
@@ -8923,14 +9738,36 @@ def persist_coverage_result(
 
 def check_coverage(args: argparse.Namespace) -> None:
     manifest_path = args.file if args.file.is_absolute() else ROOT / args.file
-    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest_bytes = manifest_path.read_bytes()
+    payload = json.loads(manifest_bytes.decode("utf-8"))
+    manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+    manifest_observed_at = dt.datetime.fromtimestamp(
+        manifest_path.stat().st_mtime, tz=dt.timezone.utc
+    ).replace(microsecond=0).isoformat()
     result = validate_coverage_manifest(payload, REQUIRED_SEARCH_STREAMS)
     if result.get("run_date") and result.get("source"):
         with connect_db(args.db) as conn:
             ensure_schema(conn)
-            run_id = persist_coverage_result(conn, result, origin_for(manifest_path))
+            manifest_file = origin_for(manifest_path)
+            run_id = persist_coverage_result(conn, result, manifest_file)
+            result["search_run_id"] = run_id
+            active = active_daily_run_lease(conn)
+            if (
+                active is not None
+                and get_durable_daily_run(conn, str(active["run_id"])) is not None
+            ):
+                result["daily_run_integration"] = integrate_coverage_result(
+                    conn,
+                    SETTINGS,
+                    run_id=str(active["run_id"]),
+                    source="hh",
+                    result=result,
+                    manifest_file=manifest_file,
+                    manifest_sha256=manifest_sha256,
+                    observed_at=manifest_observed_at,
+                    source_run_id=run_id,
+                )
             commit_projection_write(conn)
-        result["search_run_id"] = run_id
         maybe_render_after_write(args)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     if not result["ok"]:
@@ -9071,7 +9908,12 @@ def check_telegram_coverage(args: argparse.Namespace) -> None:
             "Поиск в Telegram выключен; сначала включите раздел [telegram] в локальных настройках."
         )
     manifest_path = args.file if args.file.is_absolute() else ROOT / args.file
-    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest_bytes = manifest_path.read_bytes()
+    payload = json.loads(manifest_bytes.decode("utf-8"))
+    manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+    manifest_observed_at = dt.datetime.fromtimestamp(
+        manifest_path.stat().st_mtime, tz=dt.timezone.utc
+    ).replace(microsecond=0).isoformat()
     manifest_file = origin_for(manifest_path)
     with connect_db(args.db) as conn:
         ensure_schema(conn)
@@ -9089,6 +9931,22 @@ def check_telegram_coverage(args: argparse.Namespace) -> None:
             result["search_run_id"] = run_id
             if result["ok"]:
                 persist_source_checkpoints(conn, result, manifest_file)
+            active = active_daily_run_lease(conn)
+            if (
+                active is not None
+                and get_durable_daily_run(conn, str(active["run_id"])) is not None
+            ):
+                result["daily_run_integration"] = integrate_coverage_result(
+                    conn,
+                    SETTINGS,
+                    run_id=str(active["run_id"]),
+                    source="telegram",
+                    result=result,
+                    manifest_file=manifest_file,
+                    manifest_sha256=manifest_sha256,
+                    observed_at=manifest_observed_at,
+                    source_run_id=run_id,
+                )
             commit_projection_write(conn)
     if result.get("search_run_id"):
         maybe_render_after_write(args)
@@ -9222,7 +10080,7 @@ def ingest_json(args: argparse.Namespace) -> None:
             f"В SQLite добавлено вакансий: {stats['ingested']}; "
             f"помещено в карантин: {stats['quarantined']}. "
             + (
-                "Render отложен; SQLite durable, проекции dirty."
+                "Render отложен; запись SQLite сохранена, проекции имеют состояние dirty."
                 if snapshot is None
                 else f"Обновлён файл {display_path(DASHBOARD_PATH, ROOT)}."
             )
@@ -10117,6 +10975,17 @@ def record_external_action_command(args: argparse.Namespace) -> None:
                 reason="Ждать подтверждённого ответа работодателя.",
                 evidence_note=args.evidence_note,
                 source="cli:record-external-action",
+            )
+        active = active_daily_run_lease(conn)
+        if (
+            active is not None
+            and get_durable_daily_run(conn, str(active["run_id"])) is not None
+        ):
+            note_external_action_event(
+                conn,
+                SETTINGS,
+                run_id=str(active["run_id"]),
+                action_key=args.action_key,
             )
         commit_projection_write(conn)
     maybe_render_after_write(args)
@@ -11401,7 +12270,7 @@ def initialize_workspace(args: argparse.Namespace) -> None:
             lease_conn.commit()
             if active_lease is not None:
                 raise RuntimeError(
-                    "init недоступен во время active daily run: "
+                    "init недоступен во время активного ежедневного запуска: "
                     f"run_id={active_lease['run_id']}, owner={active_lease['owner']}, "
                     f"expires_at={active_lease['expires_at']}."
                 )
@@ -11483,7 +12352,7 @@ def initialize_workspace(args: argparse.Namespace) -> None:
     if kept:
         print("  сохранено без изменений: " + ", ".join(kept))
     if bool(getattr(args, "defer_render", False)):
-        print("  SQLite durable; первичный render отложен, проекции dirty")
+        print("  запись SQLite сохранена; первичный render отложен, проекции имеют состояние dirty")
     else:
         print(f"  панель: {display_path(DASHBOARD_PATH, ROOT)}")
 
@@ -11533,6 +12402,7 @@ def doctor(args: argparse.Namespace) -> None:
                 v6_contract_issues = schema_v6_issues(conn)
                 v7_contract_issues = schema_v7_issues(conn)
                 v8_contract_issues = schema_v8_issues(conn)
+                v9_contract_issues = schema_v9_issues(conn)
                 foreign_key_issues = len(conn.execute("PRAGMA foreign_key_check").fetchall())
                 missing_canonical_streams = (
                     int(
@@ -11630,6 +12500,11 @@ def doctor(args: argparse.Namespace) -> None:
                 "database_schema_v8_contract",
                 not v8_contract_issues,
                 "; ".join(v8_contract_issues) or "Контракт v8 соблюдён.",
+            )
+            add(
+                "database_schema_v9_contract",
+                not v9_contract_issues,
+                "; ".join(v9_contract_issues) or "Контракт v9 соблюдён.",
             )
             add(
                 "database_canonical_source_streams",
@@ -11730,7 +12605,19 @@ def latest_completed_coverage(
 def operational_doctor(args: argparse.Namespace) -> None:
     """Separate structural health from fail-closed daily closeout readiness."""
 
-    as_of = parse_iso_date(args.as_of or dt.date.today().isoformat(), label="--as-of")
+    as_of_value = clean_cell(args.as_of)
+    if not as_of_value and clean_cell(getattr(args, "run_id", "")) and args.db.exists():
+        try:
+            with sqlite3.connect(args.db) as probe:
+                row = probe.execute(
+                    "SELECT run_date FROM daily_runs WHERE run_id = ?",
+                    (clean_cell(args.run_id),),
+                ).fetchone()
+                if row:
+                    as_of_value = str(row[0])
+        except sqlite3.Error:
+            pass
+    as_of = parse_iso_date(as_of_value or dt.date.today().isoformat(), label="--as-of")
     checks: list[dict[str, Any]] = []
 
     def add(
@@ -11942,6 +12829,25 @@ def operational_doctor(args: argparse.Namespace) -> None:
                             and str(manifest.get("generation") or "")
                             == str(projection["published_generation"])
                         )
+                        if not manifest_ok:
+                            recovery = conn.execute(
+                                """
+                                SELECT details_json FROM daily_run_transitions
+                                WHERE event_type = 'final_projection_recovered'
+                                ORDER BY id DESC LIMIT 1
+                                """
+                            ).fetchone()
+                            if recovery is not None:
+                                details = json.loads(str(recovery["details_json"]))
+                                manifest_ok = (
+                                    str(details.get("generation") or "")
+                                    == str(manifest.get("generation") or "")
+                                    == str(projection["published_generation"])
+                                    and int(details.get("projection_revision", -1))
+                                    == int(manifest.get("projection_revision", -1))
+                                    and int(details.get("acknowledged_revision", -1))
+                                    == int(projection["rendered_revision"])
+                                )
                     except (OSError, ValueError, TypeError, json.JSONDecodeError):
                         manifest_ok = False
                 generated_ok = (
@@ -11955,10 +12861,10 @@ def operational_doctor(args: argparse.Namespace) -> None:
                     "pass" if generated_ok else "fail",
                     "Модели чтения синхронизированы с SQLite."
                     if generated_ok
-                    else "Требуется resumable rebuild; отсутствуют: "
+                    else "Требуется возобновляемый rebuild; отсутствуют: "
                     + (", ".join(missing_generated) or "нет")
                     + f"; dirty={projection['dirty']}; manifest_ok={manifest_ok}; "
-                    + f"revision={projection['rendered_revision']}/{projection['dirty_revision']}.",
+                    + f"ревизия={projection['rendered_revision']}/{projection['dirty_revision']}.",
                     blocks_closeout=True,
                 )
 
@@ -12058,6 +12964,44 @@ def operational_doctor(args: argparse.Namespace) -> None:
                         "pass",
                         "Инкрементальные Telegram-источники выключены.",
                     )
+
+                exact_run_id = clean_cell(getattr(args, "run_id", ""))
+                if exact_run_id:
+                    durable = get_durable_daily_run(conn, exact_run_id)
+                    if durable is None:
+                        add(
+                            "durable_daily_run",
+                            "fail",
+                            f"Долговечный ежедневный запуск {exact_run_id} не найден.",
+                            blocks_closeout=True,
+                        )
+                    else:
+                        run_readiness = daily_run_closeout_readiness(
+                            conn,
+                            SETTINGS,
+                            run_id=exact_run_id,
+                            mutate_dynamic=False,
+                        )
+                        add(
+                            "durable_daily_run_preconditions",
+                            "pass" if run_readiness["ready"] else "fail",
+                            "Все обязательные шаги зафиксированного плана и манифесты согласованы."
+                            if run_readiness["ready"]
+                            else "; ".join(run_readiness["issues"][:20]),
+                            blocks_closeout=True,
+                        )
+                        completed = durable["status"] == "completed"
+                        add(
+                            "durable_daily_run_completed",
+                            "pass" if completed else "fail",
+                            (
+                                f"Ежедневный запуск {exact_run_id} завершён программным закрытием."
+                                if completed
+                                else f"Ежедневный запуск {exact_run_id} имеет состояние {durable['status']}; "
+                                "структурное здоровье не является доказательством закрытия."
+                            ),
+                            blocks_closeout=True,
+                        )
         except (sqlite3.Error, RuntimeError) as exc:
             add(
                 "database_operational_read",
@@ -12076,6 +13020,7 @@ def operational_doctor(args: argparse.Namespace) -> None:
     )
     result = {
         "as_of": as_of.isoformat(),
+        "run_id": clean_cell(getattr(args, "run_id", "")),
         "technical_health": technical_health,
         "ready_for_daily_closeout": ready,
         "overall_status": "pass"
@@ -12196,7 +13141,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="defer_render",
         action="store_true",
         default=environment_flag("JOB_SEARCH_DEFER_RENDER"),
-        help="Зафиксировать SQLite и dirty revision без пересборки проекций",
+        help="Зафиксировать SQLite и ревизию dirty без пересборки проекций",
     )
     parser.add_argument(
         "--lock-timeout",
@@ -12206,12 +13151,12 @@ def build_parser() -> argparse.ArgumentParser:
                 "JOB_SEARCH_LOCK_TIMEOUT", str(DEFAULT_LOCK_TIMEOUT_SECONDS)
             )
         ),
-        help="Ограниченное ожидание writer/render lock в секундах",
+        help="Ограниченное ожидание блокировок записи и render в секундах",
     )
     parser.add_argument(
         "--run-lease",
         default=os.environ.get("JOB_SEARCH_RUN_LEASE", ""),
-        help="Токен активного daily run для защиты от конкурентной orchestration",
+        help="Токен активного ежедневного запуска для защиты от конкурирующих оркестраторов",
     )
 
     sub = parser.add_subparsers()
@@ -12237,6 +13182,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     operational_doctor_parser.add_argument("--db", type=Path, default=DB_PATH)
     operational_doctor_parser.add_argument("--as-of", default="")
+    operational_doctor_parser.add_argument(
+        "--run-id", default="", help="Проверить точный долговечный ежедневный запуск"
+    )
     operational_doctor_parser.add_argument("--json", action="store_true")
     operational_doctor_parser.add_argument(
         "--strict", action="store_true", help="Вернуть ненулевой код, если закрытие не готово"
@@ -12250,7 +13198,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     projection_parser = sub.add_parser(
         "projection-status",
-        help="Показать dirty/fresh revision и активный daily-run lease",
+        help="Показать ревизию проекций dirty/fresh и активный lease ежедневного запуска",
     )
     projection_parser.add_argument("--db", type=Path, default=DB_PATH)
     projection_parser.add_argument("--json", action="store_true")
@@ -12258,10 +13206,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     begin_run_parser = sub.add_parser(
         "begin-daily-run",
-        help="Получить bounded lease для одного daily-run orchestration",
+        help="Получить ограниченный lease для оркестрации одного ежедневного запуска",
     )
     begin_run_parser.add_argument("--db", type=Path, default=DB_PATH)
     begin_run_parser.add_argument("--run-id", required=True)
+    begin_run_parser.add_argument("--run-date", default="")
+    begin_run_parser.add_argument(
+        "--timezone",
+        default=SETTINGS.project.timezone,
+        help="Часовой пояс IANA для зафиксированного плана",
+    )
     begin_run_parser.add_argument("--owner", default="")
     begin_run_parser.add_argument(
         "--lease-seconds",
@@ -12273,11 +13227,114 @@ def build_parser() -> argparse.ArgumentParser:
 
     finalize_run_parser = sub.add_parser(
         "finalize-daily-run",
-        help="Атомарно пересобрать проекции один раз и закрыть daily-run lease",
+        help="Один раз атомарно пересобрать проекции и закрыть lease ежедневного запуска",
     )
     finalize_run_parser.add_argument("--db", type=Path, default=DB_PATH)
     finalize_run_parser.add_argument("--json", action="store_true")
     finalize_run_parser.set_defaults(func=finalize_daily_run_command)
+
+    run_status_parser = sub.add_parser(
+        "daily-run-status",
+        help="Компактно показать незавершённый долговечный запуск и следующий безопасный шаг",
+    )
+    run_status_parser.add_argument("--db", type=Path, default=DB_PATH)
+    run_status_parser.add_argument("--run-id", default="")
+    run_status_parser.add_argument(
+        "--verbose", action="store_true", help="Включить полный план, манифесты и историю"
+    )
+    run_status_parser.add_argument("--history-limit", type=int, default=100)
+    run_status_parser.add_argument("--json", action="store_true")
+    run_status_parser.set_defaults(func=daily_run_status_command)
+
+    resume_run_parser = sub.add_parser(
+        "resume-daily-run",
+        help="Получить новый lease для существующего незавершённого ежедневного запуска",
+    )
+    resume_run_parser.add_argument("--db", type=Path, default=DB_PATH)
+    resume_run_parser.add_argument("--run-id", default="")
+    resume_run_parser.add_argument("--owner", default="")
+    resume_run_parser.add_argument(
+        "--lease-seconds", type=int, default=DEFAULT_DAILY_RUN_LEASE_SECONDS
+    )
+    resume_run_parser.add_argument("--json", action="store_true")
+    resume_run_parser.set_defaults(func=resume_daily_run_command)
+
+    pause_run_parser = sub.add_parser(
+        "pause-daily-run",
+        help="Чисто освободить lease, сохранив ежедневный запуск для продолжения",
+    )
+    pause_run_parser.add_argument("--db", type=Path, default=DB_PATH)
+    pause_run_parser.add_argument("--run-id", default="")
+    pause_run_parser.add_argument("--reason", required=True)
+    pause_run_parser.add_argument("--json", action="store_true")
+    pause_run_parser.set_defaults(func=pause_daily_run_command)
+
+    def add_daily_run_work_target(target: argparse.ArgumentParser) -> None:
+        target.add_argument("--db", type=Path, default=DB_PATH)
+        target.add_argument("--run-id", required=True)
+        target.add_argument("--step-key", required=True)
+        target.add_argument("--item-key", default="")
+        target.add_argument("--json", action="store_true")
+
+    start_work_parser = sub.add_parser(
+        "start-daily-run-work", help="Начать один ожидающий шаг или единицу работы"
+    )
+    add_daily_run_work_target(start_work_parser)
+    start_work_parser.set_defaults(func=start_daily_run_work_command)
+
+    checkpoint_work_parser = sub.add_parser(
+        "checkpoint-daily-run-work",
+        help="Сохранить проверенную частичную контрольную точку",
+    )
+    add_daily_run_work_target(checkpoint_work_parser)
+    checkpoint_work_parser.add_argument("--manifest", type=Path, required=True)
+    checkpoint_work_parser.set_defaults(func=checkpoint_daily_run_work_command)
+
+    complete_work_parser = sub.add_parser(
+        "complete-daily-run-work",
+        help="Завершить шаг или единицу работы по корректному манифесту",
+    )
+    add_daily_run_work_target(complete_work_parser)
+    complete_work_parser.add_argument("--manifest", type=Path, required=True)
+    complete_work_parser.set_defaults(func=complete_daily_run_work_command)
+
+    block_work_parser = sub.add_parser(
+        "block-daily-run-work", help="Сохранить точную блокировку и возможность повтора"
+    )
+    add_daily_run_work_target(block_work_parser)
+    block_work_parser.add_argument("--code", required=True)
+    block_work_parser.add_argument("--reason", required=True)
+    retryability = block_work_parser.add_mutually_exclusive_group(required=True)
+    retryability.add_argument("--retryable", action="store_true")
+    retryability.add_argument("--not-retryable", action="store_false", dest="retryable")
+    block_work_parser.set_defaults(func=block_daily_run_work_command)
+
+    uncertain_work_parser = sub.add_parser(
+        "mark-daily-run-work-uncertain",
+        help="Потребовать сверку без автоматической повторной отправки",
+    )
+    add_daily_run_work_target(uncertain_work_parser)
+    uncertain_work_parser.add_argument("--reason", required=True)
+    uncertain_work_parser.set_defaults(func=uncertain_daily_run_work_command)
+
+    invalidate_work_parser = sub.add_parser(
+        "invalidate-daily-run-work",
+        help="Аудируемо инвалидировать или переоткрыть завершённую работу",
+    )
+    add_daily_run_work_target(invalidate_work_parser)
+    invalidate_work_parser.add_argument("--reason", required=True)
+    invalidate_work_parser.add_argument("--leave-invalidated", action="store_true")
+    invalidate_work_parser.set_defaults(func=invalidate_daily_run_work_command)
+
+    refresh_plan_parser = sub.add_parser(
+        "refresh-daily-run-plan",
+        help="Явно обновить зафиксированный план после изменения конфигурации",
+    )
+    refresh_plan_parser.add_argument("--db", type=Path, default=DB_PATH)
+    refresh_plan_parser.add_argument("--run-id", required=True)
+    refresh_plan_parser.add_argument("--reason", required=True)
+    refresh_plan_parser.add_argument("--json", action="store_true")
+    refresh_plan_parser.set_defaults(func=refresh_daily_run_plan_command)
 
     stats_parser = sub.add_parser("stats", help="Вывести текущие показатели базы")
     stats_parser.add_argument("--db", type=Path, default=DB_PATH)
@@ -12824,6 +13881,15 @@ def mutating_command_functions() -> set[Any]:
         record_followup,
         attach_interview_summary,
         begin_daily_run_command,
+        resume_daily_run_command,
+        pause_daily_run_command,
+        start_daily_run_work_command,
+        checkpoint_daily_run_work_command,
+        complete_daily_run_work_command,
+        block_daily_run_work_command,
+        uncertain_daily_run_work_command,
+        invalidate_daily_run_work_command,
+        refresh_daily_run_plan_command,
         finalize_daily_run_command,
     }
 
@@ -12833,6 +13899,8 @@ def lease_control_functions() -> set[Any]:
         initialize_workspace,
         migrate_schema,
         begin_daily_run_command,
+        resume_daily_run_command,
+        pause_daily_run_command,
         finalize_daily_run_command,
     }
 
@@ -12867,12 +13935,31 @@ def main(argv: list[str] | None = None) -> int:
                             clean_cell(getattr(args, "run_lease", "")),
                             heartbeat=True,
                         )
+                        open_run = durable_daily_run_row(conn, open_only=True)
+                        if active_lease is None and open_run is not None:
+                            raise RuntimeError(
+                                "Открыт незавершённый долговечный ежедневный запуск "
+                                f"{open_run['run_id']}. Сначала выполните resume-daily-run "
+                                "и передайте точный --run-lease."
+                            )
+                        if active_lease is not None:
+                            durable_run = durable_daily_run_row(
+                                conn, str(active_lease["run_id"])
+                            )
+                            if (
+                                durable_run is not None
+                                and durable_run["status"] == "finalizing"
+                            ):
+                                raise RuntimeError(
+                                    "Ежедневный запуск находится в состоянии finalizing; до завершения "
+                                    "разрешены только finalize-daily-run или pause-daily-run."
+                                )
                         if active_lease is not None and not bool(
                             getattr(args, "defer_render", False)
                         ):
                             raise RuntimeError(
-                                "Active daily run требует --defer-render для каждой "
-                                "write-команды; единственный полный render выполняет "
+                                "Активный ежедневный запуск требует --defer-render для каждой "
+                                "команды записи; единственный полный render выполняет "
                                 "finalize-daily-run."
                             )
                         conn.commit()

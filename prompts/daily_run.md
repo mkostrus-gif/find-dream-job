@@ -16,24 +16,57 @@ not an onboarded candidate workspace.
    `JOB_SEARCH_CONFIG`).
 3. Read every private profile, preferences, scoring, and Q&A file listed in
    that config. Treat only verified profile evidence as candidate facts.
-4. Run:
+4. Сначала найдите незавершённый долговечный запуск одной компактной командой:
 
    ```bash
    python3 scripts/jobctl.py doctor --strict --json
-   python3 scripts/jobctl.py projection-status --json
-   python3 scripts/jobctl.py begin-daily-run \
-     --run-id daily-YYYY-MM-DD-<stable-operator-id> --json
+   python3 scripts/jobctl.py daily-run-status --json
    ```
 
-   `begin-daily-run` requires fresh projections. If an earlier interrupted run
-   left them dirty, perform one explicit resumable `rebuild --json` before
-   beginning the new run. Preserve the returned `run_lease` token. From this
-   point through the final coverage writes, add
-   `--defer-render --run-lease <token>` to every `jobctl` command that mutates
-   SQLite. These flags commit evidence immediately and mark projections dirty
-   without touching the previously published dashboard or views.
+   Если команда вернула незавершённый запуск, не создавайте новый и не повторяйте
+   уже завершённые единицы работы. Выполните указанную в ответе
+   `resume_command`, получите новый `lease` и продолжайте только элементы в
+   состояниях `pending`, `checkpointed` или `invalidated`. Состояние
+   `needs_verification` сначала требует
+   внешней сверки; автоматическая повторная отправка запрещена.
 
-5. Review `views/review_active.md`, `views/today.md`, `views/followups.md`,
+   Только при отсутствии незавершённого запуска проверьте проекции и создайте
+   новый снимок плана:
+
+   ```bash
+   python3 scripts/jobctl.py projection-status --json
+   python3 scripts/jobctl.py begin-daily-run \
+     --run-id daily-YYYY-MM-DD-<stable-operator-id> \
+     --run-date YYYY-MM-DD --timezone <IANA-timezone> --json
+   ```
+
+   Новый `begin-daily-run` требует свежих проекций; состояние `dirty` при уже
+   существующем долговечном запуске означает возобновление, а не новый
+   `rebuild`. Сохраните возвращённый токен `run_lease`. С этого момента и до
+   последних записей покрытия добавляйте
+   `--defer-render --run-lease <token>` к каждой команде `jobctl`, изменяющей
+   SQLite. Эти флаги сразу фиксируют доказательства и помечают проекции как
+   `dirty`, не затрагивая ранее опубликованные панель и представления.
+
+5. После каждого проверенного удалённого блока сразу сохраните долговечную
+   контрольную точку или завершение:
+
+   ```bash
+   python3 scripts/jobctl.py checkpoint-daily-run-work \
+     --run-id <run_id> --step-key <step> --item-key <item> \
+     --manifest tmp/checkpoint.json --defer-render --run-lease <token> --json
+   python3 scripts/jobctl.py complete-daily-run-work \
+     --run-id <run_id> --step-key <step> --item-key <item> \
+     --manifest tmp/completion.json --defer-render --run-lease <token> --json
+   ```
+
+   Манифест не доказывает удалённую полноту сам по себе: для удалённого
+   источника требуются видимо проверенные `completion_boundary` и
+   `remote_boundary_verified = true`. Если доказательство изменилось после
+   завершения, используйте `invalidate-daily-run-work --reason ...`; молчаливо
+   перезаписывать доказательство завершения запрещено.
+
+6. Review `views/review_active.md`, `views/today.md`, `views/followups.md`,
    `views/employer_accounts.md`, `reports/source_quality.md`,
    `reports/source_streams.md`, `reports/source_checkpoints.md`, and
    `reports/conversion_cohorts.md`.
@@ -228,6 +261,12 @@ complete vacancy text.
 
 ## Close the run
 
+Перед закрытием снова выполните `daily-run-status --run-id <run_id> --json`.
+Если конфигурация изменилась, примените только явный аудируемый
+`refresh-daily-run-plan --reason ...`; Engine сохранит прежние требования,
+добавит новые и инвалидирует зависимые завершения. Не используйте `skipped` для
+обхода включённого обязательного условия.
+
 Finish the coverage manifest with per-stream `status`, page checkpoints,
 `unique`, `known`, and `new` counts plus de-duplicated run totals. Then run:
 
@@ -254,6 +293,7 @@ python3 scripts/jobctl.py wip-queue --as-of YYYY-MM-DD --json
 python3 scripts/jobctl.py stats
 python3 scripts/jobctl.py doctor --strict --json
 python3 scripts/jobctl.py operational-doctor --as-of YYYY-MM-DD --strict --json
+python3 scripts/jobctl.py operational-doctor --run-id <run_id> --strict --json
 ```
 
 `finalize-daily-run` performs exactly one full render and is the run's only
@@ -263,6 +303,28 @@ interrupted or the render lock times out, the prior complete dashboard remains
 published, SQLite stays durable and dirty, and the same finalize command with
 the same token is the resumable next step. Do not start another daily run or
 manually clear the lease.
+
+`finalize-daily-run` программно пересчитывает полную авторитетную очередь
+наступивших повторных обращений без ограничения WIP или квоты сообщений,
+проверяет нетерминальные внешние действия, связанные с запуском манифесты HH и
+Telegram, дополнительные обязательные условия, изменение конфигурации и
+согласованность SQLite. При любой незавершённой или неопределённой работе
+команда отказывает в закрытии. После прохождения проверок она фиксирует
+`finalizing`, публикует ровно одно атомарное поколение P0, записывает ревизию
+проекций и только затем устанавливает `completed`.
+
+Если доступ, CAPTCHA, вход или другая внешняя блокировка не позволяет продолжить,
+зафиксируйте его через `block-daily-run-work` либо
+`mark-daily-run-work-uncertain`, затем освободите `lease` без ложного завершения:
+
+```bash
+python3 scripts/jobctl.py pause-daily-run --run-id <run_id> \
+  --reason "<точный blocker>" --run-lease <token> --json
+```
+
+Новая задача Codex начинает с `daily-run-status`, затем выполняет
+`resume-daily-run`; срок `lease` не определяет срок жизни запуска. Завершённая
+работа не повторяется только из-за смены задачи или процесса.
 
 Report verified counts for discovered, reviewed, needs-input, applied,
 follow-up, interviews, offers, rejections, quarantine, WIP overflow, and SLA

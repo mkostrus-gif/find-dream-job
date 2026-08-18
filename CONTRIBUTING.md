@@ -13,7 +13,7 @@ Use Python 3.11 or newer. The core has no third-party runtime dependencies.
 Never use a real candidate workspace as a test fixture.
 
 ```bash
-python3 -m py_compile scripts/jobctl.py scripts/jobsearch_config.py scripts/search_coverage.py scripts/telegram_source.py scripts/public_audit.py
+python3 -m py_compile scripts/jobctl.py scripts/daily_run_orchestration.py scripts/jobsearch_config.py scripts/search_coverage.py scripts/telegram_source.py scripts/public_audit.py
 python3 -m unittest discover -s tests -v
 python3 scripts/public_audit.py --strict
 python3 scripts/benchmark_daily_run.py --rows 25000 --workflow deferred
@@ -44,6 +44,16 @@ generation, concurrent renderers obey bounded OS locks, and the 25,000-row
 synthetic benchmark reports dashboard bytes and WIP file count. A schema v8
 migration changes only projection-control and run-lease structures; evidence
 tables and external-action gates must remain row-count stable.
+
+Изменения оркестрации схемы v9 дополнительно требуют синтетических сценариев
+аварийного продолжения: миграции v8 с резервной копией, детерминированного
+отпечатка плана, частичной контрольной точки источника, приостановки и нового
+`lease`, истечения `lease`, изменения конфигурации, неопределённого внешнего
+действия, полной очереди наступивших повторных обращений, прерывания финальной
+публикации, ровно одного `render`, идемпотентной повторной финализации, точного
+`operational-doctor` для запуска и ограниченного статуса на 25 000 строках. Все
+фикстуры должны находиться в одноразовом `JOB_SEARCH_HOME`; реальную базу
+кандидата использовать запрещено.
 
 ## Pull requests
 

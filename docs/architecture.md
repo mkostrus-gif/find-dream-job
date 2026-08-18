@@ -141,37 +141,81 @@ workspaces.
 
 ## SQLite lifecycle
 
-The schema has an explicit `PRAGMA user_version`; schema v8 upgrades supported
-versions v1–v7. It adds transactional projection revisions and a bounded
-daily-run lease without changing evidence tables. Schema v7 added interaction
-invalidations and effective projections on top of schema v6, which added
-lifecycle/action/external-action evidence, configured
-decision metadata, normalized source labels, quarantine, versioned screening
-policy, and migration audit state. Legacy confirmed applications are preserved
-conservatively with incomplete-history/unknown-authorization markers. The CLI
-refuses databases newer than the supported schema. Connections
-enable foreign-key enforcement and a bounded busy timeout. Generated output is
-rebuilt from a consistent snapshot. Explicit migrations create a recoverable
-backup by default, create tables and indexes idempotently, and backfill only
-facts already supported by legacy evidence.
+Версия схемы явно хранится в `PRAGMA user_version`; схема v9 обновляет
+поддерживаемые версии v1–v8. Она сохраняет контракт проекций и `lease` v8 и
+добавляет долговечный план ежедневного запуска, не изменяя таблицы доказательств
+кандидата. Схема v7 добавила инвалидации взаимодействий и эффективные проекции
+поверх схемы v6, которая ввела доказательства жизненного цикла, действий и
+внешних действий, настраиваемые метаданные решений, нормализованные метки
+источников, карантин, версионированную политику отбора и журнал миграций. Старые
+подтверждённые отклики консервативно сохраняются с признаками неполной истории и
+неизвестного разрешения. CLI отказывается работать с базой новее поддерживаемой
+схемы. Соединения включают внешние ключи и ограниченное ожидание занятой базы.
+Результаты строятся из согласованного снимка. Явные миграции по умолчанию
+создают восстанавливаемую резервную копию, идемпотентно добавляют таблицы и
+индексы и переносят только факты, уже подтверждённые прежними доказательствами.
 
-Supported mutations are serialized by an OS-backed writer lock; renders take a
-second OS-backed render lock in the same deterministic order. The lock file is
-metadata only: ownership comes from the kernel lock, so a dead PID cannot leave
-a permanent stale lock. Waits are bounded and report resumable state. A daily
-run additionally owns an expiring SQLite lease across its short-lived CLI
-processes, preventing two live orchestrators from interleaving evidence.
+Все изменения последовательно проходят системную блокировку записи; `render`
+получает вторую системную блокировку в том же детерминированном порядке. Файл
+блокировки содержит только метаданные: владение обеспечивает ядро системы,
+поэтому завершившийся процесс не оставляет вечную блокировку. Время ожидания
+ограничено, а ошибка сообщает состояние, с которого можно продолжить.
+Ежедневный запуск дополнительно владеет истекающим SQLite-`lease` между
+короткими процессами CLI и не позволяет двум оркестраторам смешивать
+доказательства. Срок жизни запуска отделён от срока жизни `lease`: сбой процесса
+или истечение `lease` не удаляет зафиксированный план и проверенные контрольные
+точки.
 
-Generated output uses immutable generation directories. `views/`, `reports/`,
-and `dashboard/index.html` resolve through one `current` symlink, so the full
-set switches atomically and stale numbered pages vanish only with a successful
-publication. The dashboard payload is an operationally bounded projection;
-full audit history remains in SQLite and paginated read paths.
+Результаты хранятся в неизменяемых каталогах поколений. `views/`, `reports/` и
+`dashboard/index.html` разрешаются через одну символическую ссылку `current`,
+поэтому весь набор переключается атомарно, а устаревшие нумерованные страницы
+исчезают только после успешной публикации. Данные панели являются ограниченной
+операционной проекцией; полная история аудита остаётся в SQLite и постраничных
+представлениях.
 
-The current code intentionally remains a single control-plane module plus a
-small configuration module. This keeps deployment dependency-free. If the CLI
-grows, natural extraction boundaries are schema/migrations, ingestion, domain
-services, and rendering.
+Не требующий сторонних зависимостей контур управления разделён между
+`jobctl.py`, конфигурацией, валидаторами источников и
+`daily_run_orchestration.py`. SQLite остаётся единственным авторитетным
+хранилищем координации.
+
+## Долговечный автомат состояний ежедневного запуска (схема v9)
+
+Каждый запуск имеет текущую запись в `daily_runs` и одну или несколько
+неизменяемых ревизий плана в `daily_run_plan_revisions`. Нормализованные шаги,
+зависимости и элементы работы находятся в `daily_run_steps`,
+`daily_run_step_dependencies` и `daily_run_work_items`. Проверенные частичные и
+завершающие манифесты сохраняются неизменяемо в `daily_run_manifests`, а каждое
+создание, контрольная точка, блокировка, инвалидация, приостановка,
+возобновление и завершение — в `daily_run_transitions` с идемпотентным хешем.
+
+```text
+running -> paused -> running
+running -> blocked | needs_verification -> running
+running -> finalizing -> completed
+finalizing -> finalizing  (прерванный render можно продолжить)
+finalizing -> running | blocked | needs_verification  (изменились входные данные)
+```
+
+`completed` терминален. Состояния единицы работы: `pending`, `in_progress`,
+`checkpointed`, `completed`, `blocked`, `needs_verification`, `invalidated` и
+`not_applicable`. Последнее допустимо только для требования, которое при
+создании снимка плана было выключено или находилось вне его объёма. Изменить
+доказательство завершённого элемента можно только через явную инвалидацию с
+причиной и записью в журнал; зависимые завершённые шаги инвалидируются
+детерминированно.
+
+Зафиксированный объём включает настроенные потоки HH, каналы Telegram, функции
+почты и источников, полную очередь наступивших повторных обращений,
+нетерминальные внешние действия и обобщённые дополнительные условия рабочей
+области. Отпечатки SHA-256 отделяют изменение конфигурации от динамического
+расширения очередей. Компактный статус не возвращает тексты вакансий или писем
+и остаётся ограниченным независимо от размера базы.
+
+Финализация сначала фиксирует `finalizing` и целевую загрязнённую ревизию, затем
+использует промежуточное поколение P0 и атомарно переключает `current`. Если
+процесс остановлен до публикации, предыдущее поколение остаётся доступно. Если
+он остановлен после публикации, повторный `finalize-daily-run` узнаёт уже
+опубликованную ревизию и завершает запуск без второго `render`.
 
 ## Trust boundaries
 

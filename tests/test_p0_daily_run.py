@@ -105,6 +105,83 @@ class DailyRunP0Tests(unittest.TestCase):
         with contextlib.closing(sqlite3.connect(self.database)) as conn:
             return int(conn.execute("SELECT id FROM vacancies").fetchone()[0])
 
+    def complete_durable_closeout_gates(self, run_id: str, lease: str) -> None:
+        inbound = self.workspace / "inbound-manifest.json"
+        inbound.write_text(
+            json.dumps(
+                {
+                    "manifest_version": 1,
+                    "kind": "inbound_reconciliation",
+                    "run_id": run_id,
+                    "step_key": "inbound_reconciliation",
+                    "item_key": "",
+                    "observed_at": "2026-08-18T12:00:00Z",
+                    "captured_scope": {"configured_sources": []},
+                    "counts": {"raw": 0, "processed": 0, "reconciled": 0, "blocked": 0},
+                    "completion_boundary": "all configured inbound sources checked",
+                    "remote_boundary_verified": True,
+                    "blockers": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.run_cli(
+            "complete-daily-run-work",
+            "--run-id",
+            run_id,
+            "--step-key",
+            "inbound_reconciliation",
+            "--manifest",
+            str(inbound),
+            "--defer-render",
+            "--run-lease",
+            lease,
+            "--json",
+        )
+        plan_input = self.workspace / "coverage-input.json"
+        plan_output = self.workspace / "coverage.json"
+        plan_input.write_text(
+            json.dumps(
+                {
+                    "run_date": "2026-08-18",
+                    "source": "hh",
+                    "required_streams": ["recommendations", "target_roles"],
+                    "streams": [
+                        {"key": "recommendations", "query": {"any_terms": ["product"]}},
+                        {"key": "target_roles", "query": {"any_terms": ["manager"]}},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.run_cli(
+            "build-coverage-plan",
+            str(plan_input),
+            "--output",
+            str(plan_output),
+        )
+        manifest = json.loads(plan_output.read_text(encoding="utf-8"))
+        for stream in manifest["streams"]:
+            stream.update(
+                {
+                    "status": "completed",
+                    "found": 0,
+                    "pages": [{"page": 0, "extracted": 0}],
+                    "unique": 0,
+                    "known": 0,
+                    "new": 0,
+                }
+            )
+        manifest["totals"] = {"unique": 0, "known": 0, "new": 0}
+        plan_output.write_text(json.dumps(manifest), encoding="utf-8")
+        self.run_cli(
+            "check-coverage",
+            str(plan_output),
+            "--defer-render",
+            "--run-lease",
+            lease,
+        )
+
     def test_deferred_init_creates_durable_dirty_database_without_outputs(self) -> None:
         with tempfile.TemporaryDirectory(prefix="find-dream-job-p0-deferred-init-") as temp:
             workspace = Path(temp)
@@ -137,7 +214,7 @@ class DailyRunP0Tests(unittest.TestCase):
             check=False,
         )
         self.assertNotEqual(concurrent.returncode, 0)
-        self.assertIn("Нельзя начать второй daily run", concurrent.stderr)
+        self.assertIn("Нельзя начать второй ежедневный запуск", concurrent.stderr)
         missing_lease = self.run_cli(
             "set-current-action",
             "--id",
@@ -152,7 +229,7 @@ class DailyRunP0Tests(unittest.TestCase):
             check=False,
         )
         self.assertNotEqual(missing_lease.returncode, 0)
-        self.assertIn("активен другой daily run", missing_lease.stderr)
+        self.assertIn("активен другой ежедневный запуск", missing_lease.stderr)
         intermediate_write = self.run_cli(
             "set-current-action",
             "--id",
@@ -234,6 +311,7 @@ class DailyRunP0Tests(unittest.TestCase):
             ).fetchone()
             self.assertGreater(dirty, rendered)
 
+        self.complete_durable_closeout_gates("synthetic-p0-run", lease)
         finalized = json.loads(
             self.run_cli(
                 "finalize-daily-run", "--run-lease", lease, "--json"
@@ -429,7 +507,7 @@ class DailyRunP0Tests(unittest.TestCase):
             self.run_cli("migrate-schema", "--defer-render", "--json").stdout
         )
         self.assertEqual(migrated["from_version"], 7)
-        self.assertEqual(migrated["to_version"], 8)
+        self.assertEqual(migrated["to_version"], 9)
         self.assertTrue(migrated["render_deferred"])
         self.assertTrue(migrated["projection_state"]["dirty"])
         backups = list(self.database.parent.glob("job_search.sqlite.bak-schema-v7-*"))
@@ -440,7 +518,7 @@ class DailyRunP0Tests(unittest.TestCase):
                 for table in before
             }
             self.assertEqual(before, after)
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 8)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 9)
             self.assertEqual(conn.execute("PRAGMA integrity_check").fetchone()[0], "ok")
             self.assertEqual(conn.execute("PRAGMA foreign_key_check").fetchall(), [])
         self.run_cli("rebuild", "--json")

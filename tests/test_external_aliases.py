@@ -447,7 +447,7 @@ class VacancyExternalAliasIntegrationTests(unittest.TestCase):
         self.assertNotEqual(blocked.returncode, 0)
         migrated = json.loads(self.run_cli("migrate-schema", "--json").stdout)
         self.assertEqual(migrated["from_version"], 2)
-        self.assertEqual(migrated["to_version"], 8)
+        self.assertEqual(migrated["to_version"], 9)
         self.assertEqual(migrated["backfilled_aliases"], 1)
         self.assertTrue(migrated["backup"])
         backups = list(self.database.parent.glob("job_search.sqlite.bak-schema-v2-*"))

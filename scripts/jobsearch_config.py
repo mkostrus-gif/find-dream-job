@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 DEFAULT_CHANNEL_LABELS = {
@@ -34,6 +35,7 @@ DEFAULT_CHANNEL_LABELS = {
 class ProjectSettings:
     title: str
     locale: str
+    timezone: str
 
 
 @dataclass(frozen=True)
@@ -147,6 +149,22 @@ class AccountSettings:
 
 
 @dataclass(frozen=True)
+class DailyRunGateSettings:
+    key: str
+    kind: str
+    order: int
+    depends_on: tuple[str, ...]
+    required: bool
+    enabled: bool
+    require_remote_boundary: bool
+
+
+@dataclass(frozen=True)
+class DailyRunSettings:
+    required_gates: tuple[DailyRunGateSettings, ...]
+
+
+@dataclass(frozen=True)
 class Settings:
     code_root: Path
     workspace_root: Path
@@ -164,6 +182,7 @@ class Settings:
     wip: WipSettings
     policy: PolicySettings
     account: AccountSettings
+    daily_run: DailyRunSettings
     channel_labels: dict[str, str]
 
 
@@ -279,6 +298,72 @@ def _configured_values(
     if len(folded) != len(set(folded)):
         raise ValueError(f"{key}: повторяющиеся значения запрещены.")
     return tuple(cleaned)
+
+
+DAILY_RUN_GATE_KEY_RE = re.compile(r"^[a-z][a-z0-9_.-]{1,95}$")
+DAILY_RUN_GATE_KIND_RE = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
+
+
+def _daily_run_gates(table: dict[str, Any]) -> tuple[DailyRunGateSettings, ...]:
+    """Parse opaque workspace gates without teaching the Engine their meaning."""
+
+    value = table.get("required_gates", [])
+    if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
+        raise ValueError(
+            "Поле daily_run.required_gates должно быть массивом таблиц TOML."
+        )
+    gates: list[DailyRunGateSettings] = []
+    seen: set[str] = set()
+    for index, raw in enumerate(value):
+        key = raw.get("key")
+        kind = raw.get("kind", "workspace_gate")
+        order = raw.get("order", 500)
+        depends_on = raw.get("depends_on", [])
+        required = raw.get("required", True)
+        enabled = raw.get("enabled", True)
+        require_remote_boundary = raw.get("require_remote_boundary", True)
+        label = f"daily_run.required_gates[{index}]"
+        if not isinstance(key, str) or not DAILY_RUN_GATE_KEY_RE.fullmatch(key.strip()):
+            raise ValueError(
+                f"{label}.key: требуется устойчивый ключ из строчных латинских букв, "
+                "цифр, точки, дефиса или подчёркивания."
+            )
+        key = key.strip()
+        if key in seen:
+            raise ValueError(f"{label}.key: ключ {key!r} повторяется.")
+        seen.add(key)
+        if not isinstance(kind, str) or not DAILY_RUN_GATE_KIND_RE.fullmatch(kind.strip()):
+            raise ValueError(
+                f"{label}.kind: требуется непустой ключ вида lowercase_snake_case."
+            )
+        if not isinstance(order, int) or isinstance(order, bool) or order < 0:
+            raise ValueError(f"{label}.order: требуется целое число не меньше 0.")
+        if not isinstance(depends_on, list) or not all(
+            isinstance(item, str) for item in depends_on
+        ):
+            raise ValueError(f"{label}.depends_on: требуется массив строк.")
+        dependencies = tuple(item.strip() for item in depends_on if item.strip())
+        if len(dependencies) != len(set(dependencies)):
+            raise ValueError(f"{label}.depends_on: повторяющиеся зависимости запрещены.")
+        for field_name, field_value in (
+            ("required", required),
+            ("enabled", enabled),
+            ("require_remote_boundary", require_remote_boundary),
+        ):
+            if not isinstance(field_value, bool):
+                raise ValueError(f"{label}.{field_name}: требуется true или false.")
+        gates.append(
+            DailyRunGateSettings(
+                key=key,
+                kind=kind.strip(),
+                order=order,
+                depends_on=dependencies,
+                required=required,
+                enabled=enabled,
+                require_remote_boundary=require_remote_boundary,
+            )
+        )
+    return tuple(sorted(gates, key=lambda gate: (gate.order, gate.key)))
 
 
 DEFAULT_WIP_BUCKETS: tuple[tuple[str, str, int, int, bool], ...] = (
@@ -440,6 +525,7 @@ def load_settings(code_root: Path, config_path: Path | None = None) -> Settings:
     queue = _table(data, "queue")
     policy = _table(data, "policy")
     account = _table(data, "account")
+    daily_run = _table(data, "daily_run")
     source_stream_aliases = _table(data, "source_stream_aliases")
     labels = _table(data, "channel_labels")
 
@@ -492,6 +578,7 @@ def load_settings(code_root: Path, config_path: Path | None = None) -> Settings:
         project=ProjectSettings(
             title=_string(project, "title", "Find Dream Job"),
             locale=_string(project, "locale", "ru"),
+            timezone=_string(project, "timezone", "UTC"),
         ),
         paths=PathSettings(
             database=_path_value(paths, "database", "data/job_search.sqlite", workspace_root),
@@ -571,6 +658,7 @@ def load_settings(code_root: Path, config_path: Path | None = None) -> Settings:
                 account, "active_portfolio_limit", 20, 1
             )
         ),
+        daily_run=DailyRunSettings(required_gates=_daily_run_gates(daily_run)),
         channel_labels=channel_labels,
     )
 
@@ -586,6 +674,12 @@ def load_settings(code_root: Path, config_path: Path | None = None) -> Settings:
         raise ValueError("Поле policy.effective_date должно быть датой в формате ГГГГ-ММ-ДД.") from exc
     if effective_date.year < 2000:
         raise ValueError("Год в policy.effective_date должен быть не раньше 2000.")
+    try:
+        ZoneInfo(settings.project.timezone)
+    except ZoneInfoNotFoundError as exc:
+        raise ValueError(
+            "Поле project.timezone должно содержать имя часового пояса IANA, например Europe/Moscow."
+        ) from exc
     return settings
 
 

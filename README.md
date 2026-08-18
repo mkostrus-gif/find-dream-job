@@ -97,7 +97,9 @@ It provides:
   structured vacancy factors that remain separate from candidate-relative score;
 - generated `views/*.md`, `reports/*.md`, and `dashboard/index.html`;
 - deferred durable writes plus one atomic closeout render for large daily runs;
-- bounded inter-process writer/render locks and one expiring daily-run lease;
+- ограниченные межпроцессные блокировки записи и `render`, долговечный план
+  ежедневного запуска в SQLite, возобновляемые контрольные точки и сменяемые
+  истекающие `lease`;
 - agent workflows for onboarding, discovery, scoring, ATS documents,
   applications, and reconciliation;
 - safe review-only defaults and a default-deny public Git allowlist.
@@ -205,6 +207,12 @@ doctor --strict --json    Validate config, profile paths, and SQLite health
 operational-doctor        Check technical health and daily-closeout readiness
 projection-status         Show dirty/fresh projection revision and active lease
 begin-daily-run           Acquire the single daily-run orchestration lease
+daily-run-status          Показать план, блокировки, контрольные точки и следующий шаг
+resume-daily-run          Получить новый lease для незавершённого запуска
+pause-daily-run           Освободить lease без завершения запуска
+checkpoint-daily-run-work Сохранить проверенный частичный результат без render
+complete-daily-run-work   Закрыть единицу работы по проверенному манифесту
+refresh-daily-run-plan    Зафиксировать изменение конфигурации и расширить план
 finalize-daily-run        Publish one atomic final generation and release lease
 ingest-json FILE          Import structured vacancy/evaluation rows
 ingest-gmail-json FILE    Import HH or LinkedIn vacancy links extracted from Gmail
@@ -244,6 +252,12 @@ All existing writes still render immediately by default. For a batch, add
 without touching generated files, then run one `rebuild`. A live daily run uses
 `begin-daily-run`, passes its `--run-lease` together with `--defer-render` to
 every mutation, and ends with `finalize-daily-run`.
+
+Перед созданием нового запуска агент обязан вызвать `daily-run-status --json`.
+Незавершённый план возобновляется через `resume-daily-run`; уже выполненная
+работа не повторяется после смены процесса. Блокировка входом, CAPTCHA или
+источником фиксируется в соответствующей единице работы и приводит к чистому
+`pause-daily-run`, а не к ложному завершению.
 
 The reproducible performance fixture is synthetic and never opens an existing
 workspace:
