@@ -74,8 +74,8 @@ invalidated.
 
 ## Migration and recovery
 
-`migrate-schema` upgrades schema v1 through v6 to v7 and creates the normal
+`migrate-schema` upgrades schema v1 through v7 to v8 and creates the normal
 timestamped database backup by default. The migration is additive: it creates
-the invalidation table, indexes, and effective views without creating any
-invalidation automatically. Recovery uses the pre-migration backup and the
+any missing invalidation/effective structures plus v8 projection-control and
+run-lease tables without creating any invalidation automatically. Recovery uses the pre-migration backup and the
 prior compatible Engine version; there is no destructive reverse migration.

@@ -47,6 +47,7 @@
 !/scripts/telegram_source.py
 !/scripts/public_audit.py
 !/scripts/qa_dashboard.mjs
+!/scripts/benchmark_daily_run.py
 
 !/tests/
 /tests/*

@@ -16,6 +16,12 @@ file.
 database and generated output. Relative paths resolve against `JOB_SEARCH_HOME`
 or the checkout root when that variable is absent.
 
+From schema v8, configured generated-output paths remain stable compatibility
+paths while their contents resolve through `.jobctl/projections/current`.
+Do not point `views`, `reports`, or `dashboard` into candidate source folders;
+the first v8 rebuild replaces only the configured generated paths with managed
+links after copying the legacy generated set.
+
 ## Profile
 
 `[profile]` lists private Markdown sources:

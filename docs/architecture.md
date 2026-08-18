@@ -18,9 +18,14 @@ Find Dream Job separates three layers.
 
 ```text
 external source -> normalized JSON -> jobctl -> SQLite
-                                           |-> Markdown views
-                                           |-> reports
-                                           `-> static dashboard
+                                           `-> transactional dirty revision
+
+closeout -> one locked SQLite snapshot -> staging generation
+                                      -> fsync/validate
+                                      -> atomic current pointer
+                                      |-> Markdown views
+                                      |-> reports
+                                      `-> compact static dashboard
 ```
 
 Discovery has a second, fail-closed evidence path:
@@ -136,9 +141,11 @@ workspaces.
 
 ## SQLite lifecycle
 
-The schema has an explicit `PRAGMA user_version`; schema v7 upgrades supported
-versions v1–v6. It adds interaction invalidations and effective projections on
-top of schema v6, which added lifecycle/action/external-action evidence, configured
+The schema has an explicit `PRAGMA user_version`; schema v8 upgrades supported
+versions v1–v7. It adds transactional projection revisions and a bounded
+daily-run lease without changing evidence tables. Schema v7 added interaction
+invalidations and effective projections on top of schema v6, which added
+lifecycle/action/external-action evidence, configured
 decision metadata, normalized source labels, quarantine, versioned screening
 policy, and migration audit state. Legacy confirmed applications are preserved
 conservatively with incomplete-history/unknown-authorization markers. The CLI
@@ -147,6 +154,19 @@ enable foreign-key enforcement and a bounded busy timeout. Generated output is
 rebuilt from a consistent snapshot. Explicit migrations create a recoverable
 backup by default, create tables and indexes idempotently, and backfill only
 facts already supported by legacy evidence.
+
+Supported mutations are serialized by an OS-backed writer lock; renders take a
+second OS-backed render lock in the same deterministic order. The lock file is
+metadata only: ownership comes from the kernel lock, so a dead PID cannot leave
+a permanent stale lock. Waits are bounded and report resumable state. A daily
+run additionally owns an expiring SQLite lease across its short-lived CLI
+processes, preventing two live orchestrators from interleaving evidence.
+
+Generated output uses immutable generation directories. `views/`, `reports/`,
+and `dashboard/index.html` resolve through one `current` symlink, so the full
+set switches atomically and stale numbered pages vanish only with a successful
+publication. The dashboard payload is an operationally bounded projection;
+full audit history remains in SQLite and paginated read paths.
 
 The current code intentionally remains a single control-plane module plus a
 small configuration module. This keeps deployment dependency-free. If the CLI

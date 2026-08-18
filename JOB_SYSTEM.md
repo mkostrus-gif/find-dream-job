@@ -33,6 +33,9 @@ Default local paths:
 - `reports/false_negative_audit.md` — deterministic review of rejected and
   low-priority screening decisions;
 - `reports/data_quality.md` — import diagnostics.
+- `.jobctl/projections/generations/` — complete immutable generated sets;
+  `views/`, `reports/`, and `dashboard/index.html` are compatibility links
+  through one atomically switched `current` generation.
 
 All paths can be moved with `JOB_SEARCH_HOME` or `config/settings.toml`.
 
@@ -438,9 +441,11 @@ JOB_SEARCH_HOME="/path/to/private-workspace" \
   python3 scripts/jobctl.py migrate-schema --json
 ```
 
-Schema v7 upgrades every supported schema v1–v6. It retains the v6 evidence
-model and adds append-only employer-interaction invalidations plus effective
-interaction and application projections. Schema v6 retained the v5 incremental
+Schema v8 upgrades every supported schema v1–v7. It retains the complete v7
+evidence model and adds only projection freshness revisions plus a bounded
+daily-run lease. Schema v7 retained the v6 evidence model and added append-only
+employer-interaction invalidations plus effective interaction and application
+projections. Schema v6 retained the v5 incremental
 checkpoints and added lifecycle/action events, external-action evidence,
 decision metadata, many-to-many source labels, quarantine, versioned screening
 policy, and migration audit state. Existing confirmed application rows become
@@ -463,11 +468,14 @@ JOB_SEARCH_HOME="/path/to/private-workspace" \
   python3 scripts/jobctl.py stats
 ```
 
-Rollback is recovery from the timestamped
+The first successful v8 rebuild imports any legacy generated directories into
+the generation store and replaces their public paths with compatibility
+symlinks. Schedule that one-time conversion with readers stopped; later
+publications switch one `current` pointer atomically. Rollback is recovery from the timestamped
 `job_search.sqlite.bak-schema-v<old>-<timestamp>` copy: stop writers, preserve
 the failed/current database for diagnosis, restore the backup to the configured
 database path, and use the prior compatible Engine version. There is no
-destructive reverse migration. Repeating `migrate-schema` on schema v7 is
+destructive reverse migration. Repeating `migrate-schema` on schema v8 is
 idempotent and creates no additional backup.
 
 ## Lifecycle, current action, and external-action evidence
@@ -510,6 +518,45 @@ Only the last command may create `application_confirmed`. Replaying the same
 visible reference is idempotent. `record-lifecycle-event` deliberately refuses
 direct `application_confirmed` writes.
 
+## Deferred writes and one-render daily runs
+
+Existing commands remain backward compatible: without another option, a write
+commits SQLite and renders immediately. A batch or daily run can instead use
+either spelling below on every mutating command:
+
+```bash
+python3 scripts/jobctl.py update-vacancy ... --defer-render
+python3 scripts/jobctl.py update-vacancy ... --no-render
+```
+
+The global flag also applies to `init` and `migrate-schema`. A deferred `init`
+creates the durable schema with dirty projections but intentionally does not
+claim bootstrap completion until a later successful `rebuild`.
+
+The domain transaction and `projection_state.dirty_revision` commit together.
+Generated files are not opened, removed, or rewritten. Inspect the resumable
+state with `projection-status --json`; `rebuild --json` publishes one complete
+generation and advances `rendered_revision` only after success.
+
+A live daily run must also hold one durable lease:
+
+```bash
+python3 scripts/jobctl.py begin-daily-run --run-id daily-YYYY-MM-DD-agent --json
+# pass both flags to every later write:
+python3 scripts/jobctl.py set-current-action ... \
+  --defer-render --run-lease <token>
+python3 scripts/jobctl.py finalize-daily-run --run-lease <token> --json
+```
+
+Only one unexpired lease may exist. Writes during it require the exact token and
+heartbeat the bounded expiry. The Engine rejects a non-deferred write or an
+ordinary `rebuild` while that lease is active. `finalize-daily-run` performs the
+run's only full render and releases the lease only after atomic publication. Repeating a
+successfully finalized command is idempotent and does not render again. A lock
+timeout or interruption leaves SQLite durable, projections dirty, the lease
+resumable, and the previous generated set intact. `--lock-timeout` controls the
+bounded writer/render wait (30 seconds by default).
+
 ## WIP, SLA, quarantine, and operational closeout
 
 ```bash
@@ -519,10 +566,16 @@ python3 scripts/jobctl.py false-negative-audit --as-of 2026-02-28 --json
 python3 scripts/jobctl.py operational-doctor --as-of 2026-02-28 --strict --json
 ```
 
-The queue orders configured buckets, overdue state, overdue age, priority, due
-date, event time, and vacancy ID deterministically. Limits mark overflow; they
-never archive or mutate old backlog rows. Numbered Markdown pages cover the
-whole result rather than truncating the first 200 records.
+The actionable queue orders configured buckets, overdue state, overdue age,
+priority, due date, event time, and vacancy ID deterministically. Its latest
+action set is materialized once per request/render and then sliced into pages.
+`action_state=none`, inactive backlog buckets, and terminal rejected/offer
+lifecycle rows are excluded from actionable WIP; their append-only history
+remains in SQLite. Limits mark overflow and never mutate history. Numbered
+Markdown pages cover the whole actionable result rather than truncating it.
+Use `wip-queue --page ... --json` for supported pagination and read
+`action_events`/`lifecycle_events` with read-only SQLite queries for the full
+audit history.
 
 `operational-doctor` returns per-check `pass`, `warn`, or `fail`, independent
 `technical_health`, and `ready_for_daily_closeout`. Current exact search
@@ -589,9 +642,19 @@ after per-message reconciliation, and verify removal of the `INBOX` label.
 
 ## Generated output
 
-Every write command regenerates the dashboard and reports. Manual changes to
-generated files will be lost. Use `watch` only when another process writes the
-SQLite database directly:
+Immediate render remains the compatibility default. Deferred writes only mark
+the projections dirty. A rebuild renders all views, reports, and the compact
+dashboard into a staging generation, fsyncs and validates the set, then
+publishes it through one atomic `current` pointer. Failed or interrupted
+renders never delete the last complete generation, and obsolete numbered pages
+disappear only when a new complete generation becomes current. Manual changes
+to generated files will be lost.
+
+The dashboard embeds only bounded operational vacancy fields; full vacancy and
+action history stays in SQLite and paginated CLI/read-model paths. This keeps a
+25,000-row workspace from turning one HTML file into a database copy. The core
+does not upload or fetch the snapshot and adds no network dependency. Use
+`watch` only when another process writes the SQLite database directly:
 
 Generated follow-up rows read `effective_applications`, which selects the
 highest application row ID for each canonical vacancy. Compatibility rows stay

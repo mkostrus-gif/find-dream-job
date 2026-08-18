@@ -16,6 +16,7 @@ Never use a real candidate workspace as a test fixture.
 python3 -m py_compile scripts/jobctl.py scripts/jobsearch_config.py scripts/search_coverage.py scripts/telegram_source.py scripts/public_audit.py
 python3 -m unittest discover -s tests -v
 python3 scripts/public_audit.py --strict
+python3 scripts/benchmark_daily_run.py --rows 25000 --workflow deferred
 ```
 
 Dashboard browser QA is optional and requires Playwright:
@@ -36,6 +37,13 @@ idempotent repeated migration. When operational state is affected, also run
 `operational-doctor`, the outcome scorecard, WIP pagination, generated-output
 language QA, and dashboard QA at desktop and narrow widths. Never use a real
 candidate database as migration proof.
+
+Projection/render changes must additionally verify that deferred mutations do
+not change generated files, an interrupted render preserves the prior current
+generation, concurrent renderers obey bounded OS locks, and the 25,000-row
+synthetic benchmark reports dashboard bytes and WIP file count. A schema v8
+migration changes only projection-control and run-lease structures; evidence
+tables and external-action gates must remain row-count stable.
 
 ## Pull requests
 

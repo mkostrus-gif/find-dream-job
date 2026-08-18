@@ -8,6 +8,7 @@ the database and regenerates reader-friendly views plus a static dashboard.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import hashlib
 import html
@@ -15,15 +16,27 @@ import json
 import os
 import re
 import shutil
+import socket
 import sqlite3
 import statistics
 import sys
 import time
 import unicodedata
+import uuid
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from urllib.parse import urlsplit, urlunsplit
+
+try:  # POSIX is the primary deployment target; Windows uses the stdlib fallback.
+    import fcntl
+except ImportError:  # pragma: no cover - exercised on Windows only.
+    fcntl = None
+
+try:  # pragma: no cover - exercised on Windows only.
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX path.
+    msvcrt = None
 
 from jobsearch_config import Settings, display_path, load_settings
 from search_coverage import (
@@ -35,7 +48,12 @@ from telegram_source import build_telegram_plan, validate_telegram_manifest
 
 
 CODE_ROOT = Path(__file__).resolve().parents[1]
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
+DEFAULT_LOCK_TIMEOUT_SECONDS = 30.0
+DEFAULT_DAILY_RUN_LEASE_SECONDS = 4 * 60 * 60
+MAX_DAILY_RUN_LEASE_SECONDS = 24 * 60 * 60
+DASHBOARD_VACANCY_LIMIT = 1000
+PROJECTION_GENERATIONS_TO_KEEP = 2
 
 SETTINGS: Settings
 ROOT: Path
@@ -271,9 +289,11 @@ EXPECTED_TABLES = {
     "interview_summaries",
     "lifecycle_events",
     "external_actions",
+    "daily_run_leases",
     "migration_log",
     "outreach_messages",
     "policy_versions",
+    "projection_state",
     "quarantine_records",
     "screening_decisions",
     "source_hits",
@@ -292,6 +312,8 @@ EXPECTED_TABLES = {
 }
 EXPECTED_INDEXES = {
     "idx_action_events_vacancy",
+    "idx_daily_run_leases_one_active",
+    "idx_daily_run_leases_status",
     "idx_employer_account_signals_account",
     "idx_employer_interaction_invalidations_vacancy",
     "idx_employer_interactions_identity",
@@ -793,6 +815,110 @@ def connect_db(path: Path | None = None) -> sqlite3.Connection:
     return conn
 
 
+class LockTimeoutError(RuntimeError):
+    """A bounded inter-process lock wait expired without changing durable state."""
+
+
+def lock_file_path(db_path: Path, kind: str) -> Path:
+    return db_path.parent / f".{db_path.name}.{kind}.lock"
+
+
+def validate_lock_timeout(value: float) -> float:
+    timeout = float(value)
+    if timeout < 0 or timeout > 3600:
+        raise ValueError("Тайм-аут блокировки должен быть от 0 до 3600 секунд.")
+    return timeout
+
+
+def read_lock_owner(handle: Any) -> str:
+    try:
+        handle.seek(0)
+        payload = handle.read().strip()
+    except OSError:
+        return ""
+    if not payload:
+        return ""
+    try:
+        owner = json.loads(payload)
+    except json.JSONDecodeError:
+        return payload[:240]
+    return ", ".join(
+        f"{key}={owner[key]}"
+        for key in ("kind", "pid", "host", "command", "acquired_at")
+        if owner.get(key) not in (None, "")
+    )
+
+
+def try_lock_file(handle: Any) -> None:
+    if fcntl is not None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return
+    if msvcrt is None:  # pragma: no cover - defensive unsupported platform path.
+        raise RuntimeError("Межпроцессные файловые блокировки недоступны.")
+    handle.seek(0)
+    if not handle.read(1):
+        handle.seek(0)
+        handle.write("0")
+        handle.flush()
+    handle.seek(0)
+    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+
+
+def unlock_file(handle: Any) -> None:
+    if fcntl is not None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return
+    if msvcrt is not None:  # pragma: no cover - Windows only.
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+@contextlib.contextmanager
+def interprocess_lock(
+    db_path: Path,
+    kind: str,
+    *,
+    timeout: float,
+) -> Iterator[None]:
+    """Use an OS-backed lock; stale metadata never blocks after the owner exits."""
+
+    timeout = validate_lock_timeout(timeout)
+    path = lock_file_path(db_path, kind)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + timeout
+    with path.open("a+", encoding="utf-8") as handle:
+        while True:
+            try:
+                try_lock_file(handle)
+                break
+            except (BlockingIOError, OSError) as exc:
+                if time.monotonic() >= deadline:
+                    owner = read_lock_owner(handle)
+                    detail = f" Текущий владелец: {owner}." if owner else ""
+                    raise LockTimeoutError(
+                        f"Блокировка {kind!r} занята дольше {timeout:.3f} с.{detail} "
+                        "Durable SQLite-состояние не откатывается; повторите команду "
+                        "с тем же аргументом или увеличьте --lock-timeout."
+                    ) from exc
+                time.sleep(min(0.05, max(deadline - time.monotonic(), 0.0)))
+        owner = {
+            "kind": kind,
+            "pid": os.getpid(),
+            "host": socket.gethostname(),
+            "command": " ".join(sys.argv[:4]),
+            "acquired_at": now_iso(),
+        }
+        handle.seek(0)
+        handle.truncate()
+        json.dump(owner, handle, ensure_ascii=False, sort_keys=True)
+        handle.flush()
+        os.fsync(handle.fileno())
+        try:
+            yield
+        finally:
+            unlock_file(handle)
+
+
 def missing_schema_tables(conn: sqlite3.Connection) -> list[str]:
     rows = conn.execute(
         "SELECT name FROM sqlite_master WHERE type = 'table'"
@@ -1258,6 +1384,54 @@ def ensure_v7_schema(conn: sqlite3.Connection) -> None:
     )
 
 
+def ensure_v8_schema(conn: sqlite3.Connection) -> None:
+    """Add projection freshness state and a bounded orchestration lease."""
+
+    timestamp = now_iso()
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS projection_state (
+            singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1),
+            dirty_revision INTEGER NOT NULL DEFAULT 0,
+            rendered_revision INTEGER NOT NULL DEFAULT 0,
+            dirty_at TEXT,
+            rendered_at TEXT,
+            published_generation TEXT,
+            CHECK(dirty_revision >= rendered_revision)
+        );
+
+        CREATE TABLE IF NOT EXISTS daily_run_leases (
+            token TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            owner TEXT NOT NULL,
+            status TEXT NOT NULL,
+            lease_seconds INTEGER NOT NULL,
+            acquired_at TEXT NOT NULL,
+            heartbeat_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            released_at TEXT,
+            release_reason TEXT,
+            CHECK(status IN ('active', 'finalized', 'expired')),
+            CHECK(lease_seconds >= 60 AND lease_seconds <= 86400)
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_daily_run_leases_one_active
+            ON daily_run_leases(status) WHERE status = 'active';
+
+        CREATE INDEX IF NOT EXISTS idx_daily_run_leases_status
+            ON daily_run_leases(status, expires_at, acquired_at);
+        """
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO projection_state (
+            singleton_id, dirty_revision, rendered_revision, dirty_at
+        ) VALUES (1, 1, 0, ?)
+        """,
+        (timestamp,),
+    )
+
+
 def schema_v6_issues(conn: sqlite3.Connection) -> list[str]:
     required_columns = {
         "lifecycle_events": {
@@ -1355,6 +1529,55 @@ def schema_v7_issues(conn: sqlite3.Connection) -> list[str]:
     for view in ("effective_employer_interactions", "effective_applications"):
         if view not in views:
             issues.append(f"{view}: представление отсутствует")
+    return issues
+
+
+def schema_v8_issues(conn: sqlite3.Connection) -> list[str]:
+    issues: list[str] = []
+    present_tables = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    required = {
+        "projection_state": {
+            "singleton_id",
+            "dirty_revision",
+            "rendered_revision",
+            "dirty_at",
+            "rendered_at",
+            "published_generation",
+        },
+        "daily_run_leases": {
+            "token",
+            "run_id",
+            "owner",
+            "status",
+            "lease_seconds",
+            "acquired_at",
+            "heartbeat_at",
+            "expires_at",
+            "released_at",
+            "release_reason",
+        },
+    }
+    for table, columns in required.items():
+        if table not in present_tables:
+            issues.append(f"{table}: таблица отсутствует")
+            continue
+        present = table_columns(conn, table)
+        missing = columns - present
+        if missing:
+            issues.append(f"{table}: отсутствуют столбцы {','.join(sorted(missing))}")
+    if "projection_state" in present_tables:
+        state = conn.execute(
+            "SELECT dirty_revision, rendered_revision FROM projection_state WHERE singleton_id = 1"
+        ).fetchone()
+        if state is None:
+            issues.append("projection_state: отсутствует singleton-строка")
+        elif int(state[1]) > int(state[0]):
+            issues.append("projection_state: rendered_revision новее dirty_revision")
     return issues
 
 
@@ -1463,13 +1686,19 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
                 f"Схему базы данных версии {version} требуется явно перенести на "
                 f"версию {SCHEMA_VERSION}. Выполните: jobctl migrate-schema"
             )
-        ensure_auxiliary_schema(conn)
         missing = missing_schema_tables(conn)
+        missing_indexes = missing_schema_indexes(conn)
+        if missing or missing_indexes:
+            # Current healthy databases stay on a fast path. Additive repair is
+            # retained for older workspaces that already report the current
+            # version but lack an auxiliary object.
+            ensure_auxiliary_schema(conn)
+            missing = missing_schema_tables(conn)
+            missing_indexes = missing_schema_indexes(conn)
         if missing:
             raise RuntimeError(
                 "В базе данных отсутствуют обязательные таблицы: " + ", ".join(missing)
             )
-        missing_indexes = missing_schema_indexes(conn)
         if missing_indexes:
             raise RuntimeError(
                 "В базе данных отсутствуют обязательные индексы: " + ", ".join(missing_indexes)
@@ -1500,6 +1729,11 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             raise RuntimeError(
                 "Нарушен контракт схемы базы данных v7: " + "; ".join(v7_issues)
             )
+        v8_issues = schema_v8_issues(conn)
+        if v8_issues:
+            raise RuntimeError(
+                "Нарушен контракт схемы базы данных v8: " + "; ".join(v8_issues)
+            )
 
 
 def reset_schema(conn: sqlite3.Connection) -> None:
@@ -1507,6 +1741,8 @@ def reset_schema(conn: sqlite3.Connection) -> None:
         """
         DROP VIEW IF EXISTS effective_applications;
         DROP VIEW IF EXISTS effective_employer_interactions;
+        DROP TABLE IF EXISTS daily_run_leases;
+        DROP TABLE IF EXISTS projection_state;
         DROP TABLE IF EXISTS migration_log;
         DROP TABLE IF EXISTS screening_decisions;
         DROP TABLE IF EXISTS policy_versions;
@@ -1907,6 +2143,7 @@ def reset_schema(conn: sqlite3.Connection) -> None:
     )
     ensure_v6_schema(conn)
     ensure_v7_schema(conn)
+    ensure_v8_schema(conn)
     ensure_active_policy(conn)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
@@ -2191,8 +2428,143 @@ def ensure_auxiliary_schema(conn: sqlite3.Connection) -> None:
     )
     ensure_v6_schema(conn)
     ensure_v7_schema(conn)
+    ensure_v8_schema(conn)
     ensure_active_policy(conn)
     conn.commit()
+
+
+def projection_state_data(conn: sqlite3.Connection) -> dict[str, Any]:
+    row = conn.execute(
+        """
+        SELECT dirty_revision, rendered_revision, dirty_at, rendered_at,
+               published_generation
+        FROM projection_state WHERE singleton_id = 1
+        """
+    ).fetchone()
+    if row is None:
+        raise RuntimeError("Не найдена обязательная строка projection_state.")
+    dirty_revision = int(row["dirty_revision"])
+    rendered_revision = int(row["rendered_revision"])
+    return {
+        "dirty_revision": dirty_revision,
+        "rendered_revision": rendered_revision,
+        "dirty": dirty_revision > rendered_revision,
+        "dirty_at": row["dirty_at"] or "",
+        "rendered_at": row["rendered_at"] or "",
+        "published_generation": row["published_generation"] or "",
+    }
+
+
+def mark_projections_dirty(conn: sqlite3.Connection) -> int:
+    timestamp = now_iso()
+    conn.execute(
+        """
+        UPDATE projection_state
+        SET dirty_revision = dirty_revision + 1,
+            dirty_at = ?
+        WHERE singleton_id = 1
+        """,
+        (timestamp,),
+    )
+    return int(
+        conn.execute(
+            "SELECT dirty_revision FROM projection_state WHERE singleton_id = 1"
+        ).fetchone()[0]
+    )
+
+
+def commit_projection_write(conn: sqlite3.Connection) -> int:
+    """Commit the domain mutation and its projection invalidation atomically."""
+
+    revision = mark_projections_dirty(conn)
+    conn.commit()
+    return revision
+
+
+def mark_projections_rendered(
+    conn: sqlite3.Connection,
+    *,
+    revision: int,
+    generation: str,
+) -> None:
+    current = projection_state_data(conn)
+    if revision > int(current["dirty_revision"]):
+        raise RuntimeError("Нельзя опубликовать проекцию новее durable SQLite revision.")
+    conn.execute(
+        """
+        UPDATE projection_state
+        SET rendered_revision = MAX(rendered_revision, ?),
+            rendered_at = ?,
+            published_generation = ?
+        WHERE singleton_id = 1
+        """,
+        (revision, now_iso(), generation),
+    )
+
+
+def expire_stale_daily_run_lease(conn: sqlite3.Connection) -> int:
+    now = now_iso()
+    return int(
+        conn.execute(
+            """
+            UPDATE daily_run_leases
+            SET status = 'expired', released_at = ?,
+                release_reason = 'lease_expired'
+            WHERE status = 'active' AND expires_at <= ?
+            """,
+            (now, now),
+        ).rowcount
+    )
+
+
+def active_daily_run_lease(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    expire_stale_daily_run_lease(conn)
+    return conn.execute(
+        """
+        SELECT * FROM daily_run_leases
+        WHERE status = 'active'
+        ORDER BY acquired_at DESC LIMIT 1
+        """
+    ).fetchone()
+
+
+def require_daily_run_lease(
+    conn: sqlite3.Connection,
+    supplied_token: str,
+    *,
+    heartbeat: bool,
+) -> sqlite3.Row | None:
+    active = active_daily_run_lease(conn)
+    token = clean_cell(supplied_token)
+    if active is None:
+        if token:
+            raise RuntimeError(
+                "Переданный daily-run lease не активен. Начните новый запуск через "
+                "begin-daily-run или уберите устаревший --run-lease."
+            )
+        return None
+    if token != str(active["token"]):
+        raise RuntimeError(
+            "Уже активен другой daily run: "
+            f"run_id={active['run_id']}, owner={active['owner']}, "
+            f"expires_at={active['expires_at']}. Передайте его точный --run-lease "
+            "или дождитесь истечения; concurrent live run запрещён."
+        )
+    if heartbeat:
+        now = dt.datetime.now().replace(microsecond=0)
+        expires = now + dt.timedelta(seconds=int(active["lease_seconds"]))
+        conn.execute(
+            """
+            UPDATE daily_run_leases
+            SET heartbeat_at = ?, expires_at = ?
+            WHERE token = ? AND status = 'active'
+            """,
+            (now.isoformat(), expires.isoformat(), token),
+        )
+        active = conn.execute(
+            "SELECT * FROM daily_run_leases WHERE token = ?", (token,)
+        ).fetchone()
+    return active
 
 
 def merge_origin(existing: str | None, new_origin: str) -> str:
@@ -4856,22 +5228,16 @@ def latest_actions_by_vacancy(
     return {int(row["vacancy_id"]): dict(row) for row in rows}
 
 
-def build_wip_queue_data(
+def materialize_wip_queue(
     conn: sqlite3.Connection,
     *,
     as_of: dt.date,
-    page: int = 1,
-    page_size: int | None = None,
     bucket_filter: str = "",
 ) -> dict[str, Any]:
-    page_size = page_size or WIP_PAGE_SIZE
-    if page < 1:
-        raise ValueError("Номер страницы должен быть не меньше 1.")
-    if page_size < 1 or page_size > 500:
-        raise ValueError("Размер страницы должен быть от 1 до 500.")
+    """Build the actionable queue once; pagination only slices this result."""
+
     if bucket_filter and bucket_filter not in WIP_BUCKET_KEYS:
         raise ValueError("Неподдерживаемый фильтр группы незавершённой работы.")
-
     bucket_config = {bucket.key: bucket for bucket in WIP_BUCKETS}
     bucket_order = {bucket.key: index for index, bucket in enumerate(WIP_BUCKETS)}
     latest = latest_actions_by_vacancy(conn)
@@ -4891,10 +5257,18 @@ def build_wip_queue_data(
         vacancy = vacancies.get(vacancy_id)
         if vacancy is None:
             continue
+        action_state = clean_cell(action.get("action_state")).lower()
+        if action_state == "none":
+            continue
         bucket_key = clean_cell(action.get("bucket")) or "backlog"
         if bucket_filter and bucket_key != bucket_filter:
             continue
         bucket = bucket_config[bucket_key]
+        if not bucket.active:
+            continue
+        state = lifecycle.get(vacancy_id, {}).get("state", "seen")
+        if state in {"rejected", "offer"}:
+            continue
         try:
             action_at = parse_iso_datetime(action["event_at"], label="event_at")
         except ValueError:
@@ -4909,13 +5283,11 @@ def build_wip_queue_data(
         else:
             due = action_at.date() + dt.timedelta(days=bucket.sla_days)
         overdue_days = max((as_of - due).days, 0)
-        state = lifecycle.get(vacancy_id, {}).get("state", "seen")
-        terminal = state in {"rejected", "offer"}
         items.append(
             {
                 "vacancy_id": vacancy_id,
                 "action_event_id": int(action["id"]),
-                "action_state": action["action_state"],
+                "action_state": action_state,
                 "bucket": bucket_key,
                 "bucket_label": bucket.label,
                 "company": vacancy["company"] or "",
@@ -4931,7 +5303,7 @@ def build_wip_queue_data(
                 "overdue": as_of > due,
                 "overdue_days": overdue_days,
                 "sla_days": bucket.sla_days,
-                "terminal_lifecycle": terminal,
+                "terminal_lifecycle": False,
                 "active_bucket": bucket.active,
             }
         )
@@ -4977,22 +5349,10 @@ def build_wip_queue_data(
             }
         )
 
-    total = len(items)
-    pages = max((total + page_size - 1) // page_size, 1)
-    offset = (page - 1) * page_size
-    page_items = items[offset : offset + page_size] if page <= pages else []
     return {
         "as_of": as_of.isoformat(),
-        "items": page_items,
+        "items": items,
         "buckets": bucket_summaries,
-        "pagination": {
-            "page": page,
-            "page_size": page_size,
-            "total_items": total,
-            "total_pages": pages,
-            "has_previous": page > 1,
-            "has_next": page < pages,
-        },
         "overflow_total": sum(item["overflow"] for item in bucket_summaries),
         "overdue_total": sum(item["overdue"] for item in bucket_summaries),
         "active_wip_total": sum(item["active"] for item in bucket_summaries),
@@ -5006,6 +5366,50 @@ def build_wip_queue_data(
             "vacancy_id",
         ],
     }
+
+
+def paginate_wip_queue(
+    materialized: dict[str, Any],
+    *,
+    page: int,
+    page_size: int,
+) -> dict[str, Any]:
+    if page < 1:
+        raise ValueError("Номер страницы должен быть не меньше 1.")
+    if page_size < 1 or page_size > 500:
+        raise ValueError("Размер страницы должен быть от 1 до 500.")
+    all_items = materialized["items"]
+    total = len(all_items)
+    pages = max((total + page_size - 1) // page_size, 1)
+    offset = (page - 1) * page_size
+    result = dict(materialized)
+    result["items"] = all_items[offset : offset + page_size] if page <= pages else []
+    result["pagination"] = {
+        "page": page,
+        "page_size": page_size,
+        "total_items": total,
+        "total_pages": pages,
+        "has_previous": page > 1,
+        "has_next": page < pages,
+    }
+    return result
+
+
+def build_wip_queue_data(
+    conn: sqlite3.Connection,
+    *,
+    as_of: dt.date,
+    page: int = 1,
+    page_size: int | None = None,
+    bucket_filter: str = "",
+) -> dict[str, Any]:
+    page_size = page_size or WIP_PAGE_SIZE
+    materialized = materialize_wip_queue(
+        conn,
+        as_of=as_of,
+        bucket_filter=bucket_filter,
+    )
+    return paginate_wip_queue(materialized, page=page, page_size=page_size)
 
 
 def build_snapshot(
@@ -5302,8 +5706,11 @@ def build_snapshot(
 
     outcome_scorecard, _ = build_outcome_scorecard_data(conn, dt.date.today())
     conversion_report, _ = build_conversion_report_data(conn, dt.date.today())
-    wip_queue = build_wip_queue_data(
-        conn, as_of=dt.date.today(), page=1, page_size=WIP_PAGE_SIZE
+    wip_materialized = materialize_wip_queue(
+        conn, as_of=dt.date.today()
+    )
+    wip_queue = paginate_wip_queue(
+        wip_materialized, page=1, page_size=WIP_PAGE_SIZE
     )
     source_quality, source_stream_diagnostics = build_source_quality_data(
         conn, conversion_report
@@ -5479,6 +5886,7 @@ def build_snapshot(
         "conversion_report": conversion_report,
         "outcome_scorecard": outcome_scorecard,
         "wip_queue": wip_queue,
+        "_wip_materialized": wip_materialized,
         "employer_accounts": employer_accounts,
         "account_signals": account_signals,
         "vacancy_factors": vacancy_factors,
@@ -6359,28 +6767,17 @@ def generate_views(
         scorecard_markdown, encoding="utf-8"
     )
 
-    with connect_db(db_path) as conn:
-        for stale in VIEWS_DIR.glob("wip_queue_page_*.md"):
-            stale.unlink()
-        for stale in REPORTS_DIR.glob("quarantine_page_*.md"):
-            stale.unlink()
-        queue_first = build_wip_queue_data(
-            conn,
-            as_of=dt.date.today(),
-            page=1,
-            page_size=WIP_PAGE_SIZE,
+    materialized_queue = snapshot["_wip_materialized"]
+    if materialized_queue:
+        queue_first = paginate_wip_queue(
+            materialized_queue, page=1, page_size=WIP_PAGE_SIZE
         )
         queue_pages = queue_first["pagination"]["total_pages"]
         for page_number in range(1, queue_pages + 1):
-            page_data = (
-                queue_first
-                if page_number == 1
-                else build_wip_queue_data(
-                    conn,
-                    as_of=dt.date.today(),
-                    page=page_number,
-                    page_size=WIP_PAGE_SIZE,
-                )
+            page_data = paginate_wip_queue(
+                materialized_queue,
+                page=page_number,
+                page_size=WIP_PAGE_SIZE,
             )
             queue_rows = [
                 [
@@ -6405,7 +6802,11 @@ def generate_views(
                 f"{page_data['overflow_total']}; просрочено по SLA: {page_data['overdue_total']}. "
                 "Старые строки не архивируются и не изменяются автоматически."
             )
-            page_path = VIEWS_DIR / f"wip_queue_page_{page_number:04d}.md"
+            page_path = (
+                VIEWS_DIR / f"wip_queue_page_{page_number:04d}.md"
+                if queue_pages > 1
+                else VIEWS_DIR / "wip_queue.md"
+            )
             write_markdown_table(
                 page_path,
                 "Очередь WIP и SLA",
@@ -6425,11 +6826,12 @@ def generate_views(
                 queue_rows,
                 intro,
             )
-            if page_number == 1:
+            if page_number == 1 and queue_pages > 1:
                 (VIEWS_DIR / "wip_queue.md").write_text(
                     page_path.read_text(encoding="utf-8"), encoding="utf-8"
                 )
 
+    with connect_db(db_path) as conn:
         quarantine_first = quarantine_report_data(
             conn,
             page=1,
@@ -6536,8 +6938,116 @@ def json_for_script(value: Any) -> str:
     )
 
 
+def select_fields(item: dict[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
+    return {field: item.get(field) for field in fields}
+
+
+def compact_dashboard_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Keep the online snapshot operationally useful without embedding full history."""
+
+    vacancy_fields = (
+        "id",
+        "external_id",
+        "channel",
+        "company",
+        "title",
+        "url",
+        "score",
+        "first_seen_date",
+        "last_seen_date",
+        "latest_stage",
+        "latest_status",
+        "reason",
+        "risks",
+        "open_questions",
+        "next_action",
+        "current_action_state",
+        "action_bucket",
+        "action_due_date",
+        "interview_summaries",
+    )
+    all_vacancies = snapshot["vacancies"]
+    by_id = {int(item["id"]): item for item in all_vacancies}
+    selected_ids: list[int] = []
+    seen_ids: set[int] = set()
+
+    def include(value: Any) -> None:
+        try:
+            vacancy_id = int(value)
+        except (TypeError, ValueError):
+            return
+        if vacancy_id in by_id and vacancy_id not in seen_ids:
+            seen_ids.add(vacancy_id)
+            selected_ids.append(vacancy_id)
+
+    for collection, key in (
+        (snapshot["active_review"], "id"),
+        (snapshot["recent"], "id"),
+        (snapshot["followups"], "id"),
+        (snapshot["wip_queue"]["items"], "vacancy_id"),
+    ):
+        for item in collection:
+            include(item.get(key))
+    for item in all_vacancies:
+        if len(selected_ids) >= DASHBOARD_VACANCY_LIMIT:
+            break
+        include(item.get("id"))
+    selected_ids = selected_ids[:DASHBOARD_VACANCY_LIMIT]
+
+    account_fields = (
+        "id",
+        "canonical_name",
+        "website",
+        "careers_url",
+        "priority",
+        "status",
+        "linked_vacancies",
+        "active_target_vacancies",
+        "portfolio_limit_effective",
+        "portfolio_overflow",
+        "human_path_status",
+        "next_review_date",
+        "latest_signal",
+    )
+    payload = {
+        "generated_at": snapshot["generated_at"],
+        "db_path": snapshot["db_path"],
+        "kpis": snapshot["kpis"],
+        "channels": snapshot["channels"],
+        "funnel_by_channel": snapshot["funnel_by_channel"],
+        "active_review": [
+            select_fields(item, vacancy_fields) for item in snapshot["active_review"][:200]
+        ],
+        "recent": [
+            select_fields(item, vacancy_fields) for item in snapshot["recent"][:120]
+        ],
+        "followups": snapshot["followups"][:DASHBOARD_VACANCY_LIMIT],
+        "wip_queue": snapshot["wip_queue"],
+        "employer_accounts": [
+            select_fields(item, account_fields)
+            for item in snapshot["employer_accounts"][:200]
+        ],
+        "conversion_report": {
+            "interaction_history_available": snapshot["conversion_report"][
+                "interaction_history_available"
+            ]
+        },
+        "vacancies": [
+            select_fields(by_id[vacancy_id], vacancy_fields)
+            for vacancy_id in selected_ids
+        ],
+        "vacancy_projection": {
+            "total": len(all_vacancies),
+            "included": len(selected_ids),
+            "truncated": len(selected_ids) < len(all_vacancies),
+            "full_history": "SQLite and paginated CLI read paths",
+        },
+    }
+    return payload
+
+
 def render_dashboard(snapshot: dict[str, Any]) -> str:
-    data_json = json_for_script(snapshot)
+    data_json = json_for_script(compact_dashboard_snapshot(snapshot))
     stage_labels = json_for_script(STAGE_LABELS)
     funnel_stages = json_for_script(FUNNEL_STAGES)
     channel_labels = json_for_script(CHANNEL_LABELS)
@@ -7061,6 +7571,7 @@ def render_dashboard(snapshot: dict[str, Any]) -> str:
     <section id="tab-funnel" class="hidden">
       <div class="panel">
         <h2>Воронка по каналам</h2>
+        <div id="vacancyProjectionNote" class="note" style="padding: 0 12px 10px;"></div>
         <div id="funnelTable" class="funnel"></div>
         <div id="funnelVisual" class="funnel-visual"></div>
         <div id="funnelVacancies" class="funnel-vacancies"></div>
@@ -7404,6 +7915,10 @@ def render_dashboard(snapshot: dict[str, Any]) -> str:
     }}
 
     function renderFunnel() {{
+      const projection = DATA.vacancy_projection || {{}};
+      $('vacancyProjectionNote').textContent = projection.truncated
+        ? `В панели показана компактная операционная выборка ${{projection.included}} из ${{projection.total}} вакансий; полная история доступна через SQLite и CLI.`
+        : `В панели показаны все ${{projection.total || 0}} вакансий.`;
       const visibleStages = currentFunnelStages();
       const channels = currentFunnelChannels();
       const headers = ['Канал', ...visibleStages.map(st => STAGE_LABELS[st] || st)];
@@ -7567,16 +8082,321 @@ def generate_dashboard(snapshot: dict[str, Any]) -> None:
     DASHBOARD_PATH.write_text(render_dashboard(snapshot), encoding="utf-8")
 
 
-def render_outputs(db_path: Path) -> dict[str, Any]:
+def projection_store_dir() -> Path:
+    return ROOT / ".jobctl" / "projections"
+
+
+@contextlib.contextmanager
+def staged_projection_paths(stage: Path) -> Iterator[None]:
+    global VIEWS_DIR, REPORTS_DIR, DASHBOARD_PATH
+    previous = (VIEWS_DIR, REPORTS_DIR, DASHBOARD_PATH)
+    VIEWS_DIR = stage / "views"
+    REPORTS_DIR = stage / "reports"
+    DASHBOARD_PATH = stage / "dashboard" / "index.html"
+    try:
+        yield
+    finally:
+        VIEWS_DIR, REPORTS_DIR, DASHBOARD_PATH = previous
+
+
+def fsync_directory(path: Path) -> None:
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+    except OSError:  # pragma: no cover - unsupported filesystem/platform.
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError:  # pragma: no cover - unsupported filesystem/platform.
+        pass
+    finally:
+        os.close(descriptor)
+
+
+def fsync_projection_tree(root: Path) -> tuple[int, int]:
+    file_count = 0
+    total_bytes = 0
+    directories: list[Path] = []
+    for current_root, _, filenames in os.walk(root):
+        directory = Path(current_root)
+        directories.append(directory)
+        for filename in filenames:
+            path = directory / filename
+            with path.open("rb") as handle:
+                os.fsync(handle.fileno())
+            stat = path.stat()
+            file_count += 1
+            total_bytes += stat.st_size
+    for directory in reversed(directories):
+        fsync_directory(directory)
+    return file_count, total_bytes
+
+
+def atomic_symlink(target: Path, link_path: Path, *, target_is_directory: bool) -> None:
+    link_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = link_path.with_name(f".{link_path.name}.link-{uuid.uuid4().hex}")
+    relative_target = os.path.relpath(target, link_path.parent)
+    os.symlink(relative_target, temporary, target_is_directory=target_is_directory)
+    try:
+        os.replace(temporary, link_path)
+    finally:
+        if temporary.is_symlink():
+            temporary.unlink()
+
+
+def symlink_resolves_to(path: Path, target: Path) -> bool:
+    if not path.is_symlink():
+        return False
+    try:
+        return path.resolve(strict=False) == target.resolve(strict=False)
+    except OSError:
+        return False
+
+
+def install_managed_projection_link(
+    path: Path,
+    target: Path,
+    *,
+    target_is_directory: bool,
+) -> None:
+    if symlink_resolves_to(path, target):
+        return
+    if path.is_symlink() or not path.exists():
+        atomic_symlink(target, path, target_is_directory=target_is_directory)
+        return
+
+    backup = path.with_name(f".{path.name}.pre-v8-{uuid.uuid4().hex}")
+    os.replace(path, backup)
+    try:
+        atomic_symlink(target, path, target_is_directory=target_is_directory)
+    except Exception:
+        if not path.exists() and not path.is_symlink() and backup.exists():
+            os.replace(backup, path)
+        raise
+    if backup.is_dir():
+        shutil.rmtree(backup)
+    elif backup.exists():
+        backup.unlink()
+
+
+def set_current_projection(store: Path, generation: Path) -> None:
+    atomic_symlink(
+        generation,
+        store / "current",
+        target_is_directory=True,
+    )
+    fsync_directory(store)
+
+
+def projection_links(store: Path) -> tuple[tuple[Path, Path, bool], ...]:
+    current = store / "current"
+    return (
+        (VIEWS_DIR, current / "views", True),
+        (REPORTS_DIR, current / "reports", True),
+        (DASHBOARD_PATH, current / "dashboard" / "index.html", False),
+    )
+
+
+def projection_links_managed(store: Path) -> bool:
+    return all(
+        symlink_resolves_to(path, target)
+        for path, target, _ in projection_links(store)
+    )
+
+
+def copy_legacy_projection(store: Path) -> Path | None:
+    sources = projection_links(store)
+    if not any(path.exists() and not path.is_symlink() for path, _, _ in sources):
+        return None
+    legacy = store / "generations" / f"legacy-{uuid.uuid4().hex}"
+    (legacy / "views").mkdir(parents=True, exist_ok=True)
+    (legacy / "reports").mkdir(parents=True, exist_ok=True)
+    (legacy / "dashboard").mkdir(parents=True, exist_ok=True)
+    if VIEWS_DIR.exists() and not VIEWS_DIR.is_symlink():
+        shutil.copytree(VIEWS_DIR, legacy / "views", dirs_exist_ok=True)
+    if REPORTS_DIR.exists() and not REPORTS_DIR.is_symlink():
+        shutil.copytree(REPORTS_DIR, legacy / "reports", dirs_exist_ok=True)
+    if DASHBOARD_PATH.exists() and not DASHBOARD_PATH.is_symlink():
+        shutil.copy2(DASHBOARD_PATH, legacy / "dashboard" / "index.html")
+    fsync_projection_tree(legacy)
+    fsync_directory(legacy.parent)
+    return legacy
+
+
+def ensure_projection_links(store: Path, new_generation: Path) -> None:
+    if projection_links_managed(store):
+        return
+    current = store / "current"
+    if not current.is_symlink():
+        legacy = copy_legacy_projection(store)
+        set_current_projection(store, legacy or new_generation)
+    for path, target, is_directory in projection_links(store):
+        install_managed_projection_link(
+            path,
+            target,
+            target_is_directory=is_directory,
+        )
+
+
+def clean_projection_generations(store: Path) -> None:
+    generations = store / "generations"
+    if not generations.is_dir():
+        return
+    current_target = ""
+    current = store / "current"
+    if current.is_symlink():
+        current_target = current.resolve(strict=False).name
+    candidates = sorted(
+        (path for path in generations.iterdir() if path.is_dir()),
+        key=lambda path: path.stat().st_mtime_ns,
+        reverse=True,
+    )
+    keep = {path.name for path in candidates[:PROJECTION_GENERATIONS_TO_KEEP]}
+    if current_target:
+        keep.add(current_target)
+    for path in candidates:
+        if path.name not in keep:
+            shutil.rmtree(path)
+
+
+def publish_projection_generation(stage: Path, generation_id: str) -> str:
+    store = projection_store_dir()
+    generations = store / "generations"
+    generations.mkdir(parents=True, exist_ok=True)
+    final = generations / generation_id
+    os.replace(stage, final)
+    fsync_directory(generations)
+    ensure_projection_links(store, final)
+    set_current_projection(store, final)
+    clean_projection_generations(store)
+    return generation_id
+
+
+def render_outputs(
+    db_path: Path,
+    *,
+    lock_timeout: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
+    writer_locked: bool = False,
+    allowed_run_lease: str = "",
+) -> dict[str, Any]:
+    writer_context = (
+        contextlib.nullcontext()
+        if writer_locked
+        else interprocess_lock(db_path, "writer", timeout=lock_timeout)
+    )
+    with writer_context:
+        with interprocess_lock(db_path, "render", timeout=lock_timeout):
+            with connect_db(db_path) as conn:
+                ensure_schema(conn)
+                if allowed_run_lease:
+                    require_daily_run_lease(
+                        conn, allowed_run_lease, heartbeat=False
+                    )
+                else:
+                    active_lease = active_daily_run_lease(conn)
+                    if active_lease is not None:
+                        raise RuntimeError(
+                            "Полный render запрещён во время active daily run: "
+                            f"run_id={active_lease['run_id']}, "
+                            f"owner={active_lease['owner']}, "
+                            f"expires_at={active_lease['expires_at']}. "
+                            "Завершите его через finalize-daily-run с точным lease."
+                        )
+                before = conn.total_changes
+                ensure_active_policy(conn)
+                refresh_source_hit_labels(conn)
+                if conn.total_changes > before:
+                    mark_projections_dirty(conn)
+                conn.commit()
+                revision = int(projection_state_data(conn)["dirty_revision"])
+                snapshot = build_snapshot(conn, db_path)
+
+            store = projection_store_dir()
+            staging_root = store / "staging"
+            staging_root.mkdir(parents=True, exist_ok=True)
+            for stale in staging_root.iterdir():
+                if stale.is_dir():
+                    shutil.rmtree(stale)
+                else:
+                    stale.unlink()
+            generation_id = (
+                dt.datetime.now().strftime("%Y%m%dT%H%M%S")
+                + f"-r{revision}-{uuid.uuid4().hex[:12]}"
+            )
+            stage = staging_root / generation_id
+            stage.mkdir(parents=True)
+            try:
+                with staged_projection_paths(stage):
+                    generate_views(snapshot, db_path)
+                    generate_dashboard(snapshot)
+                manifest = {
+                    "schema_version": SCHEMA_VERSION,
+                    "projection_revision": revision,
+                    "generation": generation_id,
+                    "generated_at": snapshot["generated_at"],
+                    "database": db_label(db_path),
+                }
+                (stage / "manifest.json").write_text(
+                    json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                file_count, total_bytes = fsync_projection_tree(stage)
+                manifest.update({"file_count": file_count, "total_bytes": total_bytes})
+                (stage / "manifest.json").write_text(
+                    json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                fsync_projection_tree(stage)
+                delay = float(os.environ.get("JOBCTL_TEST_RENDER_DELAY_SECONDS", "0"))
+                if delay > 0:
+                    time.sleep(min(delay, 30.0))
+                if os.environ.get("JOBCTL_TEST_FAIL_RENDER_BEFORE_PUBLISH") == "1":
+                    raise RuntimeError("Синтетическое прерывание render до публикации.")
+                published_generation = publish_projection_generation(
+                    stage, generation_id
+                )
+            except Exception:
+                if stage.exists():
+                    shutil.rmtree(stage)
+                raise
+
+            with connect_db(db_path) as conn:
+                ensure_schema(conn)
+                mark_projections_rendered(
+                    conn,
+                    revision=revision,
+                    generation=published_generation,
+                )
+                conn.commit()
+                snapshot["projection_state"] = projection_state_data(conn)
+            return snapshot
+
+
+def command_lock_timeout(args: argparse.Namespace) -> float:
+    return validate_lock_timeout(
+        float(getattr(args, "lock_timeout", DEFAULT_LOCK_TIMEOUT_SECONDS))
+    )
+
+
+def maybe_render_after_write(args: argparse.Namespace) -> dict[str, Any] | None:
+    if bool(getattr(args, "defer_render", False)):
+        return None
+    return render_outputs(
+        args.db,
+        lock_timeout=command_lock_timeout(args),
+        writer_locked=True,
+    )
+
+
+def read_projection_state(db_path: Path) -> dict[str, Any]:
     with connect_db(db_path) as conn:
         ensure_schema(conn)
-        ensure_active_policy(conn)
-        refresh_source_hit_labels(conn)
-        conn.commit()
-        snapshot = build_snapshot(conn, db_path)
-    generate_views(snapshot, db_path)
-    generate_dashboard(snapshot)
-    return snapshot
+        return projection_state_data(conn)
+
+
+def projection_write_note(args: argparse.Namespace) -> str:
+    if bool(getattr(args, "defer_render", False)):
+        return "SQLite durable; render отложен, проекции dirty."
+    return f"Обновлён файл {display_path(DASHBOARD_PATH, ROOT)}."
 
 
 def db_label(path: Path) -> str:
@@ -7597,9 +8417,22 @@ def print_render_summary(action: str, db_path: Path, snapshot: dict[str, Any]) -
 
 
 def rebuild(args: argparse.Namespace) -> None:
-    snapshot = render_outputs(args.db)
+    snapshot = render_outputs(
+        args.db,
+        lock_timeout=command_lock_timeout(args),
+        writer_locked=bool(getattr(args, "writer_locked", False)),
+    )
     if args.json:
-        print(json.dumps({"kpis": snapshot["kpis"]}, ensure_ascii=False, indent=2))
+        print(
+            json.dumps(
+                {
+                    "kpis": snapshot["kpis"],
+                    "projection_state": snapshot["projection_state"],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
     else:
         print_render_summary("Проекции поиска работы пересобраны из SQLite.", args.db, snapshot)
 
@@ -7626,7 +8459,9 @@ def watch(args: argparse.Namespace) -> None:
             if current != previous:
                 print(f"\nИзменение обнаружено: {now_iso()}")
                 rebuild(argparse.Namespace(db=args.db, json=False))
-                previous = current
+                # Rebuild advances projection_state in SQLite. Track the
+                # post-render signature so watch does not trigger itself.
+                previous = file_signature([args.db])
     except KeyboardInterrupt:
         print("\nНаблюдение остановлено.")
 
@@ -7638,6 +8473,206 @@ def print_stats(args: argparse.Namespace) -> None:
     print(json.dumps(snapshot["kpis"], ensure_ascii=False, indent=2))
 
 
+def projection_status_command(args: argparse.Namespace) -> None:
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        state = projection_state_data(conn)
+        active = conn.execute(
+            """
+            SELECT * FROM daily_run_leases
+            WHERE status = 'active' AND expires_at > ?
+            ORDER BY acquired_at DESC LIMIT 1
+            """,
+            (now_iso(),),
+        ).fetchone()
+    store = projection_store_dir()
+    state["managed_outputs"] = projection_links_managed(store)
+    state["manifest"] = display_path(
+        store / "current" / "manifest.json", ROOT
+    )
+    state["active_daily_run"] = (
+        {
+            key: active[key]
+            for key in (
+                "run_id",
+                "owner",
+                "status",
+                "acquired_at",
+                "heartbeat_at",
+                "expires_at",
+            )
+        }
+        if active is not None
+        else None
+    )
+    if args.json:
+        print(json.dumps(state, ensure_ascii=False, indent=2))
+        return
+    freshness = "dirty" if state["dirty"] else "fresh"
+    print(
+        f"Проекции: {freshness}; revision "
+        f"{state['rendered_revision']}/{state['dirty_revision']}; "
+        f"generation={state['published_generation'] or 'нет'}."
+    )
+    if active is not None:
+        print(
+            f"  daily run: {active['run_id']} · owner={active['owner']} · "
+            f"expires_at={active['expires_at']}"
+        )
+
+
+def begin_daily_run_command(args: argparse.Namespace) -> None:
+    run_id = clean_cell(args.run_id)
+    if not run_id:
+        raise ValueError("Требуется непустой --run-id.")
+    lease_seconds = int(args.lease_seconds)
+    if lease_seconds < 60 or lease_seconds > MAX_DAILY_RUN_LEASE_SECONDS:
+        raise ValueError("--lease-seconds должен быть от 60 до 86400.")
+    owner = clean_cell(args.owner) or f"{socket.gethostname()}:{os.getpid()}"
+    supplied_token = clean_cell(getattr(args, "run_lease", ""))
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        active = active_daily_run_lease(conn)
+        if active is not None:
+            if supplied_token and supplied_token == str(active["token"]) and run_id == str(
+                active["run_id"]
+            ):
+                active = require_daily_run_lease(
+                    conn, supplied_token, heartbeat=True
+                )
+                conn.commit()
+                token = supplied_token
+                created = False
+            else:
+                raise RuntimeError(
+                    "Нельзя начать второй daily run: "
+                    f"run_id={active['run_id']}, owner={active['owner']}, "
+                    f"expires_at={active['expires_at']}. Возобновите его с точным "
+                    "--run-lease или дождитесь истечения."
+                )
+        else:
+            projection = projection_state_data(conn)
+            if projection["dirty"]:
+                raise RuntimeError(
+                    "Проекции dirty до начала daily run. Сначала выполните resumable "
+                    "rebuild, затем повторите begin-daily-run."
+                )
+            token = uuid.uuid4().hex
+            now = dt.datetime.now().replace(microsecond=0)
+            expires = now + dt.timedelta(seconds=lease_seconds)
+            conn.execute(
+                """
+                INSERT INTO daily_run_leases (
+                    token, run_id, owner, status, lease_seconds, acquired_at,
+                    heartbeat_at, expires_at
+                ) VALUES (?, ?, ?, 'active', ?, ?, ?, ?)
+                """,
+                (
+                    token,
+                    run_id,
+                    owner,
+                    lease_seconds,
+                    now.isoformat(),
+                    now.isoformat(),
+                    expires.isoformat(),
+                ),
+            )
+            conn.commit()
+            active = conn.execute(
+                "SELECT * FROM daily_run_leases WHERE token = ?", (token,)
+            ).fetchone()
+            created = True
+    result = {
+        "run_id": run_id,
+        "run_lease": token,
+        "owner": active["owner"],
+        "expires_at": active["expires_at"],
+        "created": created,
+        "write_flags": ["--defer-render", f"--run-lease={token}"],
+    }
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print(
+            f"Daily run {run_id} защищён lease до {active['expires_at']}. "
+            f"Передавайте --defer-render --run-lease={token} каждой write-команде."
+        )
+
+
+def finalize_daily_run_command(args: argparse.Namespace) -> None:
+    token = clean_cell(getattr(args, "run_lease", ""))
+    if not token:
+        raise ValueError("Для finalize-daily-run требуется точный --run-lease.")
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        existing = conn.execute(
+            "SELECT * FROM daily_run_leases WHERE token = ?", (token,)
+        ).fetchone()
+        if existing is not None and existing["status"] == "finalized":
+            state = projection_state_data(conn)
+            result = {
+                "run_id": existing["run_id"],
+                "run_lease": token,
+                "already_finalized": True,
+                "projection_state": state,
+            }
+            print(json.dumps(result, ensure_ascii=False, indent=2)) if args.json else print(
+                f"Daily run {existing['run_id']} уже финализирован; повторный render не выполнен."
+            )
+            return
+        active = require_daily_run_lease(conn, token, heartbeat=True)
+        if active is None:
+            raise RuntimeError("Активный daily run для finalize не найден.")
+        conn.commit()
+
+    snapshot = render_outputs(
+        args.db,
+        lock_timeout=command_lock_timeout(args),
+        writer_locked=True,
+        allowed_run_lease=token,
+    )
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        # The outer writer lock has been held continuously since the lease was
+        # validated and heartbeated.  A long render may pass expires_at, but no
+        # competing process can expire or replace this lease before this
+        # successful publication is recorded.
+        active = conn.execute(
+            "SELECT * FROM daily_run_leases WHERE token = ? AND status = 'active'",
+            (token,),
+        ).fetchone()
+        if active is None:
+            raise RuntimeError("Daily-run lease исчез до фиксации finalize.")
+        released_at = now_iso()
+        conn.execute(
+            """
+            UPDATE daily_run_leases
+            SET status = 'finalized', released_at = ?,
+                release_reason = 'successful_final_render'
+            WHERE token = ? AND status = 'active'
+            """,
+            (released_at, token),
+        )
+        conn.commit()
+        state = projection_state_data(conn)
+    result = {
+        "run_id": active["run_id"],
+        "run_lease": token,
+        "finalized_at": released_at,
+        "already_finalized": False,
+        "kpis": snapshot["kpis"],
+        "projection_state": state,
+    }
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print_render_summary(
+            f"Daily run {active['run_id']} финализирован одним полным render.",
+            args.db,
+            snapshot,
+        )
+
+
 def migrate_schema(args: argparse.Namespace) -> None:
     """Explicitly migrate an existing database with a recoverable backup."""
 
@@ -7645,10 +8680,26 @@ def migrate_schema(args: argparse.Namespace) -> None:
         raise FileNotFoundError(f"База данных не найдена: {args.db}")
     with sqlite3.connect(args.db) as probe:
         current_version = int(probe.execute("PRAGMA user_version").fetchone()[0])
-    if current_version not in {1, 2, 3, 4, 5, 6, SCHEMA_VERSION}:
+    if current_version not in set(range(1, SCHEMA_VERSION + 1)):
         raise RuntimeError(
             f"Неподдерживаемый путь переноса: {current_version} → {SCHEMA_VERSION}."
         )
+
+    # A current-schema migration is still a mutation/repair operation.  Do not
+    # let it run beside a live daily session; older schemas cannot have a v8
+    # lease yet and are guarded by the process-wide writer lock in main().
+    if current_version == SCHEMA_VERSION:
+        with connect_db(args.db) as lease_conn:
+            ensure_schema(lease_conn)
+            active_lease = active_daily_run_lease(lease_conn)
+            lease_conn.commit()
+            if active_lease is not None:
+                raise RuntimeError(
+                    "migrate-schema недоступен во время active daily run: "
+                    f"run_id={active_lease['run_id']}, owner={active_lease['owner']}, "
+                    f"expires_at={active_lease['expires_at']}. Сначала выполните "
+                    "finalize-daily-run или дождитесь истечения lease."
+                )
 
     backup_path: Path | None = None
     if current_version < SCHEMA_VERSION and not args.no_backup:
@@ -7708,15 +8759,16 @@ def migrate_schema(args: argparse.Namespace) -> None:
                     db_label(backup_path) if backup_path else "",
                     json.dumps(row_counts_before, ensure_ascii=False, sort_keys=True),
                     (
-                        "Добавлены аудируемые исправления взаимодействий и эффективные проекции; "
-                        "исторические строки не изменялись."
-                        if current_version == 6
+                        "Добавлены transactional dirty revision, daily-run lease и "
+                        "атомарная публикация read models; evidence-таблицы не изменялись."
+                        if current_version == 7
                         else "Консервативный перенос: неизвестные исторические поля не заполнялись; "
-                        "добавлены эффективные проекции без автоматических исправлений."
+                        "добавлены effective и projection-control структуры без "
+                        "автоматических исправлений evidence."
                     ),
                 ),
             )
-        conn.commit()
+        commit_projection_write(conn)
         quick_check = str(conn.execute("PRAGMA quick_check").fetchone()[0])
         foreign_key_issues = len(conn.execute("PRAGMA foreign_key_check").fetchall())
         row_counts_after = {
@@ -7734,7 +8786,12 @@ def migrate_schema(args: argparse.Namespace) -> None:
                 f"до={row_counts_before}, после={row_counts_after}"
             )
 
-    snapshot = render_outputs(args.db)
+    snapshot = maybe_render_after_write(args)
+    projection = (
+        snapshot["projection_state"]
+        if snapshot is not None
+        else read_projection_state(args.db)
+    )
     result = {
         "from_version": current_version,
         "to_version": SCHEMA_VERSION,
@@ -7748,7 +8805,9 @@ def migrate_schema(args: argparse.Namespace) -> None:
         "quick_check": quick_check,
         "foreign_key_issues": foreign_key_issues,
         "already_current": current_version == SCHEMA_VERSION,
-        "kpis": snapshot["kpis"],
+        "kpis": snapshot["kpis"] if snapshot is not None else None,
+        "render_deferred": snapshot is None,
+        "projection_state": projection,
     }
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -7870,9 +8929,9 @@ def check_coverage(args: argparse.Namespace) -> None:
         with connect_db(args.db) as conn:
             ensure_schema(conn)
             run_id = persist_coverage_result(conn, result, origin_for(manifest_path))
-            conn.commit()
+            commit_projection_write(conn)
         result["search_run_id"] = run_id
-        render_outputs(args.db)
+        maybe_render_after_write(args)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     if not result["ok"]:
         raise SystemExit(1)
@@ -8030,9 +9089,9 @@ def check_telegram_coverage(args: argparse.Namespace) -> None:
             result["search_run_id"] = run_id
             if result["ok"]:
                 persist_source_checkpoints(conn, result, manifest_file)
-            conn.commit()
+            commit_projection_write(conn)
     if result.get("search_run_id"):
-        render_outputs(args.db)
+        maybe_render_after_write(args)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     if not result["ok"]:
         raise SystemExit(1)
@@ -8092,14 +9151,17 @@ def migrate_stages(args: argparse.Namespace) -> None:
             (now_iso(),),
         ).rowcount
 
-        conn.commit()
+        commit_projection_write(conn)
 
-    snapshot = render_outputs(args.db)
+    snapshot = maybe_render_after_write(args)
     print("Старые этапы перенесены в совместимую компактную воронку.")
     print(f"  изменённые значения: {changed}")
     print(f"  строки повторных обращений: {followup_applications}")
     print(f"  вакансии с повторным обращением: {followup_vacancies}")
-    print(f"  показатели: {snapshot['kpis']}")
+    if snapshot is None:
+        print("  render отложен; проекции помечены dirty")
+    else:
+        print(f"  показатели: {snapshot['kpis']}")
 
 
 def ingest_json(args: argparse.Namespace) -> None:
@@ -8135,15 +9197,21 @@ def ingest_json(args: argparse.Namespace) -> None:
                 ingestion_stats=stats,
             ):
                 pass
-        conn.commit()
-    snapshot = render_outputs(args.db)
+        commit_projection_write(conn)
+    snapshot = maybe_render_after_write(args)
     if args.json:
         print(
             json.dumps(
                 {
                     "ingested": stats["ingested"],
                     "quarantined": stats["quarantined"],
-                    "kpis": snapshot["kpis"],
+                    "kpis": snapshot["kpis"] if snapshot is not None else None,
+                    "render_deferred": snapshot is None,
+                    "projection_state": (
+                        snapshot["projection_state"]
+                        if snapshot is not None
+                        else read_projection_state(args.db)
+                    ),
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -8153,7 +9221,11 @@ def ingest_json(args: argparse.Namespace) -> None:
         print(
             f"В SQLite добавлено вакансий: {stats['ingested']}; "
             f"помещено в карантин: {stats['quarantined']}. "
-            f"Обновлён файл {display_path(DASHBOARD_PATH, ROOT)}."
+            + (
+                "Render отложен; SQLite durable, проекции dirty."
+                if snapshot is None
+                else f"Обновлён файл {display_path(DASHBOARD_PATH, ROOT)}."
+            )
         )
 
 
@@ -8210,8 +9282,8 @@ def ingest_gmail_json(args: argparse.Namespace) -> None:
                 ingestion_stats=stats,
             ):
                 pass
-        conn.commit()
-    snapshot = render_outputs(args.db)
+        commit_projection_write(conn)
+    snapshot = maybe_render_after_write(args)
     if args.json:
         print(
             json.dumps(
@@ -8219,7 +9291,13 @@ def ingest_gmail_json(args: argparse.Namespace) -> None:
                     "ingested": stats["ingested"],
                     "quarantined": stats["quarantined"],
                     "provider": args.provider,
-                    "kpis": snapshot["kpis"],
+                    "kpis": snapshot["kpis"] if snapshot is not None else None,
+                    "render_deferred": snapshot is None,
+                    "projection_state": (
+                        snapshot["projection_state"]
+                        if snapshot is not None
+                        else read_projection_state(args.db)
+                    ),
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -8401,16 +9479,16 @@ def update_vacancy(args: argparse.Namespace) -> None:
                 history_complete=True,
                 authorization_status="not_applicable",
             )
-        conn.commit()
-    render_outputs(args.db)
+        commit_projection_write(conn)
+    maybe_render_after_write(args)
     sync_note = (
         f"; синхронизирована совместимая запись отклика №{synced_application_id}"
         if synced_application_id is not None
         else ""
     )
     print(
-        f"Вакансия №{vacancy_id} обновлена{sync_note}; пересобран файл "
-        f"{display_path(DASHBOARD_PATH, ROOT)}."
+        f"Вакансия №{vacancy_id} обновлена{sync_note}. "
+        + projection_write_note(args)
     )
 
 
@@ -8599,8 +9677,8 @@ def record_employer_interaction(args: argparse.Namespace) -> None:
             (dedupe_key,),
         ).fetchone()
         interaction_id = int(row["id"])
-        conn.commit()
-    render_outputs(args.db)
+        commit_projection_write(conn)
+    maybe_render_after_write(args)
     result = {
         "interaction_id": interaction_id,
         "vacancy_id": vacancy_id,
@@ -8705,9 +9783,9 @@ def invalidate_employer_interaction(args: argparse.Namespace) -> None:
             )
             invalidation_id = int(cursor.lastrowid)
             created = True
-        conn.commit()
+        commit_projection_write(conn)
 
-    render_outputs(args.db)
+    maybe_render_after_write(args)
     result = {
         "invalidation_id": invalidation_id,
         "interaction_id": int(args.interaction_id),
@@ -8761,8 +9839,6 @@ def outcome_scorecard_command(args: argparse.Namespace) -> None:
     as_of = parse_iso_date(args.as_of or dt.date.today().isoformat(), label="--as-of")
     with connect_db(args.db) as conn:
         ensure_schema(conn)
-        refresh_source_hit_labels(conn)
-        conn.commit()
         scorecard, _ = build_outcome_scorecard_data(conn, as_of)
     if args.json:
         print(json.dumps(scorecard, ensure_ascii=False, indent=2))
@@ -8874,8 +9950,8 @@ def record_lifecycle_event_command(args: argparse.Namespace) -> None:
             history_complete=True,
             authorization_status="not_applicable",
         )
-        conn.commit()
-    render_outputs(args.db)
+        commit_projection_write(conn)
+    maybe_render_after_write(args)
     result = {
         "lifecycle_event_id": event_id,
         "vacancy_id": vacancy_id,
@@ -8908,8 +9984,8 @@ def set_current_action_command(args: argparse.Namespace) -> None:
             evidence_note=args.evidence_note,
             source=args.source,
         )
-        conn.commit()
-    render_outputs(args.db)
+        commit_projection_write(conn)
+    maybe_render_after_write(args)
     result = {
         "action_event_id": event_id,
         "vacancy_id": vacancy_id,
@@ -9042,9 +10118,8 @@ def record_external_action_command(args: argparse.Namespace) -> None:
                 evidence_note=args.evidence_note,
                 source="cli:record-external-action",
             )
-        conn.commit()
-    if vacancy_id is not None:
-        render_outputs(args.db)
+        commit_projection_write(conn)
+    maybe_render_after_write(args)
     result = {
         "external_action_id": external_action_id,
         "vacancy_id": vacancy_id,
@@ -9217,8 +10292,8 @@ def reprocess_quarantine_command(args: argparse.Namespace) -> None:
                 (now_iso(), args.quarantine_id),
             )
             status = "pending"
-        conn.commit()
-    render_outputs(args.db)
+        commit_projection_write(conn)
+    maybe_render_after_write(args)
     result = {
         "quarantine_id": args.quarantine_id,
         "status": status,
@@ -9576,8 +10651,8 @@ def upsert_employer_account(args: argparse.Namespace) -> None:
                     account_id,
                 ),
             )
-        conn.commit()
-    render_outputs(args.db)
+        commit_projection_write(conn)
+    maybe_render_after_write(args)
     result = {"account_id": account_id, "created": created, "canonical_name": canonical_name}
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -9632,8 +10707,8 @@ def record_employer_signal(args: argparse.Namespace) -> None:
             (account_id, args.signal_type, observed_date, evidence_url, evidence_note),
         ).fetchone()
         signal_id = int(signal["id"])
-        conn.commit()
-    render_outputs(args.db)
+        commit_projection_write(conn)
+    maybe_render_after_write(args)
     result = {"signal_id": signal_id, "account_id": account_id, "created": created}
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -9675,8 +10750,8 @@ def link_vacancy_account(args: argparse.Namespace) -> None:
                 """,
                 (vacancy_id, account_id, clean_cell(args.evidence_note), now, now),
             )
-        conn.commit()
-    render_outputs(args.db)
+        commit_projection_write(conn)
+    maybe_render_after_write(args)
     result = {"vacancy_id": vacancy_id, "account_id": account_id, "created": created}
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -9707,8 +10782,8 @@ def record_vacancy_factor(args: argparse.Namespace) -> None:
             factor=factor,
             default_date=observed_date,
         )
-        conn.commit()
-    render_outputs(args.db)
+        commit_projection_write(conn)
+    maybe_render_after_write(args)
     result = {"vacancy_id": vacancy_id, "factor_key": args.factor_key, "created": created}
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -9781,13 +10856,13 @@ def upsert_employer_contact(args: argparse.Namespace) -> None:
             """,
             (vacancy_id, channel, clean_cell(args.contact_address)),
         ).fetchone()
-        conn.commit()
+        commit_projection_write(conn)
 
-    render_outputs(args.db)
+    maybe_render_after_write(args)
     print(
         f"Контакт работодателя №{contact['id']} сохранён для вакансии №{vacancy_id} "
-        f"({channel}, {args.confidence}). Обновлён файл "
-        f"{display_path(DASHBOARD_PATH, ROOT)}."
+        f"({channel}, {args.confidence}). "
+        + projection_write_note(args)
     )
 
 
@@ -9830,12 +10905,12 @@ def record_contact_search(args: argparse.Namespace) -> None:
             "cli:record-contact-search",
             0,
         )
-        conn.commit()
+        commit_projection_write(conn)
 
-    render_outputs(args.db)
+    maybe_render_after_write(args)
     print(
         f"Поиск контакта №{cur.lastrowid} записан для вакансии №{vacancy_id}. "
-        f"Обновлён файл {display_path(DASHBOARD_PATH, ROOT)}."
+        + projection_write_note(args)
     )
 
 
@@ -10184,13 +11259,13 @@ def record_followup(args: argparse.Namespace) -> None:
             "cli:record-followup",
             0,
         )
-        conn.commit()
+        commit_projection_write(conn)
 
-    render_outputs(args.db)
+    maybe_render_after_write(args)
     print(
         f"Раунд повторного обращения №{follow_up_number} записан для вакансии №{vacancy_id} "
         f"через {', '.join(sent_channels)}; поиск контакта №{contact_search_cur.lastrowid}. "
-        f"Обновлён файл {display_path(DASHBOARD_PATH, ROOT)}."
+        + projection_write_note(args)
     )
 
 
@@ -10296,9 +11371,9 @@ def attach_interview_summary(args: argparse.Namespace) -> None:
                 """,
                 (completion_lifecycle_event_id, int(summary_row["id"])),
             )
-        conn.commit()
+        commit_projection_write(conn)
 
-    render_outputs(args.db)
+    maybe_render_after_write(args)
     completion_text = (
         f" Завершение подтверждено событием №{completion_lifecycle_event_id}."
         if args.confirms_completion
@@ -10306,7 +11381,7 @@ def attach_interview_summary(args: argparse.Namespace) -> None:
     )
     print(
         f"Резюме интервью №{summary_row['id']} связано с вакансией №{vacancy_id}."
-        f"{completion_text} Обновлён файл {display_path(DASHBOARD_PATH, ROOT)}."
+        f"{completion_text} " + projection_write_note(args)
     )
 
 
@@ -10318,6 +11393,18 @@ def initialize_workspace(args: argparse.Namespace) -> None:
     settings_template = CODE_ROOT / "config" / "settings.example.toml"
     if not settings_template.exists():
         raise FileNotFoundError(f"Не найден шаблон настроек: {settings_template}")
+
+    if DB_PATH.exists():
+        with connect_db(DB_PATH) as lease_conn:
+            ensure_schema(lease_conn)
+            active_lease = active_daily_run_lease(lease_conn)
+            lease_conn.commit()
+            if active_lease is not None:
+                raise RuntimeError(
+                    "init недоступен во время active daily run: "
+                    f"run_id={active_lease['run_id']}, owner={active_lease['owner']}, "
+                    f"expires_at={active_lease['expires_at']}."
+                )
 
     if SETTINGS.config_path.exists():
         kept.append(display_path(SETTINGS.config_path, ROOT))
@@ -10365,7 +11452,18 @@ def initialize_workspace(args: argparse.Namespace) -> None:
         directory.mkdir(parents=True, exist_ok=True)
 
     database_existed = DB_PATH.exists()
-    snapshot = render_outputs(DB_PATH)
+    if bool(getattr(args, "defer_render", False)):
+        with connect_db(DB_PATH) as conn:
+            ensure_schema(conn)
+            commit_projection_write(conn)
+            snapshot = build_snapshot(conn, DB_PATH)
+            snapshot["projection_state"] = projection_state_data(conn)
+    else:
+        snapshot = render_outputs(
+            DB_PATH,
+            lock_timeout=command_lock_timeout(args),
+            writer_locked=True,
+        )
     (created if not database_existed else kept).append(display_path(DB_PATH, ROOT))
 
     result = {
@@ -10373,6 +11471,8 @@ def initialize_workspace(args: argparse.Namespace) -> None:
         "created": created,
         "kept": kept,
         "kpis": snapshot["kpis"],
+        "render_deferred": bool(getattr(args, "defer_render", False)),
+        "projection_state": snapshot["projection_state"],
     }
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -10382,7 +11482,10 @@ def initialize_workspace(args: argparse.Namespace) -> None:
         print("  создано: " + ", ".join(created))
     if kept:
         print("  сохранено без изменений: " + ", ".join(kept))
-    print(f"  панель: {display_path(DASHBOARD_PATH, ROOT)}")
+    if bool(getattr(args, "defer_render", False)):
+        print("  SQLite durable; первичный render отложен, проекции dirty")
+    else:
+        print(f"  панель: {display_path(DASHBOARD_PATH, ROOT)}")
 
 
 def doctor(args: argparse.Namespace) -> None:
@@ -10429,6 +11532,7 @@ def doctor(args: argparse.Namespace) -> None:
                 v5_contract_issues = schema_v5_issues(conn)
                 v6_contract_issues = schema_v6_issues(conn)
                 v7_contract_issues = schema_v7_issues(conn)
+                v8_contract_issues = schema_v8_issues(conn)
                 foreign_key_issues = len(conn.execute("PRAGMA foreign_key_check").fetchall())
                 missing_canonical_streams = (
                     int(
@@ -10521,6 +11625,11 @@ def doctor(args: argparse.Namespace) -> None:
                 "database_schema_v7_contract",
                 not v7_contract_issues,
                 "; ".join(v7_contract_issues) or "Контракт v7 соблюдён.",
+            )
+            add(
+                "database_schema_v8_contract",
+                not v8_contract_issues,
+                "; ".join(v8_contract_issues) or "Контракт v8 соблюдён.",
             )
             add(
                 "database_canonical_source_streams",
@@ -10813,7 +11922,6 @@ def operational_doctor(args: argparse.Namespace) -> None:
                     f"Просроченных записей по SLA: {wip['overdue_total']}.",
                 )
 
-                db_mtime = args.db.stat().st_mtime if args.db.exists() else 0
                 generated_paths = [
                     DASHBOARD_PATH,
                     REPORTS_DIR / "outcome_scorecard.md",
@@ -10822,21 +11930,35 @@ def operational_doctor(args: argparse.Namespace) -> None:
                 missing_generated = [
                     display_path(path, ROOT) for path in generated_paths if not path.is_file()
                 ]
-                stale_generated = [
-                    display_path(path, ROOT)
-                    for path in generated_paths
-                    if path.is_file() and path.stat().st_mtime + 0.001 < db_mtime
-                ]
-                generated_ok = not missing_generated and not stale_generated
+                projection = projection_state_data(conn)
+                manifest_path = projection_store_dir() / "current" / "manifest.json"
+                manifest_ok = False
+                if manifest_path.is_file():
+                    try:
+                        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                        manifest_ok = (
+                            int(manifest.get("projection_revision", -1))
+                            == int(projection["rendered_revision"])
+                            and str(manifest.get("generation") or "")
+                            == str(projection["published_generation"])
+                        )
+                    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                        manifest_ok = False
+                generated_ok = (
+                    not missing_generated
+                    and not projection["dirty"]
+                    and manifest_ok
+                    and projection_links_managed(projection_store_dir())
+                )
                 add(
                     "generated_read_model_freshness",
                     "pass" if generated_ok else "fail",
                     "Модели чтения синхронизированы с SQLite."
                     if generated_ok
-                    else "Требуется пересборка; отсутствуют: "
+                    else "Требуется resumable rebuild; отсутствуют: "
                     + (", ".join(missing_generated) or "нет")
-                    + "; устарели: "
-                    + (", ".join(stale_generated) or "нет"),
+                    + f"; dirty={projection['dirty']}; manifest_ok={manifest_ok}; "
+                    + f"revision={projection['rendered_revision']}/{projection['dirty_revision']}.",
                     blocks_closeout=True,
                 )
 
@@ -11001,6 +12123,46 @@ def extract_config_argument(argv: list[str]) -> tuple[list[str], Path | None]:
     return normalized, selected
 
 
+def extract_runtime_arguments(argv: list[str]) -> list[str]:
+    """Allow global coordination flags before or after the subcommand."""
+
+    normalized: list[str] = []
+    extracted: list[str] = []
+    index = 0
+    while index < len(argv):
+        value = argv[index]
+        if value in {"--defer-render", "--no-render"}:
+            extracted.append("--defer-render")
+            index += 1
+            continue
+        matched = False
+        for option in ("--lock-timeout", "--run-lease"):
+            if value == option:
+                if index + 1 >= len(argv):
+                    normalized.append(value)
+                    index += 1
+                    matched = True
+                    break
+                extracted.extend((option, argv[index + 1]))
+                index += 2
+                matched = True
+                break
+            if value.startswith(option + "="):
+                extracted.extend((option, value.split("=", 1)[1]))
+                index += 1
+                matched = True
+                break
+        if matched:
+            continue
+        normalized.append(value)
+        index += 1
+    return [*extracted, *normalized]
+
+
+def environment_flag(name: str) -> bool:
+    return clean_cell(os.environ.get(name, "")).lower() in {"1", "true", "yes", "on"}
+
+
 def build_parser() -> argparse.ArgumentParser:
     argparse_messages = {
         "usage: ": "использование: ",
@@ -11028,6 +12190,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--db", type=Path, default=DB_PATH, help="Путь к базе SQLite")
     parser.add_argument("--json", action="store_true", help="Вывести машиночитаемый JSON")
+    parser.add_argument(
+        "--defer-render",
+        "--no-render",
+        dest="defer_render",
+        action="store_true",
+        default=environment_flag("JOB_SEARCH_DEFER_RENDER"),
+        help="Зафиксировать SQLite и dirty revision без пересборки проекций",
+    )
+    parser.add_argument(
+        "--lock-timeout",
+        type=validate_lock_timeout,
+        default=float(
+            os.environ.get(
+                "JOB_SEARCH_LOCK_TIMEOUT", str(DEFAULT_LOCK_TIMEOUT_SECONDS)
+            )
+        ),
+        help="Ограниченное ожидание writer/render lock в секундах",
+    )
+    parser.add_argument(
+        "--run-lease",
+        default=os.environ.get("JOB_SEARCH_RUN_LEASE", ""),
+        help="Токен активного daily run для защиты от конкурентной orchestration",
+    )
 
     sub = parser.add_subparsers()
 
@@ -11062,6 +12247,37 @@ def build_parser() -> argparse.ArgumentParser:
     rebuild_parser.add_argument("--db", type=Path, default=DB_PATH)
     rebuild_parser.add_argument("--json", action="store_true")
     rebuild_parser.set_defaults(func=rebuild)
+
+    projection_parser = sub.add_parser(
+        "projection-status",
+        help="Показать dirty/fresh revision и активный daily-run lease",
+    )
+    projection_parser.add_argument("--db", type=Path, default=DB_PATH)
+    projection_parser.add_argument("--json", action="store_true")
+    projection_parser.set_defaults(func=projection_status_command)
+
+    begin_run_parser = sub.add_parser(
+        "begin-daily-run",
+        help="Получить bounded lease для одного daily-run orchestration",
+    )
+    begin_run_parser.add_argument("--db", type=Path, default=DB_PATH)
+    begin_run_parser.add_argument("--run-id", required=True)
+    begin_run_parser.add_argument("--owner", default="")
+    begin_run_parser.add_argument(
+        "--lease-seconds",
+        type=int,
+        default=DEFAULT_DAILY_RUN_LEASE_SECONDS,
+    )
+    begin_run_parser.add_argument("--json", action="store_true")
+    begin_run_parser.set_defaults(func=begin_daily_run_command)
+
+    finalize_run_parser = sub.add_parser(
+        "finalize-daily-run",
+        help="Атомарно пересобрать проекции один раз и закрыть daily-run lease",
+    )
+    finalize_run_parser.add_argument("--db", type=Path, default=DB_PATH)
+    finalize_run_parser.add_argument("--json", action="store_true")
+    finalize_run_parser.set_defaults(func=finalize_daily_run_command)
 
     stats_parser = sub.add_parser("stats", help="Вывести текущие показатели базы")
     stats_parser.add_argument("--db", type=Path, default=DB_PATH)
@@ -11583,9 +12799,48 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def mutating_command_functions() -> set[Any]:
+    return {
+        initialize_workspace,
+        migrate_schema,
+        migrate_stages,
+        check_coverage,
+        check_telegram_coverage,
+        ingest_json,
+        ingest_gmail_json,
+        update_vacancy,
+        record_employer_interaction,
+        invalidate_employer_interaction,
+        record_lifecycle_event_command,
+        set_current_action_command,
+        record_external_action_command,
+        reprocess_quarantine_command,
+        upsert_employer_account,
+        record_employer_signal,
+        link_vacancy_account,
+        record_vacancy_factor,
+        upsert_employer_contact,
+        record_contact_search,
+        record_followup,
+        attach_interview_summary,
+        begin_daily_run_command,
+        finalize_daily_run_command,
+    }
+
+
+def lease_control_functions() -> set[Any]:
+    return {
+        initialize_workspace,
+        migrate_schema,
+        begin_daily_run_command,
+        finalize_daily_run_command,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     raw_argv, config_path = extract_config_argument(raw_argv)
+    raw_argv = extract_runtime_arguments(raw_argv)
     try:
         configure_runtime(config_path)
     except (OSError, ValueError) as exc:
@@ -11596,7 +12851,34 @@ def main(argv: list[str] | None = None) -> int:
     if hasattr(args, "db"):
         args.db = args.db.resolve() if not args.db.is_absolute() else args.db
     try:
-        args.func(args)
+        if args.func in mutating_command_functions():
+            db_path = getattr(args, "db", DB_PATH)
+            with interprocess_lock(
+                db_path,
+                "writer",
+                timeout=command_lock_timeout(args),
+            ):
+                args.writer_locked = True
+                if args.func not in lease_control_functions():
+                    with connect_db(db_path) as conn:
+                        ensure_schema(conn)
+                        active_lease = require_daily_run_lease(
+                            conn,
+                            clean_cell(getattr(args, "run_lease", "")),
+                            heartbeat=True,
+                        )
+                        if active_lease is not None and not bool(
+                            getattr(args, "defer_render", False)
+                        ):
+                            raise RuntimeError(
+                                "Active daily run требует --defer-render для каждой "
+                                "write-команды; единственный полный render выполняет "
+                                "finalize-daily-run."
+                            )
+                        conn.commit()
+                args.func(args)
+        else:
+            args.func(args)
     except Exception as exc:  # Keep CLI errors readable for daily runs.
         print(f"Ошибка jobctl: {exc}", file=sys.stderr)
         return 1

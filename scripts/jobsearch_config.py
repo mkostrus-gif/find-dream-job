@@ -379,7 +379,9 @@ def _path(workspace_root: Path, value: str) -> Path:
     candidate = Path(value).expanduser()
     if not candidate.is_absolute():
         candidate = workspace_root / candidate
-    return candidate.resolve()
+    # Keep configured generated-output paths stable when they are managed
+    # symlinks into an atomically switched projection generation.
+    return Path(os.path.abspath(candidate))
 
 
 def _path_value(

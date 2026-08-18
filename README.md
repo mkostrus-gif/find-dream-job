@@ -96,6 +96,8 @@ It provides:
 - an explicit employer account radar, evidence-backed employer signals, and
   structured vacancy factors that remain separate from candidate-relative score;
 - generated `views/*.md`, `reports/*.md`, and `dashboard/index.html`;
+- deferred durable writes plus one atomic closeout render for large daily runs;
+- bounded inter-process writer/render locks and one expiring daily-run lease;
 - agent workflows for onboarding, discovery, scoring, ATS documents,
   applications, and reconciliation;
 - safe review-only defaults and a default-deny public Git allowlist.
@@ -201,6 +203,9 @@ The core CLI uses only the Python standard library.
 init                      Create local settings, profile templates, and DB
 doctor --strict --json    Validate config, profile paths, and SQLite health
 operational-doctor        Check technical health and daily-closeout readiness
+projection-status         Show dirty/fresh projection revision and active lease
+begin-daily-run           Acquire the single daily-run orchestration lease
+finalize-daily-run        Publish one atomic final generation and release lease
 ingest-json FILE          Import structured vacancy/evaluation rows
 ingest-gmail-json FILE    Import HH or LinkedIn vacancy links extracted from Gmail
 build-coverage-plan FILE  Generate deterministic HH URLs and manifest skeleton
@@ -233,6 +238,19 @@ watch                      Rebuild when the SQLite file changes
 ```
 
 Run `python3 scripts/jobctl.py COMMAND --help` for exact fields.
+
+All existing writes still render immediately by default. For a batch, add
+`--defer-render` (or `--no-render`) to commit SQLite and mark projections dirty
+without touching generated files, then run one `rebuild`. A live daily run uses
+`begin-daily-run`, passes its `--run-lease` together with `--defer-render` to
+every mutation, and ends with `finalize-daily-run`.
+
+The reproducible performance fixture is synthetic and never opens an existing
+workspace:
+
+```bash
+python3 scripts/benchmark_daily_run.py --rows 25000 --workflow deferred
+```
 
 ## Repository map
 

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Added schema v8 projection revisions and expiring daily-run leases; global
+  deferred/no-render writes; bounded OS-backed writer/render locks; immutable
+  staged projection generations with atomic publication; single-pass actionable
+  WIP pagination; and a bounded dashboard projection. Immediate rendering stays
+  the compatibility default, and v1–v7 evidence rows are preserved by migration.
 - Added schema v7 append-only employer-interaction invalidations, effective
   interaction metrics, deterministic one-row-per-vacancy application state for
   follow-up projections, a fail-closed idempotent correction CLI, and backed-up

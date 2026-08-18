@@ -107,6 +107,20 @@ class AgentDocumentationTests(unittest.TestCase):
         self.assertIn("scan_linkedin_inbox = false", settings)
         self.assertIn("archive_processed_linkedin = false", settings)
 
+    def test_daily_run_defers_writes_and_has_one_final_render(self) -> None:
+        daily = self.read("prompts/daily_run.md")
+        required_text = (
+            "begin-daily-run",
+            "projection-status",
+            "--defer-render",
+            "--run-lease",
+            "finalize-daily-run",
+            "exactly one full render",
+        )
+        for text in required_text:
+            with self.subTest(text=text):
+                self.assertIn(text, daily)
+
     def test_daily_run_requires_complete_linkedin_mail_processing(self) -> None:
         daily = self.read("prompts/daily_run.md")
         mail_workflow = self.read("prompts/gmail_hh_digest.md")

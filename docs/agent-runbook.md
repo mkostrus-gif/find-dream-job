@@ -123,14 +123,17 @@ JOB_SEARCH_HOME="/path/to/private-workspace" \
   python3 scripts/jobctl.py stats
 ```
 
-Never use `--no-backup` on a live database. Schema v7 upgrades supported
-versions v1–v6 and preserves raw source hits, canonical vacancy identity,
+Never use `--no-backup` on a live database. Schema v8 upgrades supported
+versions v1–v7 and preserves raw source hits, canonical vacancy identity,
 aliases, applications, interactions, accounts, factors, and checkpoints. A
 legacy confirmed application becomes a durable event with explicitly
 incomplete history and unknown legacy authorization; no campaign, resume,
 reply, interview, offer, quarantine reason, or source completion is invented.
-Schema v7 adds interaction invalidations and effective interaction/application
-read models; see [`evidence-corrections.md`](evidence-corrections.md).
+Schema v8 adds transactional projection freshness, bounded writer/render locks,
+atomic generated-output generations, and one expiring daily-run lease. It does
+not change v7 evidence rows. Schema v7 added interaction invalidations and
+effective interaction/application read models; see
+[`evidence-corrections.md`](evidence-corrections.md).
 Restore the timestamped backup with the prior Engine version for rollback;
 there is no destructive reverse migration. Russian operator recovery guidance
 is in [`operations-v6.ru.md`](operations-v6.ru.md).
@@ -140,7 +143,8 @@ is in [`operations-v6.ru.md`](operations-v6.ru.md).
 Use [`prompts/daily_run.md`](../prompts/daily_run.md) as the canonical order:
 
 1. load settings and private evidence;
-2. validate and rebuild existing state;
+2. validate `projection-status`, recover an older dirty run when necessary,
+   then acquire `begin-daily-run` and retain its token;
 3. reconcile inbound replies and external statuses; record each automated or
    human employer event with `record-employer-interaction`, then append precise
    lifecycle evidence separately;
@@ -152,13 +156,23 @@ Use [`prompts/daily_run.md`](../prompts/daily_run.md) as the canonical order:
    a cursor;
 6. build the configured source-stream coverage plan, search every generated
    query through its final fully loaded page, and deduplicate against SQLite;
-7. normalize results into ignored JSON and ingest them;
+7. normalize results into ignored JSON and ingest them; every mutation from
+   inbound reconciliation through coverage uses
+   `--defer-render --run-lease <token>`;
 8. score the real mandate, hard constraints, and open questions;
 9. prepare only in-scope actions; persist an exact `authorized` action record
    before any attempt—score and `auto_apply` are not authorization;
 10. append attempted/blocked/failed evidence and verify visible success before
     adding `visibly_confirmed`;
-11. run every enabled fail-closed source check, rebuild, validate, and report.
+11. run every enabled fail-closed source check with the same deferred flags,
+    execute one `finalize-daily-run --run-lease <token>`, validate, and report.
+
+Deferred writes commit SQLite and its dirty revision in one transaction while
+leaving the previously published dashboard untouched. If finalization is
+interrupted or its bounded lock wait expires, rerun that exact finalization
+with the same token. Do not start a second run, clear a lease manually, or
+interpret a dirty read model as lost evidence. The CLI rejects an ordinary
+`rebuild` and any non-deferred mutation while the lease is active.
 
 Use [`prompts/scan_channel.md`](../prompts/scan_channel.md) when the task is
 limited to one company or source. Use

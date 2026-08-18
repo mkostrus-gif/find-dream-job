@@ -20,8 +20,18 @@ not an onboarded candidate workspace.
 
    ```bash
    python3 scripts/jobctl.py doctor --strict --json
-   python3 scripts/jobctl.py rebuild --json
+   python3 scripts/jobctl.py projection-status --json
+   python3 scripts/jobctl.py begin-daily-run \
+     --run-id daily-YYYY-MM-DD-<stable-operator-id> --json
    ```
+
+   `begin-daily-run` requires fresh projections. If an earlier interrupted run
+   left them dirty, perform one explicit resumable `rebuild --json` before
+   beginning the new run. Preserve the returned `run_lease` token. From this
+   point through the final coverage writes, add
+   `--defer-render --run-lease <token>` to every `jobctl` command that mutates
+   SQLite. These flags commit evidence immediately and mark projections dirty
+   without touching the previously published dashboard or views.
 
 5. Review `views/review_active.md`, `views/today.md`, `views/followups.md`,
    `views/employer_accounts.md`, `reports/source_quality.md`,
@@ -107,7 +117,8 @@ authorized scope.
 
   ```bash
   python3 scripts/jobctl.py ingest-json tmp/telegram_scan_YYYY-MM-DD.json \
-    --channel telegram --source telegram_public_channel --json
+    --channel telegram --source telegram_public_channel \
+    --defer-render --run-lease <token> --json
   ```
 
   Use `source_stream = telegram:<handle>`, the exact post URL, and stable
@@ -121,7 +132,8 @@ authorized scope.
 
   ```bash
   python3 scripts/jobctl.py check-telegram-coverage \
-    tmp/telegram_coverage_YYYY-MM-DD.json
+    tmp/telegram_coverage_YYYY-MM-DD.json \
+    --defer-render --run-lease <token>
   ```
 
   This command verifies the configured channel set, boundary, post
@@ -175,7 +187,8 @@ Example write path:
 
 ```bash
 python3 scripts/jobctl.py ingest-json tmp/daily_scan_YYYY-MM-DD.json \
-  --channel <channel> --source <source>
+  --channel <channel> --source <source> \
+  --defer-render --run-lease <token>
 ```
 
 ## Review and applications
@@ -184,8 +197,10 @@ python3 scripts/jobctl.py ingest-json tmp/daily_scan_YYYY-MM-DD.json \
 - `automation.apply_threshold` only prioritizes review. It never authorizes an
   external action, regardless of `automation.auto_apply`.
 - Before any submission, record the exact action as `authorized` with the
-  current authorization note. Record `attempted`, `blocked`, or `failed` after
-  the attempt and `visibly_confirmed` only after visible external success.
+  current authorization note, using the active deferred-write flags. Record
+  `attempted`, `blocked`, or `failed` after the attempt and
+  `visibly_confirmed` only after visible external success, again durably and
+  without an intermediate render.
 - Preserve the external draft when blocked by an unknown field.
 - Only the visibly confirmed action may create `application_confirmed`. Store
   the actual submitted resume and message variant separately from the plan.
@@ -217,7 +232,8 @@ Finish the coverage manifest with per-stream `status`, page checkpoints,
 `unique`, `known`, and `new` counts plus de-duplicated run totals. Then run:
 
 ```bash
-python3 scripts/jobctl.py check-coverage tmp/search_coverage_YYYY-MM-DD.json
+python3 scripts/jobctl.py check-coverage tmp/search_coverage_YYYY-MM-DD.json \
+  --defer-render --run-lease <token>
 ```
 
 This check is fail-closed. A missing or blocked required stream, wrong HH query
@@ -232,13 +248,21 @@ channel, and Telegram success cannot compensate for a missing HH stream.
 Run:
 
 ```bash
-python3 scripts/jobctl.py rebuild --json
+python3 scripts/jobctl.py finalize-daily-run --run-lease <token> --json
 python3 scripts/jobctl.py outcome-scorecard --as-of YYYY-MM-DD --json
 python3 scripts/jobctl.py wip-queue --as-of YYYY-MM-DD --json
 python3 scripts/jobctl.py stats
 python3 scripts/jobctl.py doctor --strict --json
 python3 scripts/jobctl.py operational-doctor --as-of YYYY-MM-DD --strict --json
 ```
+
+`finalize-daily-run` performs exactly one full render and is the run's only
+full render. It stages the complete
+generated set and atomically publishes it before releasing the lease. If it is
+interrupted or the render lock times out, the prior complete dashboard remains
+published, SQLite stays durable and dirty, and the same finalize command with
+the same token is the resumable next step. Do not start another daily run or
+manually clear the lease.
 
 Report verified counts for discovered, reviewed, needs-input, applied,
 follow-up, interviews, offers, rejections, quarantine, WIP overflow, and SLA
