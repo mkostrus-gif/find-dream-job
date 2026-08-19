@@ -177,29 +177,79 @@ authorized scope.
 
 ## Discover and screen
 
-- Use search streams and exclusions from the private preferences/scoring files.
-- Treat `search.required_streams` from local settings as a mandatory manifest,
-  not a suggestion. Before an HH scan, create a private JSON query plan with one
-  entry per required stream and run:
+- Используйте потоки поиска и исключения из приватных файлов предпочтений и
+  скоринга.
+- Считайте `search.required_streams` из локальных настроек обязательным
+  перечнем, а не рекомендацией. Для каждого обязательного потока храните
+  отдельное приватное JSON-описание запроса. Обычный поток рекомендаций не
+  закрывает независимый шаг `personal_recommendations`. Старые
+  `build-coverage-plan` и манифест v1 остаются совместимыми, но стандартный
+  запуск схемы v10 сначала фиксирует точный план P2:
 
   ```bash
-  python3 scripts/jobctl.py build-coverage-plan tmp/search_plan_YYYY-MM-DD.json \
-    --output tmp/search_coverage_YYYY-MM-DD.json
+  python3 scripts/jobctl.py plan-hh-acquisition \
+    --run-id <run_id> --stream-key <stream_key> \
+    --source-kind ordinary_search --query-json tmp/<stream>-query.json \
+    --defer-render --run-lease <token> --json
   ```
 
-  Use the generated URLs exactly. The builder supplies explicit `OR` groups,
-  `NAME`/`DESCRIPTION` scope, `search_period`, and the configured page size;
-  do not replace them with concatenated synonyms or the obsolete `period`
-  parameter.
-- Query all authorized sources; follow their terms and current access limits.
-- Use SQLite `external_id`, normalized URL, company/title, stage, and history as
-  the skip list.
-- Exhaust every results page. When a source lazy-loads cards, keep scrolling
-  until the page contains exactly `min(page_size, remaining found results)`.
-  Record `found`, every zero-based page number, and the raw extracted-card count
-  in the coverage manifest. With `items_on_page=100`, a visible first batch such
-  as 20/100 is not a complete page.
-- Normalize each result into JSON and import it with `ingest-json`.
+  Возвращённые отпечаток запроса и режим сбора сохраняются в SQLite. Изменение
+  запроса или настройки безопасности отменяет право на `delta`; не берите
+  отпечаток из текстового описания и не восстанавливайте его вручную после
+  прерывания.
+- Для рабочего сбора HH сначала используйте авторизованный встроенный браузер
+  Codex. Не переключайтесь молча в Chrome, отдельный профиль Playwright, другой
+  аккаунт, HTTP-сбор или скрытый API. Читайте только видимые данные DOM и
+  соблюдайте ограничения источника. Страница входа, CAPTCHA, отказ в доступе,
+  отсутствующий числовой ID или активный индикатор загрузки блокируют источник.
+- Получите путь и SHA-256 проверенного адаптера командой
+  `python3 scripts/jobctl.py hh-browser-adapter --json`, выполните именно эту
+  версию на разрешённой странице и вызовите
+  `FindDreamJobHHAdapter.captureListPage(...)` для обычной выдачи либо
+  `capturePersonalRecommendations(...)` для отдельного персонального источника.
+  Передайте отпечаток запроса из плана, точный номер страницы с нуля,
+  настроенный размер страницы, `page_stability_samples` и
+  `page_stability_delay_ms`.
+- Страница считается полной только после повторяющихся одинаковых наборов
+  канонических ID, стабильной высоты или явного признака конца, исчезновения
+  индикатора загрузки, отсутствия значимой мутации DOM после дополнительной
+  прокрутки вниз, валидных ID и согласованной навигации. Не принимайте 99/100
+  только потому, что страница перестала меняться. При предупреждении
+  `source_reported_count_drift` запишите первый устойчивый снимок и следуйте
+  `next-hh-work`, чтобы получить второй независимый снимок. Расхождение можно
+  снять только при одинаковых хешах ID, навигации, порядке и данных сессии.
+- Сохраняйте JSON-снимок только внутри выбранного `JOB_SEARCH_HOME` и сразу
+  записывайте его:
+
+  ```bash
+  python3 scripts/jobctl.py record-hh-page \
+    --run-id <run_id> --stream-key <stream_key> \
+    --capture tmp/<stream>-page-NNNN.json \
+    --defer-render --run-lease <token> --json
+  python3 scripts/jobctl.py next-hh-work \
+    --run-id <run_id> --stream-key <stream_key> --json
+  ```
+
+  Канонизацию ID и сверку псевдонимов выполняет код. Не передавайте модели
+  тысячи уже известных ID и не восстанавливайте состояние страницы временными
+  скриптами. Выполняйте точное действие из SQLite: повторить неустойчивый
+  снимок, проверить расхождение счётчика, продолжить со страницы N, перейти к
+  полному обходу, получить ограниченный набор новых или изменённых вакансий,
+  сверить без повторной передачи либо завершить поток.
+- Для каждого возвращённого `new` или `known_changed` ID откройте точную
+  вакансию в той же сессии встроенного браузера, вызовите
+  `FindDreamJobHHAdapter.captureVacancyDetail()` и сохраните результат через
+  `record-hh-detail`. Текст и позиция из списка не перезаписывают более сильное
+  доказательство со страницы вакансии или из жизненного цикла. В существующий
+  путь нормализации, импорта и скоринга передаются только эти ограниченные
+  детали; описания неизменившихся известных вакансий повторно не снимаются.
+- В режиме `shadow` после предсказанной границы продолжайте до фактического
+  исчерпания источника. Режимы `full` и `audit` требуют полного обхода. В
+  `delta` останавливайтесь только по доказанной границе известных результатов.
+  Если граница не доказана, продолжайте полный обход; предел безопасности
+  блокирует поток, а не объявляет его завершённым. Обычные потоки завершайте
+  через `finalize-hh-stream`, а персональные рекомендации — только через
+  `finalize-hh-personal-recommendations`.
 - Treat CAPTCHA pages, logged-out pages, access errors, malformed payloads, and
   source-aware missing required fields as quarantine records, not low-fit
   vacancies. Review `reports/quarantine.md`; reprocess only an exact record.
@@ -267,18 +317,25 @@ complete vacancy text.
 добавит новые и инвалидирует зависимые завершения. Не используйте `skipped` для
 обхода включённого обязательного условия.
 
-Finish the coverage manifest with per-stream `status`, page checkpoints,
-`unique`, `known`, and `new` counts plus de-duplicated run totals. Then run:
+Для каждого P2-потока выполните `next-hh-work` и убедитесь, что он предлагает
+финализацию, а не продолжение страницы, повторную проверку расхождения счётчика,
+очередь подробностей или разрешение блокировки. Завершите все обычные потоки и
+отдельно персональные рекомендации. Манифест v2, канонические итоги запуска и
+соответствующий рабочий элемент P1 создаются программно. Если рабочая область
+всё ещё использует совместимый прежний путь v1,
+завершите его прежней командой:
 
 ```bash
 python3 scripts/jobctl.py check-coverage tmp/search_coverage_YYYY-MM-DD.json \
   --defer-render --run-lease <token>
 ```
 
-This check is fail-closed. A missing or blocked required stream, wrong HH query
-parameters, absent page, partial lazy-load, or inconsistent totals means the run
-is incomplete. Preserve the checkpoint and report the exact blocker; never call
-the daily run complete until the command exits successfully.
+Оба пути запрещают завершение при недостаточном доказательстве. Пропущенный или
+заблокированный поток, неверный отпечаток запроса, нестабильная страница,
+непроверенное расхождение счётчика, незавершённая очередь подробностей или
+неполное доказательство границы оставляют запуск незавершённым. Сохраните
+контрольную точку и точную причину блокировки; не объявляйте ежедневный запуск
+закрытым по одному лишь успешному `doctor --strict`.
 
 When Telegram is enabled, `check-telegram-coverage` is a second mandatory
 fail-closed gate. HH coverage success cannot compensate for a missing Telegram

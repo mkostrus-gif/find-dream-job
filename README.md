@@ -75,6 +75,11 @@ It provides:
 - canonical external-ID plus persisted repost aliases, conservative
   semantic-repost deduplication, and source/evaluation history;
 - deterministic HH query plans and fail-closed stream/page/lazy-load coverage;
+- безопасное инкрементальное получение вакансий HH в схеме v10: версионированный
+  DOM-адаптер только для чтения, режимы `full`, `shadow`, `delta`, `resume` и
+  `audit`, доказательство стабильности страницы, программная сверка канонических
+  ID и псевдонимов в SQLite, отдельные персональные рекомендации, ограниченная
+  очередь деталей и периодические полные аудиты;
 - configurable public Telegram channels with a per-channel 30-day first
   backfill, success-gated post cursors, incremental daily deltas, and
   fail-closed post/ingest reconciliation;
@@ -214,6 +219,15 @@ checkpoint-daily-run-work Сохранить проверенный частич
 complete-daily-run-work   Закрыть единицу работы по проверенному манифесту
 refresh-daily-run-plan    Зафиксировать изменение конфигурации и расширить план
 finalize-daily-run        Publish one atomic final generation and release lease
+hh-browser-adapter        Найти версионированный DOM-адаптер HH только для чтения
+plan-hh-acquisition       Выбрать безопасный режим full/shadow/delta/resume/audit
+record-hh-page            Проверить снимок, сверить ID и сохранить контрольную точку P1
+record-hh-detail          Сохранить подробности только для ограниченной очереди
+next-hh-work              Показать точное безопасное продолжение потока HH
+finalize-hh-stream        Завершить обычный поток HH по манифесту v2
+finalize-hh-personal-recommendations Завершить отдельный персональный источник
+inspect-hh-checkpoint     Показать курсор и доказательства shadow/audit
+invalidate-hh-checkpoint  Явно отключить небезопасный инкрементальный курсор
 ingest-json FILE          Import structured vacancy/evaluation rows
 ingest-gmail-json FILE    Import HH or LinkedIn vacancy links extracted from Gmail
 build-coverage-plan FILE  Generate deterministic HH URLs and manifest skeleton
@@ -264,7 +278,14 @@ workspace:
 
 ```bash
 python3 scripts/benchmark_daily_run.py --rows 25000 --workflow deferred
+python3 scripts/benchmark_hh_incremental.py --streams 10 --cards 3000
 ```
+
+Тест производительности HH создаёт только одноразовые синтетические рабочие
+области, сравнивает `full` и `delta` по числу страниц, повторным загрузкам,
+объёму снимков и времени сверки, проверяет все ожидаемые новые и изменённые ID,
+а также подтверждает, что нарушение порядка и конфликтующие повторные снимки
+приводят к полному обходу или блокировке.
 
 ## Repository map
 

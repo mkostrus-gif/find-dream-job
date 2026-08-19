@@ -90,9 +90,10 @@ class AgentDocumentationTests(unittest.TestCase):
             "search.required_streams",
             "build-coverage-plan",
             "check-coverage",
-            "search_period",
-            "items_on_page=100",
-            "min(page_size, remaining found results)",
+            "plan-hh-acquisition",
+            "record-hh-page",
+            "source_reported_count_drift",
+            "доказанной границе известных результатов",
             "fail-closed",
             "reports/search_coverage.md",
         )
@@ -102,6 +103,7 @@ class AgentDocumentationTests(unittest.TestCase):
 
         settings = self.read("config/settings.example.toml")
         self.assertIn("[search]", settings)
+        self.assertIn("[search.hh_acquisition]", settings)
         self.assertIn("required_streams", settings)
         self.assertIn("[mail]", settings)
         self.assertIn("scan_linkedin_inbox = false", settings)
@@ -121,7 +123,7 @@ class AgentDocumentationTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertIn(text, daily)
 
-    def test_daily_run_documents_durable_v9_resume_contract(self) -> None:
+    def test_daily_run_documents_durable_v10_resume_contract(self) -> None:
         daily = self.read("prompts/daily_run.md")
         system = self.read("JOB_SYSTEM.md")
         architecture = self.read("docs/architecture.md")
@@ -138,6 +140,7 @@ class AgentDocumentationTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertIn(text, daily)
         for text in (
+            "схема v10",
             "схема v9",
             "daily_runs",
             "daily_run_work_items",
@@ -152,6 +155,66 @@ class AgentDocumentationTests(unittest.TestCase):
         self.assertIn("срока жизни `lease`", normalized_architecture)
         self.assertIn("[daily_run]", settings)
         self.assertIn("[[daily_run.required_gates]]", settings)
+
+    def test_p2_hh_acquisition_contract_is_public_and_fail_closed(self) -> None:
+        candidates = set(self.public_candidates())
+        self.assertIn("scripts/hh_acquisition.py", candidates)
+        self.assertIn("scripts/hh_browser_adapter.js", candidates)
+        self.assertIn("scripts/benchmark_hh_incremental.py", candidates)
+
+        daily = self.read("prompts/daily_run.md")
+        system = self.read("JOB_SYSTEM.md")
+        runbook = self.read("docs/agent-runbook.md")
+        architecture = self.read("docs/architecture.md")
+        settings = self.read("config/settings.example.toml")
+        for text in (
+            "авторизованный встроенный браузер",
+            "Не переключайтесь молча",
+            "видимые данные DOM",
+            "capturePersonalRecommendations",
+            "record-hh-detail",
+            "finalize-hh-personal-recommendations",
+            "doctor --strict",
+        ):
+            with self.subTest(text=text):
+                self.assertIn(text, daily)
+        for text in (
+            "hh-dom-v1.0.0",
+            "source_reported_count_drift",
+            "known_unchanged",
+            "duplicate_across_streams",
+            "Манифест HH v2",
+            "incremental_safety_failure",
+        ):
+            with self.subTest(text=text):
+                self.assertIn(text, system)
+        for text in (
+            "full",
+            "shadow",
+            "delta",
+            "resume",
+            "audit",
+            "hh_stream_checkpoints",
+            "hh_page_captures",
+        ):
+            with self.subTest(text=text):
+                self.assertIn(text, architecture)
+        self.assertIn("не переключайтесь молча", runbook.lower())
+        for key in (
+            "incremental_mode",
+            "minimum_overlap_pages",
+            "consecutive_known_boundary_pages",
+            "guard_page_required",
+            "checkpoint_staleness_days",
+            "shadow_runs_required",
+            "full_audit_interval_days",
+            "page_stability_samples",
+            "count_drift_recaptures",
+            "personal_max_is_completion_boundary",
+            "max_returned_ids",
+        ):
+            with self.subTest(key=key):
+                self.assertIn(key, settings)
 
     def test_daily_run_requires_complete_linkedin_mail_processing(self) -> None:
         daily = self.read("prompts/daily_run.md")

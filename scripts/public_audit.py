@@ -64,6 +64,7 @@ PRIVATE_SUFFIXES = {
     ".xlsx",
     ".zip",
 }
+PUBLIC_TEXT_FIXTURE_PREFIXES = ("tests/fixtures/",)
 
 SECRET_PATTERNS = {
     "private key": re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"),
@@ -192,7 +193,11 @@ def audit_file(path: Path, deny_literals: list[str], max_bytes: int) -> list[str
         issues.append(f"private runtime root is public: {parts[0]}")
     if path.name in PRIVATE_BASENAMES:
         issues.append(f"private filename is public: {path.name}")
-    if path.suffix.casefold() in PRIVATE_SUFFIXES:
+    synthetic_text_fixture = (
+        path.suffix.casefold() == ".html"
+        and relative.startswith(PUBLIC_TEXT_FIXTURE_PREFIXES)
+    )
+    if path.suffix.casefold() in PRIVATE_SUFFIXES and not synthetic_text_fixture:
         issues.append(f"private/binary file type is public: {path.suffix}")
     if not path.is_file():
         issues.append("candidate path is not a regular file")

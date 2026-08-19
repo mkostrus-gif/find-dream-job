@@ -157,7 +157,7 @@ items_per_page = 100
             row["factors"] = factors
         return row
 
-    def test_new_workspace_uses_schema_v9_and_safe_defaults(self) -> None:
+    def test_new_workspace_uses_schema_v10_and_safe_defaults(self) -> None:
         expected = {
             "employer_interactions",
             "employer_accounts",
@@ -167,7 +167,7 @@ items_per_page = 100
             "source_checkpoints",
         }
         with sqlite3.connect(self.database) as conn:
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 9)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 10)
             tables = {
                 row[0]
                 for row in conn.execute(
@@ -750,7 +750,7 @@ items_per_page = 100
             self.run_cli("migrate-schema", *self.config_args, "--json").stdout
         )
         self.assertEqual(migrated["from_version"], 3)
-        self.assertEqual(migrated["to_version"], 9)
+        self.assertEqual(migrated["to_version"], 10)
         self.assertEqual(migrated["backfilled_source_streams"], 1)
         self.assertTrue(migrated["backup"])
         backups = list(self.database.parent.glob("job_search.sqlite.bak-schema-v3-*"))
@@ -763,7 +763,7 @@ items_per_page = 100
                 ).fetchone()
             )
         with sqlite3.connect(self.database) as conn:
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 9)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 10)
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM vacancies").fetchone()[0], 1)
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM source_hits").fetchone()[0], 1)
             self.assertEqual(

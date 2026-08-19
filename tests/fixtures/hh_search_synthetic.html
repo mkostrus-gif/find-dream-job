@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8">
+    <title>Синтетическая выдача вакансий</title>
+    <style>
+      article { min-height: 220px; border: 1px solid #ccc; margin: 16px; padding: 12px; }
+    </style>
+  </head>
+  <body>
+    <h1 data-qa="vacancies-search-header">Найдено 4 вакансии</h1>
+    <main>
+      <article data-qa="vacancy-serp__vacancy" data-vacancy-id="910001">
+        <a data-qa="serp-item__title" href="/vacancy/910001">Синтетическая продуктовая роль A</a>
+        <span data-qa="vacancy-serp__vacancy-employer">Тестовая организация A</span>
+        <time data-qa="vacancy-serp__vacancy-published-text" datetime="2026-08-19">19 августа</time>
+      </article>
+      <article data-qa="vacancy-serp__vacancy" data-vacancy-id="910002" data-promoted="true">
+        <a data-qa="serp-item__title" href="/vacancy/910002">Синтетическая продуктовая роль B</a>
+        <span data-qa="vacancy-serp__vacancy-employer">Тестовая организация B</span>
+        <time data-qa="vacancy-serp__vacancy-published-text" datetime="2026-08-19">19 августа</time>
+      </article>
+      <article data-qa="vacancy-serp__vacancy" data-vacancy-id="910003">
+        <a data-qa="serp-item__title" href="/vacancy/910003">Синтетическая операционная роль C</a>
+        <span data-qa="vacancy-serp__vacancy-employer">Тестовая организация C</span>
+        <time data-qa="vacancy-serp__vacancy-published-text" datetime="2026-08-18">18 августа</time>
+      </article>
+    </main>
+    <a data-qa="pager-next" href="?page=1">Следующая страница</a>
+    <pre id="adapter-result">pending</pre>
+    <script src="/scripts/hh_browser_adapter.js"></script>
+    <script>
+      FindDreamJobHHAdapter.captureListPage({
+        queryFingerprint: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        pageIndex: 0,
+        pageSize: 4,
+        stabilitySamples: 3,
+        stabilityDelayMs: 10,
+        maxScrollAttempts: 8
+      }).then((capture) => {
+        document.querySelector("#adapter-result").textContent = JSON.stringify(capture);
+      }).catch((error) => {
+        document.querySelector("#adapter-result").textContent = JSON.stringify({error: String(error)});
+      });
+    </script>
+  </body>
+</html>

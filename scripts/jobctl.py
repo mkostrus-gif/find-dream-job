@@ -50,6 +50,7 @@ from telegram_source import build_telegram_plan, validate_telegram_manifest
 
 
 _DAILY_RUN_API: Any | None = None
+_HH_ACQUISITION_API: Any | None = None
 
 
 def _daily_run_api() -> Any:
@@ -69,6 +70,23 @@ def _lazy_daily_run(name: str) -> Any:
     return call
 
 
+def _hh_acquisition_api() -> Any:
+    """Load P2 acquisition only for schema or HH commands that need it."""
+    global _HH_ACQUISITION_API
+    if _HH_ACQUISITION_API is None:
+        import hh_acquisition
+
+        _HH_ACQUISITION_API = hh_acquisition
+    return _HH_ACQUISITION_API
+
+
+def _lazy_hh_acquisition(name: str) -> Any:
+    def call(*args: Any, **kwargs: Any) -> Any:
+        return getattr(_hh_acquisition_api(), name)(*args, **kwargs)
+
+    return call
+
+
 append_daily_run_transition = _lazy_daily_run("append_transition")
 bind_daily_run_lease = _lazy_daily_run("bind_lease")
 block_daily_run_work = _lazy_daily_run("block_work")
@@ -76,6 +94,8 @@ daily_run_closeout_readiness = _lazy_daily_run("closeout_readiness")
 complete_daily_run_work = _lazy_daily_run("complete_work")
 create_durable_daily_run = _lazy_daily_run("create_run")
 ensure_v9_schema = _lazy_daily_run("ensure_v9_schema")
+ensure_v10_schema = _lazy_hh_acquisition("ensure_v10_schema")
+schema_v10_contract_issues = _lazy_hh_acquisition("schema_v10_issues")
 enter_daily_run_finalizing = _lazy_daily_run("enter_finalizing")
 final_render_already_published = _lazy_daily_run("final_render_already_published")
 get_durable_daily_run = _lazy_daily_run("get_run")
@@ -94,7 +114,7 @@ start_daily_run_work = _lazy_daily_run("start_work")
 
 
 CODE_ROOT = Path(__file__).resolve().parents[1]
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 DEFAULT_LOCK_TIMEOUT_SECONDS = 30.0
 DEFAULT_DAILY_RUN_LEASE_SECONDS = 4 * 60 * 60
 MAX_DAILY_RUN_LEASE_SECONDS = 24 * 60 * 60
@@ -344,6 +364,14 @@ EXPECTED_TABLES = {
     "daily_run_work_items",
     "daily_run_manifests",
     "daily_run_transitions",
+    "hh_stream_checkpoints",
+    "hh_stream_checkpoint_history",
+    "hh_stream_runs",
+    "hh_page_captures",
+    "hh_page_items",
+    "hh_vacancy_snapshots",
+    "hh_detail_queue",
+    "hh_incremental_events",
     "migration_log",
     "outreach_messages",
     "policy_versions",
@@ -374,6 +402,13 @@ EXPECTED_INDEXES = {
     "idx_daily_run_work_items_state",
     "idx_daily_run_manifests_lookup",
     "idx_daily_run_transitions_lookup",
+    "idx_hh_stream_checkpoints_eligibility",
+    "idx_hh_checkpoint_history_lookup",
+    "idx_hh_stream_runs_state",
+    "idx_hh_page_captures_lookup",
+    "idx_hh_page_items_external",
+    "idx_hh_detail_queue_state",
+    "idx_hh_incremental_events_lookup",
     "idx_employer_account_signals_account",
     "idx_employer_interaction_invalidations_vacancy",
     "idx_employer_interactions_identity",
@@ -1823,6 +1858,11 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             raise RuntimeError(
                 "Нарушен контракт схемы базы данных v9: " + "; ".join(v9_issues)
             )
+        v10_issues = schema_v10_contract_issues(conn)
+        if v10_issues:
+            raise RuntimeError(
+                "Нарушен контракт схемы базы данных v10: " + "; ".join(v10_issues)
+            )
 
 
 def reset_schema(conn: sqlite3.Connection) -> None:
@@ -1830,6 +1870,14 @@ def reset_schema(conn: sqlite3.Connection) -> None:
         """
         DROP VIEW IF EXISTS effective_applications;
         DROP VIEW IF EXISTS effective_employer_interactions;
+        DROP TABLE IF EXISTS hh_incremental_events;
+        DROP TABLE IF EXISTS hh_detail_queue;
+        DROP TABLE IF EXISTS hh_vacancy_snapshots;
+        DROP TABLE IF EXISTS hh_page_items;
+        DROP TABLE IF EXISTS hh_page_captures;
+        DROP TABLE IF EXISTS hh_stream_runs;
+        DROP TABLE IF EXISTS hh_stream_checkpoint_history;
+        DROP TABLE IF EXISTS hh_stream_checkpoints;
         DROP TABLE IF EXISTS daily_run_transitions;
         DROP TABLE IF EXISTS daily_run_manifests;
         DROP TABLE IF EXISTS daily_run_work_items;
@@ -2241,6 +2289,7 @@ def reset_schema(conn: sqlite3.Connection) -> None:
     ensure_v7_schema(conn)
     ensure_v8_schema(conn)
     ensure_v9_schema(conn)
+    ensure_v10_schema(conn)
     ensure_active_policy(conn)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
@@ -2527,6 +2576,7 @@ def ensure_auxiliary_schema(conn: sqlite3.Connection) -> None:
     ensure_v7_schema(conn)
     ensure_v8_schema(conn)
     ensure_v9_schema(conn)
+    ensure_v10_schema(conn)
     ensure_active_policy(conn)
     conn.commit()
 
@@ -8996,6 +9046,45 @@ def pause_daily_run_command(args: argparse.Namespace) -> None:
     )
 
 
+_DAILY_RUN_STATUS_LABELS = {
+    "running": "выполняется",
+    "paused": "приостановлен",
+    "finalizing": "завершается",
+    "completed": "завершён",
+    "blocked": "заблокирован",
+}
+
+_SAFE_ACTION_LABELS = {
+    "start": "начать работу",
+    "reconcile_without_resend": "сверить состояние без повторной отправки",
+    "continue_from_checkpoint": "продолжить с контрольной точки",
+    "retry_after_blocker": "повторить после устранения блокировки",
+    "resolve_blocker": "устранить блокировку",
+    "reverify": "повторно проверить доказательство",
+    "continue_authorized_work": "продолжить разрешённое действие",
+    "review_draft": "проверить черновик",
+    "finalize": "завершить ежедневный запуск",
+    "refresh_plan": "обновить зафиксированный план",
+    "build_hh_acquisition_plan": "построить план получения HH",
+    "resolve_hh_capture_blocker": "устранить блокировку снимка HH",
+    "verify_count_drift": "проверить расхождение счётчика повторным снимком",
+    "repeat_unstable_capture": "повторить неустойчивый снимок страницы",
+    "fetch_bounded_new_changed_details": "получить ограниченные подробности новых и изменённых вакансий",
+    "fetch_details": "получить ограниченные подробности вакансий",
+    "finalize_hh_stream": "завершить поток HH",
+    "finalize_stream": "завершить поток HH",
+    "continue_full_scan_after_fallback": "продолжить полный обход после безопасного отката",
+    "continue_from_page": "продолжить со следующей проверенной страницы",
+    "continue_stable_page_capture": "снять следующую устойчивую страницу",
+    "capture_stable_page": "снять устойчивую страницу",
+    "stream_complete": "поток завершён",
+}
+
+
+def _safe_action_label(action: str) -> str:
+    return _SAFE_ACTION_LABELS.get(action, action)
+
+
 def daily_run_status_command(args: argparse.Namespace) -> None:
     with connect_db(args.db) as conn:
         ensure_schema(conn)
@@ -9015,21 +9104,22 @@ def daily_run_status_command(args: argparse.Namespace) -> None:
         print(result["message"])
         return
     counts = status["counts"]
+    status_label = _DAILY_RUN_STATUS_LABELS.get(str(status["status"]), status["status"])
     print(
-        f"Ежедневный запуск {status['run_id']}: {status['status']}; "
+        f"Ежедневный запуск {status['run_id']}: {status_label}; "
         f"готово {counts['completed']}/{counts['total_required']}; "
         f"заблокировано={counts['blocked']}; требует проверки={counts['needs_verification']}."
     )
     projection = status["projection_state"]
     print(
-        f"  проекции: {'dirty' if projection['dirty'] else 'fresh'} "
+        f"  проекции: {'требуют публикации' if projection['dirty'] else 'актуальны'} "
         f"{projection['rendered_revision']}/{projection['dirty_revision']}"
     )
     if status["configuration_drift"]:
         print("  конфигурация изменилась: требуется аудируемый refresh-daily-run-plan")
     for item in status["next_safe_work"][:5]:
         suffix = f"/{item['item_key']}" if item["item_key"] else ""
-        print(f"  дальше: {item['action']} · {item['step_key']}{suffix}")
+        print(f"  дальше: {_safe_action_label(str(item['action']))} · {item['step_key']}{suffix}")
     if status["resume_command"]:
         print(f"  возобновление: {status['resume_command']}")
 
@@ -9475,6 +9565,404 @@ def finalize_daily_run_command(args: argparse.Namespace) -> None:
             )
 
 
+def _workspace_json_path(path: Path, *, label: str) -> Path:
+    candidate = path if path.is_absolute() else ROOT / path
+    resolved = candidate.resolve()
+    try:
+        resolved.relative_to(ROOT.resolve())
+    except ValueError as exc:
+        raise ValueError(f"{label} должен находиться внутри выбранной рабочей области.") from exc
+    if not resolved.is_file():
+        raise FileNotFoundError(f"{label} не найден: {resolved}")
+    return resolved
+
+
+def _load_workspace_json(path: Path, *, label: str) -> Any:
+    resolved = _workspace_json_path(path, label=label)
+    return json.loads(resolved.read_text(encoding="utf-8"))
+
+
+def hh_browser_adapter_command(args: argparse.Namespace) -> None:
+    path = CODE_ROOT / "scripts" / "hh_browser_adapter.js"
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    result = {
+        "adapter_version": _hh_acquisition_api().ADAPTER_VERSION,
+        "path": str(path),
+        "sha256": digest,
+        "read_only": True,
+        "capture_contracts": [
+            _hh_acquisition_api().PAGE_CAPTURE_KIND,
+            _hh_acquisition_api().DETAIL_CAPTURE_KIND,
+        ],
+    }
+    if args.print_source:
+        print(path.read_text(encoding="utf-8"))
+    elif args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print(f"DOM-адаптер HH только для чтения {_hh_acquisition_api().ADAPTER_VERSION}: {path}")
+        print(f"  SHA-256: {digest}")
+
+
+def validate_hh_capture_command(args: argparse.Namespace) -> None:
+    payload = _load_workspace_json(args.capture, label="JSON-снимок")
+    api = _hh_acquisition_api()
+    if args.detail:
+        normalized = api.validate_detail_capture(payload)
+        result: dict[str, Any] = {
+            "ok": True,
+            "capture_contract": normalized["capture_contract"],
+            "adapter_version": normalized["adapter_version"],
+            "external_id": normalized["external_id"],
+            "capture_hash": normalized["capture_hash"],
+            "field_names": sorted(normalized["fields"]),
+        }
+    else:
+        normalized = api.validate_page_capture(payload, SETTINGS)
+        result = {
+            "ok": True,
+            "capture_contract": normalized["capture_contract"],
+            "adapter_version": normalized["adapter_version"],
+            "source_kind": normalized["source_kind"],
+            "page_index": normalized["page_index"],
+            "stable": normalized["stable"],
+            "capture_hash": normalized["capture_hash"],
+            "canonical_id_set_hash": normalized["canonical_id_set_hash"],
+            "raw_card_count": normalized["raw_card_count"],
+            "canonical_unique_count": normalized["canonical_unique_count"],
+            "requires_count_drift_recapture": normalized[
+                "requires_count_drift_recapture"
+            ],
+            "warnings": normalized["warnings"],
+            "blockers": normalized["blockers"],
+        }
+    if args.verbose:
+        result["normalized_capture"] = normalized
+    print(json.dumps(result, ensure_ascii=False, indent=2)) if args.json else print(
+        "Снимок DOM прошёл структурную проверку."
+    )
+
+
+def plan_hh_acquisition_command(args: argparse.Namespace) -> None:
+    if bool(args.query_json) == bool(args.query_fingerprint):
+        raise ValueError("Укажите ровно одно: --query-json или --query-fingerprint.")
+    api = _hh_acquisition_api()
+    query_fingerprint = clean_cell(args.query_fingerprint).lower()
+    if args.query_json:
+        query_payload = _load_workspace_json(args.query_json, label="JSON-план запроса")
+        query_fingerprint = api.query_fingerprint_from_payload(query_payload)
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        run_id, _ = _require_exact_durable_lease(conn, args)
+        before = conn.total_changes
+        result = api.build_acquisition_plan(
+            conn,
+            SETTINGS,
+            run_id=run_id,
+            stream_key=args.stream_key,
+            source_kind=args.source_kind,
+            query_fingerprint=query_fingerprint,
+        )
+        changed = conn.total_changes > before
+        revision = (
+            commit_projection_write(conn)
+            if changed
+            else projection_state_data(conn)["dirty_revision"]
+        )
+    result["projection_revision"] = revision
+    result["message"] = (
+        f"План сбора HH сохранён: режим={result['acquisition_mode']}, "
+        f"следующая страница={result['next_page']}."
+    )
+    _daily_run_mutation_result(args, result)
+
+
+def _p2_checkpoint_or_block(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    stream_key: str,
+    result: Mapping[str, Any],
+) -> dict[str, Any]:
+    api = _hh_acquisition_api()
+    stream = conn.execute(
+        "SELECT source_kind FROM hh_stream_runs WHERE run_id = ? AND source = 'hh' AND stream_key = ?",
+        (run_id, stream_key),
+    ).fetchone()
+    if stream is None:
+        raise RuntimeError("Состояние потока P2 не найдено после записи снимка DOM.")
+    target = api.p1_target(
+        conn,
+        run_id=run_id,
+        stream_key=stream_key,
+        source_kind=str(stream["source_kind"]),
+    )
+    changed = False
+    if not bool(result.get("idempotent")):
+        manifest = api.build_p1_checkpoint_manifest(
+            conn,
+            SETTINGS,
+            run_id=run_id,
+            stream_key=stream_key,
+        )
+        changed = checkpoint_daily_run_work(
+            conn,
+            SETTINGS,
+            run_id=run_id,
+            step_key=target["step_key"],
+            item_key=target["item_key"],
+            manifest=manifest,
+        )
+    current = conn.execute(
+        "SELECT state, blocker_code, blocker_reason FROM hh_stream_runs WHERE run_id = ? AND source = 'hh' AND stream_key = ?",
+        (run_id, stream_key),
+    ).fetchone()
+    if current is not None and current["state"] == "blocked":
+        changed = block_daily_run_work(
+            conn,
+            run_id=run_id,
+            step_key=target["step_key"],
+            item_key=target["item_key"],
+            code=str(current["blocker_code"] or "hh_capture_blocked"),
+            reason=str(current["blocker_reason"] or "Снимок HH заблокирован."),
+            retryable=True,
+        ) or changed
+    return {"target": target, "changed": changed}
+
+
+def record_hh_page_command(args: argparse.Namespace) -> None:
+    payload = _load_workspace_json(args.capture, label="JSON-снимок")
+    failure: str | None = None
+    result: dict[str, Any]
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        run_id, _ = _require_exact_durable_lease(conn, args)
+        try:
+            result = _hh_acquisition_api().record_page_capture(
+                conn,
+                SETTINGS,
+                run_id=run_id,
+                stream_key=args.stream_key,
+                payload=payload,
+            )
+            integration = _p2_checkpoint_or_block(
+                conn,
+                run_id=run_id,
+                stream_key=args.stream_key,
+                result=result,
+            )
+            if args.verbose:
+                result["complete_reconciliation"] = [
+                    dict(row)
+                    for row in conn.execute(
+                        """
+                        SELECT page_index, ordinal, external_id, vacancy_id,
+                               base_classification, classification
+                        FROM hh_page_items
+                        WHERE run_id = ? AND source = 'hh' AND stream_key = ?
+                        ORDER BY page_index, ordinal
+                        """,
+                        (run_id, args.stream_key),
+                    ).fetchall()
+                ]
+        except (ValueError, RuntimeError) as exc:
+            failure = str(exc)
+            target = _hh_acquisition_api().record_validation_failure(
+                conn,
+                run_id=run_id,
+                stream_key=args.stream_key,
+                code="capture_validation_failed",
+                reason=failure,
+            )
+            block_daily_run_work(
+                conn,
+                run_id=run_id,
+                step_key=target["step_key"],
+                item_key=target["item_key"],
+                code="capture_validation_failed",
+                reason=failure,
+                retryable=True,
+            )
+            result = {
+                "run_id": run_id,
+                "stream_key": args.stream_key,
+                "ok": False,
+                "blocker": {"code": "capture_validation_failed", "reason": failure},
+            }
+            integration = {"target": target, "changed": True}
+        revision = (
+            commit_projection_write(conn)
+            if not bool(result.get("idempotent")) or bool(integration.get("changed"))
+            else projection_state_data(conn)["dirty_revision"]
+        )
+    result["p1_integration"] = integration
+    result["projection_revision"] = revision
+    result["message"] = (
+        "Снимок страницы HH записан; идентификаторы сверены программно."
+        if failure is None
+        else "Снимок HH заблокирован из-за проверяемой ошибки."
+    )
+    _daily_run_mutation_result(args, result)
+    if failure is not None:
+        raise RuntimeError(failure)
+
+
+def record_hh_detail_command(args: argparse.Namespace) -> None:
+    payload = _load_workspace_json(args.capture, label="JSON-снимок вакансии")
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        run_id, _ = _require_exact_durable_lease(conn, args)
+        result = _hh_acquisition_api().record_detail_capture(
+            conn,
+            SETTINGS,
+            run_id=run_id,
+            stream_key=args.stream_key,
+            payload=payload,
+        )
+        integration = _p2_checkpoint_or_block(
+            conn,
+            run_id=run_id,
+            stream_key=args.stream_key,
+            result=result,
+        )
+        revision = (
+            commit_projection_write(conn)
+            if not bool(result.get("idempotent")) or bool(integration.get("changed"))
+            else projection_state_data(conn)["dirty_revision"]
+        )
+    result["p1_integration"] = integration
+    result["projection_revision"] = revision
+    result["message"] = "Снимок вакансии сохранён как доказательство из видимой страницы."
+    _daily_run_mutation_result(args, result)
+
+
+def _finalize_hh_acquisition(args: argparse.Namespace, *, personal: bool) -> None:
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        run_id, _ = _require_exact_durable_lease(conn, args)
+        stream = conn.execute(
+            "SELECT source_kind FROM hh_stream_runs WHERE run_id = ? AND source = 'hh' AND stream_key = ?",
+            (run_id, args.stream_key),
+        ).fetchone()
+        if stream is None:
+            raise ValueError("Поток сбора HH не найден.")
+        expected = "personal_recommendations" if personal else "ordinary_search"
+        if str(stream["source_kind"]) != expected:
+            raise ValueError("Команда завершения не соответствует виду источника потока.")
+        result = _hh_acquisition_api().finalize_stream(
+            conn,
+            SETTINGS,
+            run_id=run_id,
+            stream_key=args.stream_key,
+        )
+        target = _hh_acquisition_api().p1_target(
+            conn,
+            run_id=run_id,
+            stream_key=args.stream_key,
+            source_kind=expected,
+        )
+        if result.get("audit_failure"):
+            changed = block_daily_run_work(
+                conn,
+                run_id=run_id,
+                step_key=target["step_key"],
+                item_key=target["item_key"],
+                code=result["blocker"]["code"],
+                reason=result["blocker"]["reason"],
+                retryable=True,
+            )
+        else:
+            changed = complete_daily_run_work(
+                conn,
+                SETTINGS,
+                run_id=run_id,
+                step_key=target["step_key"],
+                item_key=target["item_key"],
+                manifest=result["manifest"],
+            )
+        revision = (
+            commit_projection_write(conn)
+            if not bool(result.get("idempotent")) or bool(changed)
+            else projection_state_data(conn)["dirty_revision"]
+        )
+    result.pop("manifest", None)
+    result["p1_integration"] = {"target": target, "changed": changed}
+    result["projection_revision"] = revision
+    result["message"] = (
+        "Персональные рекомендации завершены по отдельному манифесту v2."
+        if personal and not result.get("audit_failure")
+        else "Поток HH завершён по манифесту v2."
+        if not result.get("audit_failure")
+        else "Расхождение полного аудита заблокировало инкрементальную контрольную точку."
+    )
+    _daily_run_mutation_result(args, result)
+    if result.get("audit_failure"):
+        raise RuntimeError(result["blocker"]["reason"])
+
+
+def finalize_hh_stream_command(args: argparse.Namespace) -> None:
+    _finalize_hh_acquisition(args, personal=False)
+
+
+def finalize_hh_personal_command(args: argparse.Namespace) -> None:
+    _finalize_hh_acquisition(args, personal=True)
+
+
+def next_hh_work_command(args: argparse.Namespace) -> None:
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        result = _hh_acquisition_api().next_acquisition_work(
+            conn,
+            SETTINGS,
+            run_id=args.run_id,
+            stream_key=clean_cell(args.stream_key) or None,
+        )
+    print(json.dumps(result, ensure_ascii=False, indent=2)) if args.json else print(
+        "\n".join(
+            f"{item['stream_key']}: "
+            f"{_safe_action_label(str(item['next_safe_action']['action']))}"
+            for item in result["work"]
+        )
+        or "Активная работа по сбору HH не найдена."
+    )
+
+
+def inspect_hh_checkpoint_command(args: argparse.Namespace) -> None:
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        result = _hh_acquisition_api().inspect_checkpoint_state(
+            conn,
+            stream_key=clean_cell(args.stream_key) or None,
+            run_id=clean_cell(args.run_id) or None,
+            history_limit=args.history_limit,
+        )
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print(
+            f"Контрольные точки HH: {len(result['checkpoints'])}; "
+            f"запуски: {len(result['runs'])}; события: {len(result['events'])}."
+        )
+
+
+def invalidate_hh_checkpoint_command(args: argparse.Namespace) -> None:
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        run_id, _ = _require_exact_durable_lease(conn, args)
+        result = _hh_acquisition_api().invalidate_checkpoint(
+            conn,
+            run_id=run_id,
+            stream_key=args.stream_key,
+            reason=args.reason,
+        )
+        revision = commit_projection_write(conn)
+    result["projection_revision"] = revision
+    result["message"] = (
+        "Небезопасная контрольная точка HH явно инвалидирована; режим delta запрещён."
+    )
+    _daily_run_mutation_result(args, result)
+
+
 def migrate_schema(args: argparse.Namespace) -> None:
     """Explicitly migrate an existing database with a recoverable backup."""
 
@@ -9521,7 +10009,7 @@ def migrate_schema(args: argparse.Namespace) -> None:
             "employer_accounts",
             "source_checkpoints",
         )
-        if current_version == 8:
+        if current_version in {8, 9}:
             preserved_tables += (
                 "lifecycle_events",
                 "action_events",
@@ -9532,6 +10020,13 @@ def migrate_schema(args: argparse.Namespace) -> None:
                 "external_actions",
                 "daily_run_leases",
                 "projection_state",
+                "daily_runs",
+                "daily_run_plan_revisions",
+                "daily_run_steps",
+                "daily_run_step_dependencies",
+                "daily_run_work_items",
+                "daily_run_manifests",
+                "daily_run_transitions",
             )
         present_before = {
             str(row[0])
@@ -9573,7 +10068,11 @@ def migrate_schema(args: argparse.Namespace) -> None:
                     db_label(backup_path) if backup_path else "",
                     json.dumps(row_counts_before, ensure_ascii=False, sort_keys=True),
                     (
-                        "Добавлен долговечный контур управления ежедневным запуском v9; "
+                        "Добавлен безопасный инкрементальный контур HH P2 схемы v10; "
+                        "доказательства P0/P1 и опубликованные поколения проекций сохранены "
+                        "без переписывания."
+                        if current_version == 9
+                        else "Добавлены долговечная оркестрация P1 и безопасный контур HH P2; "
                         "доказательства и опубликованные поколения проекций сохранены "
                         "без переписывания."
                         if current_version == 8
@@ -12403,6 +12902,7 @@ def doctor(args: argparse.Namespace) -> None:
                 v7_contract_issues = schema_v7_issues(conn)
                 v8_contract_issues = schema_v8_issues(conn)
                 v9_contract_issues = schema_v9_issues(conn)
+                v10_contract_issues = schema_v10_contract_issues(conn)
                 foreign_key_issues = len(conn.execute("PRAGMA foreign_key_check").fetchall())
                 missing_canonical_streams = (
                     int(
@@ -12507,6 +13007,11 @@ def doctor(args: argparse.Namespace) -> None:
                 "; ".join(v9_contract_issues) or "Контракт v9 соблюдён.",
             )
             add(
+                "database_schema_v10_contract",
+                not v10_contract_issues,
+                "; ".join(v10_contract_issues) or "Контракт v10 соблюдён.",
+            )
+            add(
                 "database_canonical_source_streams",
                 missing_canonical_streams == 0,
                 f"Записей без канонического потока: {missing_canonical_streams}.",
@@ -12600,6 +13105,120 @@ def latest_completed_coverage(
         """,
         (source,),
     ).fetchone()
+
+
+def _validated_p2_completion_payload(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    step_key: str,
+    item_key: str,
+    manifest_hash: str,
+    manifest_kind: str,
+    source_kind: str,
+) -> dict[str, Any] | None:
+    """Return one exact immutable HH v2 completion manifest, if present."""
+
+    if not manifest_hash:
+        return None
+    row = conn.execute(
+        """
+        SELECT payload_json
+        FROM daily_run_manifests
+        WHERE run_id = ? AND step_key = ? AND item_key = ?
+          AND payload_hash = ? AND manifest_kind = ?
+          AND record_type = 'completion' AND validation_status = 'validated'
+        ORDER BY id DESC LIMIT 1
+        """,
+        (run_id, step_key, item_key, manifest_hash, manifest_kind),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(str(row["payload_json"]))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    scope = payload.get("captured_scope")
+    if not isinstance(scope, dict):
+        return None
+    if not (
+        payload.get("manifest_version") == 2
+        and payload.get("run_id") == run_id
+        and payload.get("step_key") == step_key
+        and payload.get("item_key") == item_key
+        and payload.get("kind") == manifest_kind
+        and payload.get("remote_boundary_verified") is True
+        and payload.get("blockers") == []
+        and scope.get("source_kind") == source_kind
+    ):
+        return None
+    return payload
+
+
+def _p2_ordinary_hh_coverage_complete(
+    conn: sqlite3.Connection, *, run_id: str
+) -> bool:
+    step = conn.execute(
+        """
+        SELECT required, state FROM daily_run_steps
+        WHERE run_id = ? AND step_key = 'hh_coverage'
+        """,
+        (run_id,),
+    ).fetchone()
+    if step is None or not bool(step["required"]) or step["state"] != "completed":
+        return False
+    items = conn.execute(
+        """
+        SELECT item_key, state, manifest_hash
+        FROM daily_run_work_items
+        WHERE run_id = ? AND step_key = 'hh_coverage' AND required = 1
+        ORDER BY order_no, item_key
+        """,
+        (run_id,),
+    ).fetchall()
+    if not items:
+        return False
+    return all(
+        item["state"] == "completed"
+        and _validated_p2_completion_payload(
+            conn,
+            run_id=run_id,
+            step_key="hh_coverage",
+            item_key=str(item["item_key"]),
+            manifest_hash=str(item["manifest_hash"] or ""),
+            manifest_kind="hh_stream",
+            source_kind="ordinary_search",
+        )
+        is not None
+        for item in items
+    )
+
+
+def _p2_personal_hh_coverage_complete(
+    conn: sqlite3.Connection, *, run_id: str
+) -> bool:
+    step = conn.execute(
+        """
+        SELECT required, state, manifest_hash FROM daily_run_steps
+        WHERE run_id = ? AND step_key = 'personal_recommendations'
+        """,
+        (run_id,),
+    ).fetchone()
+    return bool(
+        step
+        and bool(step["required"])
+        and step["state"] == "completed"
+        and _validated_p2_completion_payload(
+            conn,
+            run_id=run_id,
+            step_key="personal_recommendations",
+            item_key="",
+            manifest_hash=str(step["manifest_hash"] or ""),
+            manifest_kind="source_gate",
+            source_kind="personal_recommendations",
+        )
+        is not None
+    )
 
 
 def operational_doctor(args: argparse.Namespace) -> None:
@@ -12868,30 +13487,37 @@ def operational_doctor(args: argparse.Namespace) -> None:
                     blocks_closeout=True,
                 )
 
-                coverage_fresh = False
+                exact_run_id = clean_cell(getattr(args, "run_id", ""))
+                coverage_fresh = bool(
+                    exact_run_id
+                    and _p2_ordinary_hh_coverage_complete(conn, run_id=exact_run_id)
+                )
                 coverage_source = ""
-                for run in conn.execute(
-                    """
-                    SELECT id, source FROM search_runs
-                    WHERE run_date = ? AND status = 'completed'
-                    ORDER BY id DESC
-                    """,
-                    (as_of.isoformat(),),
-                ).fetchall():
-                    completed_streams = {
-                        str(row["stream_key"])
-                        for row in conn.execute(
-                            """
-                            SELECT stream_key FROM search_coverage
-                            WHERE search_run_id = ? AND status = 'completed'
-                            """,
-                            (int(run["id"]),),
-                        ).fetchall()
-                    }
-                    if set(REQUIRED_SEARCH_STREAMS).issubset(completed_streams):
-                        coverage_fresh = True
-                        coverage_source = str(run["source"])
-                        break
+                if coverage_fresh:
+                    coverage_source = f"HH v2 запуска {exact_run_id}"
+                else:
+                    for run in conn.execute(
+                        """
+                        SELECT id, source FROM search_runs
+                        WHERE run_date = ? AND status = 'completed'
+                        ORDER BY id DESC
+                        """,
+                        (as_of.isoformat(),),
+                    ).fetchall():
+                        completed_streams = {
+                            str(row["stream_key"])
+                            for row in conn.execute(
+                                """
+                                SELECT stream_key FROM search_coverage
+                                WHERE search_run_id = ? AND status = 'completed'
+                                """,
+                                (int(run["id"]),),
+                            ).fetchall()
+                        }
+                        if set(REQUIRED_SEARCH_STREAMS).issubset(completed_streams):
+                            coverage_fresh = True
+                            coverage_source = str(run["source"])
+                            break
                 add(
                     "required_search_coverage",
                     "pass" if coverage_fresh else "fail",
@@ -12904,21 +13530,28 @@ def operational_doctor(args: argparse.Namespace) -> None:
                 )
 
                 if PERSONAL_RECOMMENDATIONS_ENABLED:
-                    personal = conn.execute(
-                        """
-                        SELECT sr.run_date, sr.status
-                        FROM search_runs sr
-                        JOIN search_coverage sc ON sc.search_run_id = sr.id
-                        WHERE sc.stream_key = ? AND sc.status = 'completed'
-                        ORDER BY sr.run_date DESC, sr.id DESC LIMIT 1
-                        """,
-                        (PERSONAL_RECOMMENDATION_STREAM,),
-                    ).fetchone()
                     personal_ok = bool(
-                        personal
-                        and personal["status"] == "completed"
-                        and personal["run_date"] == as_of.isoformat()
+                        exact_run_id
+                        and _p2_personal_hh_coverage_complete(
+                            conn, run_id=exact_run_id
+                        )
                     )
+                    if not personal_ok:
+                        personal = conn.execute(
+                            """
+                            SELECT sr.run_date, sr.status
+                            FROM search_runs sr
+                            JOIN search_coverage sc ON sc.search_run_id = sr.id
+                            WHERE sc.stream_key = ? AND sc.status = 'completed'
+                            ORDER BY sr.run_date DESC, sr.id DESC LIMIT 1
+                            """,
+                            (PERSONAL_RECOMMENDATION_STREAM,),
+                        ).fetchone()
+                        personal_ok = bool(
+                            personal
+                            and personal["status"] == "completed"
+                            and personal["run_date"] == as_of.isoformat()
+                        )
                     add(
                         "personal_recommendation_coverage",
                         "pass" if personal_ok else "fail",
@@ -12965,7 +13598,6 @@ def operational_doctor(args: argparse.Namespace) -> None:
                         "Инкрементальные Telegram-источники выключены.",
                     )
 
-                exact_run_id = clean_cell(getattr(args, "run_id", ""))
                 if exact_run_id:
                     durable = get_durable_daily_run(conn, exact_run_id)
                     if durable is None:
@@ -13335,6 +13967,108 @@ def build_parser() -> argparse.ArgumentParser:
     refresh_plan_parser.add_argument("--reason", required=True)
     refresh_plan_parser.add_argument("--json", action="store_true")
     refresh_plan_parser.set_defaults(func=refresh_daily_run_plan_command)
+
+    hh_adapter_parser = sub.add_parser(
+        "hh-browser-adapter",
+        help="Показать проверенный DOM-адаптер HH только для чтения и его SHA-256",
+    )
+    hh_adapter_parser.add_argument("--print-source", action="store_true")
+    hh_adapter_parser.add_argument("--json", action="store_true")
+    hh_adapter_parser.set_defaults(func=hh_browser_adapter_command)
+
+    hh_validate_parser = sub.add_parser(
+        "validate-hh-capture",
+        help="Строго проверить синтетический снимок DOM HH без записи в SQLite",
+    )
+    hh_validate_parser.add_argument("--capture", type=Path, required=True)
+    hh_validate_parser.add_argument("--detail", action="store_true")
+    hh_validate_parser.add_argument("--verbose", action="store_true")
+    hh_validate_parser.add_argument("--json", action="store_true")
+    hh_validate_parser.set_defaults(func=validate_hh_capture_command)
+
+    def add_hh_run_stream_target(target: argparse.ArgumentParser) -> None:
+        target.add_argument("--db", type=Path, default=DB_PATH)
+        target.add_argument("--run-id", required=True)
+        target.add_argument("--stream-key", required=True)
+        target.add_argument("--json", action="store_true")
+
+    hh_plan_parser = sub.add_parser(
+        "plan-hh-acquisition",
+        help="Зафиксировать план full/shadow/delta/resume/audit точного потока HH в P1",
+    )
+    add_hh_run_stream_target(hh_plan_parser)
+    hh_plan_parser.add_argument(
+        "--source-kind",
+        choices=("ordinary_search", "personal_recommendations"),
+        required=True,
+    )
+    hh_plan_parser.add_argument("--query-json", type=Path, default=None)
+    hh_plan_parser.add_argument("--query-fingerprint", default="")
+    hh_plan_parser.set_defaults(func=plan_hh_acquisition_command)
+
+    hh_record_parser = sub.add_parser(
+        "record-hh-page",
+        help="Записать устойчивый снимок страницы, сверенные ID и манифест контрольной точки P1 v2",
+    )
+    add_hh_run_stream_target(hh_record_parser)
+    hh_record_parser.add_argument("--capture", type=Path, required=True)
+    hh_record_parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Явно вывести полную сверку вместо ограниченного результата",
+    )
+    hh_record_parser.set_defaults(func=record_hh_page_command)
+
+    hh_detail_parser = sub.add_parser(
+        "record-hh-detail",
+        help="Сохранить снимок вакансии только для ограниченной очереди новых и изменённых ID",
+    )
+    add_hh_run_stream_target(hh_detail_parser)
+    hh_detail_parser.add_argument("--capture", type=Path, required=True)
+    hh_detail_parser.set_defaults(func=record_hh_detail_command)
+
+    hh_next_parser = sub.add_parser(
+        "next-hh-work",
+        help="Показать следующий безопасный шаг сбора, детализации или завершения HH",
+    )
+    hh_next_parser.add_argument("--db", type=Path, default=DB_PATH)
+    hh_next_parser.add_argument("--run-id", required=True)
+    hh_next_parser.add_argument("--stream-key", default="")
+    hh_next_parser.add_argument("--json", action="store_true")
+    hh_next_parser.set_defaults(func=next_hh_work_command)
+
+    hh_finalize_parser = sub.add_parser(
+        "finalize-hh-stream",
+        help="Завершить обычный поток HH по полному обходу или доказанной границе delta",
+    )
+    add_hh_run_stream_target(hh_finalize_parser)
+    hh_finalize_parser.set_defaults(func=finalize_hh_stream_command)
+
+    hh_personal_finalize_parser = sub.add_parser(
+        "finalize-hh-personal-recommendations",
+        help="Отдельно завершить персональные рекомендации по собственному манифесту v2",
+    )
+    add_hh_run_stream_target(hh_personal_finalize_parser)
+    hh_personal_finalize_parser.set_defaults(func=finalize_hh_personal_command)
+
+    hh_inspect_parser = sub.add_parser(
+        "inspect-hh-checkpoint",
+        help="Показать контрольную точку, доказательства shadow/audit и состояние потоков HH",
+    )
+    hh_inspect_parser.add_argument("--db", type=Path, default=DB_PATH)
+    hh_inspect_parser.add_argument("--run-id", default="")
+    hh_inspect_parser.add_argument("--stream-key", default="")
+    hh_inspect_parser.add_argument("--history-limit", type=int, default=20)
+    hh_inspect_parser.add_argument("--json", action="store_true")
+    hh_inspect_parser.set_defaults(func=inspect_hh_checkpoint_command)
+
+    hh_invalidate_parser = sub.add_parser(
+        "invalidate-hh-checkpoint",
+        help="Аудируемо запретить небезопасную контрольную точку delta для точного потока HH",
+    )
+    add_hh_run_stream_target(hh_invalidate_parser)
+    hh_invalidate_parser.add_argument("--reason", required=True)
+    hh_invalidate_parser.set_defaults(func=invalidate_hh_checkpoint_command)
 
     stats_parser = sub.add_parser("stats", help="Вывести текущие показатели базы")
     stats_parser.add_argument("--db", type=Path, default=DB_PATH)
@@ -13890,6 +14624,12 @@ def mutating_command_functions() -> set[Any]:
         uncertain_daily_run_work_command,
         invalidate_daily_run_work_command,
         refresh_daily_run_plan_command,
+        plan_hh_acquisition_command,
+        record_hh_page_command,
+        record_hh_detail_command,
+        finalize_hh_stream_command,
+        finalize_hh_personal_command,
+        invalidate_hh_checkpoint_command,
         finalize_daily_run_command,
     }
 

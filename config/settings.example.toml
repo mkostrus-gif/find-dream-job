@@ -64,6 +64,29 @@ items_per_page = 100
 personal_recommendations_enabled = false
 personal_recommendation_stream = "personal_recommendations"
 
+[search.hh_acquisition]
+# Безопасное публичное значение: вычислять возможную границу `delta`, но
+# продолжать полный обход. Ранняя остановка разрешается только при
+# incremental_mode = "enabled" и после требуемого числа чистых запусков
+# `shadow`.
+incremental_mode = "shadow" # disabled | shadow | enabled
+minimum_overlap_pages = 2
+consecutive_known_boundary_pages = 2
+guard_page_required = true
+checkpoint_staleness_days = 7
+shadow_runs_required = 3
+full_audit_interval_days = 7
+page_stability_samples = 3
+page_stability_delay_ms = 750
+count_drift_recaptures = 2
+max_pages_per_stream = 100
+max_returned_ids = 50
+personal_initial_depth_pages = 3
+personal_minimum_stable_pages = 2
+personal_consecutive_known_pages = 2
+personal_max_pages = 10
+personal_max_is_completion_boundary = false
+
 [daily_run]
 # Приватная рабочая область может добавить непрозрачные обязательные условия без
 # изменения Engine. Зависимости указывают встроенный ключ шага либо ключ другого

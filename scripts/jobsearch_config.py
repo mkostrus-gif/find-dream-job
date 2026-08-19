@@ -105,6 +105,27 @@ class TelegramSettings:
 
 
 @dataclass(frozen=True)
+class HHAcquisitionSettings:
+    incremental_mode: str
+    minimum_overlap_pages: int
+    consecutive_known_boundary_pages: int
+    guard_page_required: bool
+    checkpoint_staleness_days: int
+    shadow_runs_required: int
+    full_audit_interval_days: int
+    page_stability_samples: int
+    page_stability_delay_ms: int
+    count_drift_recaptures: int
+    max_pages_per_stream: int
+    max_returned_ids: int
+    personal_initial_depth_pages: int
+    personal_minimum_stable_pages: int
+    personal_consecutive_known_pages: int
+    personal_max_pages: int
+    personal_max_is_completion_boundary: bool
+
+
+@dataclass(frozen=True)
 class SearchSettings:
     required_streams: tuple[str, ...]
     default_period_days: int
@@ -112,6 +133,7 @@ class SearchSettings:
     stream_aliases: dict[str, tuple[str, ...]]
     personal_recommendations_enabled: bool
     personal_recommendation_stream: str
+    hh_acquisition: HHAcquisitionSettings
 
 
 @dataclass(frozen=True)
@@ -521,6 +543,7 @@ def load_settings(code_root: Path, config_path: Path | None = None) -> Settings:
     mail = _table(data, "mail")
     telegram = _table(data, "telegram")
     search = _table(data, "search")
+    hh_acquisition = _table(search, "hh_acquisition")
     decision = _table(data, "decision")
     queue = _table(data, "queue")
     policy = _table(data, "policy")
@@ -641,6 +664,64 @@ def load_settings(code_root: Path, config_path: Path | None = None) -> Settings:
                 "personal_recommendation_stream",
                 "personal_recommendations",
             ),
+            hh_acquisition=HHAcquisitionSettings(
+                incremental_mode=_string(
+                    hh_acquisition, "incremental_mode", "shadow"
+                ).lower(),
+                minimum_overlap_pages=_integer(
+                    hh_acquisition, "minimum_overlap_pages", 2, 1
+                ),
+                consecutive_known_boundary_pages=_integer(
+                    hh_acquisition,
+                    "consecutive_known_boundary_pages",
+                    2,
+                    2,
+                ),
+                guard_page_required=_boolean(
+                    hh_acquisition, "guard_page_required", True
+                ),
+                checkpoint_staleness_days=_integer(
+                    hh_acquisition, "checkpoint_staleness_days", 7, 1
+                ),
+                shadow_runs_required=_integer(
+                    hh_acquisition, "shadow_runs_required", 3, 1
+                ),
+                full_audit_interval_days=_integer(
+                    hh_acquisition, "full_audit_interval_days", 7, 1
+                ),
+                page_stability_samples=_integer(
+                    hh_acquisition, "page_stability_samples", 3, 2
+                ),
+                page_stability_delay_ms=_integer(
+                    hh_acquisition, "page_stability_delay_ms", 750, 0
+                ),
+                count_drift_recaptures=_integer(
+                    hh_acquisition, "count_drift_recaptures", 2, 2
+                ),
+                max_pages_per_stream=_integer(
+                    hh_acquisition, "max_pages_per_stream", 100, 1
+                ),
+                max_returned_ids=_integer(
+                    hh_acquisition, "max_returned_ids", 50, 1
+                ),
+                personal_initial_depth_pages=_integer(
+                    hh_acquisition, "personal_initial_depth_pages", 3, 1
+                ),
+                personal_minimum_stable_pages=_integer(
+                    hh_acquisition, "personal_minimum_stable_pages", 2, 2
+                ),
+                personal_consecutive_known_pages=_integer(
+                    hh_acquisition, "personal_consecutive_known_pages", 2, 2
+                ),
+                personal_max_pages=_integer(
+                    hh_acquisition, "personal_max_pages", 10, 1
+                ),
+                personal_max_is_completion_boundary=_boolean(
+                    hh_acquisition,
+                    "personal_max_is_completion_boundary",
+                    False,
+                ),
+            ),
         ),
         decision=DecisionSettings(
             campaign_ids=_configured_values(decision, "campaign_ids"),
@@ -666,6 +747,37 @@ def load_settings(code_root: Path, config_path: Path | None = None) -> Settings:
         raise ValueError("Значение automation.apply_threshold должно быть от 0 до 100.")
     if settings.search.items_per_page > 100:
         raise ValueError("Значение search.items_per_page должно быть от 1 до 100.")
+    acquisition = settings.search.hh_acquisition
+    if acquisition.incremental_mode not in {"disabled", "shadow", "enabled"}:
+        raise ValueError(
+            "Значение search.hh_acquisition.incremental_mode должно быть "
+            "disabled, shadow или enabled."
+        )
+    bounded_acquisition_limits = (
+        ("minimum_overlap_pages", acquisition.minimum_overlap_pages, 25),
+        (
+            "consecutive_known_boundary_pages",
+            acquisition.consecutive_known_boundary_pages,
+            25,
+        ),
+        ("checkpoint_staleness_days", acquisition.checkpoint_staleness_days, 365),
+        ("shadow_runs_required", acquisition.shadow_runs_required, 25),
+        ("full_audit_interval_days", acquisition.full_audit_interval_days, 365),
+        ("page_stability_samples", acquisition.page_stability_samples, 10),
+        ("page_stability_delay_ms", acquisition.page_stability_delay_ms, 60_000),
+        ("count_drift_recaptures", acquisition.count_drift_recaptures, 5),
+        ("max_pages_per_stream", acquisition.max_pages_per_stream, 1_000),
+        ("max_returned_ids", acquisition.max_returned_ids, 500),
+        ("personal_initial_depth_pages", acquisition.personal_initial_depth_pages, 100),
+        ("personal_minimum_stable_pages", acquisition.personal_minimum_stable_pages, 25),
+        ("personal_consecutive_known_pages", acquisition.personal_consecutive_known_pages, 25),
+        ("personal_max_pages", acquisition.personal_max_pages, 1_000),
+    )
+    for key, value, maximum in bounded_acquisition_limits:
+        if value > maximum:
+            raise ValueError(
+                f"Значение search.hh_acquisition.{key} должно быть не больше {maximum}."
+            )
     try:
         effective_date = __import__("datetime").date.fromisoformat(
             settings.policy.effective_date

@@ -344,11 +344,11 @@ class DurableDailyRunP1Tests(unittest.TestCase):
             self.run_cli("migrate-schema", "--defer-render", "--json").stdout
         )
         self.assertEqual(migrated["from_version"], 8)
-        self.assertEqual(migrated["to_version"], 9)
+        self.assertEqual(migrated["to_version"], 10)
         self.assertTrue(migrated["backup"])
         self.assertTrue(list(self.database.parent.glob("job_search.sqlite.bak-schema-v8-*")))
         with sqlite3.connect(self.database) as conn:
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 9)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 10)
             self.assertEqual(
                 conn.execute("SELECT published_generation FROM projection_state").fetchone()[0],
                 generation,

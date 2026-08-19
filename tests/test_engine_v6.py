@@ -1127,7 +1127,7 @@ linkedin = "LinkedIn"
             self.run_cli("migrate-schema", *self.config_args, "--json").stdout
         )
         self.assertEqual(migrated["from_version"], 5)
-        self.assertEqual(migrated["to_version"], 9)
+        self.assertEqual(migrated["to_version"], 10)
         self.assertTrue(migrated["backup"])
         backups = list(self.database.parent.glob("job_search.sqlite.bak-schema-v5-*"))
         self.assertEqual(len(backups), 1)
@@ -1144,7 +1144,7 @@ linkedin = "LinkedIn"
                 for table in before
             }
             self.assertEqual(before, after)
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 9)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 10)
             self.assertEqual(conn.execute("PRAGMA quick_check").fetchone()[0], "ok")
             self.assertEqual(conn.execute("PRAGMA foreign_key_check").fetchall(), [])
             lifecycle = conn.execute(
@@ -1174,7 +1174,7 @@ linkedin = "LinkedIn"
         migrated = json.loads(
             self.run_cli("migrate-schema", *self.config_args, "--json").stdout
         )
-        self.assertEqual(migrated["to_version"], 9)
+        self.assertEqual(migrated["to_version"], 10)
         self.ingest(
             "escaped.json",
             [

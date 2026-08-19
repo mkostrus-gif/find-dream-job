@@ -60,6 +60,11 @@ COUNT_FIELDS = (
     "processed",
     "reconciled",
     "blocked",
+    "known_unchanged",
+    "known_changed",
+    "duplicate_on_page",
+    "duplicate_across_pages",
+    "duplicate_across_streams",
 )
 
 
@@ -394,6 +399,25 @@ def _config_snapshot(settings: Settings, timezone: str) -> dict[str, Any]:
             "enabled": settings.search.personal_recommendations_enabled,
             "stream": settings.search.personal_recommendation_stream,
         },
+        "hh_acquisition": {
+            "incremental_mode": settings.search.hh_acquisition.incremental_mode,
+            "minimum_overlap_pages": settings.search.hh_acquisition.minimum_overlap_pages,
+            "consecutive_known_boundary_pages": settings.search.hh_acquisition.consecutive_known_boundary_pages,
+            "guard_page_required": settings.search.hh_acquisition.guard_page_required,
+            "checkpoint_staleness_days": settings.search.hh_acquisition.checkpoint_staleness_days,
+            "shadow_runs_required": settings.search.hh_acquisition.shadow_runs_required,
+            "full_audit_interval_days": settings.search.hh_acquisition.full_audit_interval_days,
+            "page_stability_samples": settings.search.hh_acquisition.page_stability_samples,
+            "page_stability_delay_ms": settings.search.hh_acquisition.page_stability_delay_ms,
+            "count_drift_recaptures": settings.search.hh_acquisition.count_drift_recaptures,
+            "max_pages_per_stream": settings.search.hh_acquisition.max_pages_per_stream,
+            "max_returned_ids": settings.search.hh_acquisition.max_returned_ids,
+            "personal_initial_depth_pages": settings.search.hh_acquisition.personal_initial_depth_pages,
+            "personal_minimum_stable_pages": settings.search.hh_acquisition.personal_minimum_stable_pages,
+            "personal_consecutive_known_pages": settings.search.hh_acquisition.personal_consecutive_known_pages,
+            "personal_max_pages": settings.search.hh_acquisition.personal_max_pages,
+            "personal_max_is_completion_boundary": settings.search.hh_acquisition.personal_max_is_completion_boundary,
+        },
         "telegram": {
             "enabled": settings.telegram.enabled,
             "initial_lookback_days": settings.telegram.initial_lookback_days,
@@ -679,6 +703,7 @@ def build_plan_definition(
                 "required_streams": list(settings.search.required_streams),
                 "period_days": settings.search.default_period_days,
                 "items_per_page": settings.search.items_per_page,
+                "hh_acquisition": _config_snapshot(settings, timezone)["hh_acquisition"],
             },
             items=hh_items,
         ),
@@ -703,7 +728,10 @@ def build_plan_definition(
             required=settings.search.personal_recommendations_enabled,
             enabled=settings.search.personal_recommendations_enabled,
             depends_on=("inbound_reconciliation",),
-            scope={"stream_key": settings.search.personal_recommendation_stream},
+            scope={
+                "stream_key": settings.search.personal_recommendation_stream,
+                "hh_acquisition": _config_snapshot(settings, timezone)["hh_acquisition"],
+            },
         ),
     ]
 
@@ -1265,8 +1293,9 @@ def validate_manifest(
             "Манифест превышает 1 МБ; подробное доказательство сохраните в artifact с SHA-256."
         )
     normalized = dict(manifest)
-    if normalized.get("manifest_version") != 1:
-        raise ValueError("Поддерживается только manifest_version = 1.")
+    manifest_version = normalized.get("manifest_version")
+    if manifest_version not in {1, 2}:
+        raise ValueError("Поддерживаются manifest_version = 1 и HH coverage v2.")
     expected = {
         "run_id": expected_run_id,
         "step_key": expected_step_key,
@@ -1321,9 +1350,17 @@ def validate_manifest(
                 raise ValueError(f"Неподдерживаемый счётчик: {key}.")
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
                 raise ValueError(f"Счётчик counts.{key} должен быть неотрицательным целым.")
-        if all(key in counts for key in ("known", "new", "unique")):
+        if manifest_version == 1 and all(key in counts for key in ("known", "new", "unique")):
             if counts["known"] + counts["new"] != counts["unique"]:
                 raise ValueError("Сумма counts.known и counts.new должна равняться counts.unique.")
+        if manifest_version == 2 and all(
+            key in counts for key in ("known_unchanged", "known_changed", "new", "unique")
+        ):
+            if counts["known_unchanged"] + counts["known_changed"] + counts["new"] != counts["unique"]:
+                raise ValueError(
+                    "Сумма counts.known_unchanged, counts.known_changed и counts.new "
+                    "должна равняться counts.unique."
+                )
         if "raw" in counts and "processed" in counts and counts["processed"] > counts["raw"]:
             raise ValueError("counts.processed не может превышать counts.raw.")
         if "processed" in counts and "unique" in counts and counts["unique"] > counts["processed"]:
@@ -1362,6 +1399,19 @@ def validate_manifest(
             raise ValueError("Для завершения требуется непустая completion_boundary.")
         if blockers:
             raise ValueError("Завершённый манифест удалённого источника не может содержать blockers.")
+    if manifest_version == 2:
+        from hh_acquisition import validate_manifest_v2
+
+        normalized = validate_manifest_v2(
+            normalized,
+            expected_run_id=expected_run_id,
+            expected_step_key=expected_step_key,
+            expected_item_key=expected_item_key,
+            expected_kind=expected_kind,
+            completion=completion,
+        )
+        normalized["artifact_path"] = artifact_path
+        normalized["artifact_sha256"] = artifact_sha
     if completion and expected_kind == "due_followup":
         valid, resolution = due_followup_resolution(
             conn, expected_run_id, expected_step_key, expected_item_key
@@ -2052,6 +2102,83 @@ def _leaf_rows(conn: sqlite3.Connection, run_id: str) -> list[dict[str, Any]]:
     return result
 
 
+def _p2_next_safe_action(
+    conn: sqlite3.Connection, run_id: str, item: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    if item.get("kind") not in {"hh_stream", "source_gate"}:
+        return None
+    scope = item.get("scope", {})
+    stream_key = str(scope.get("stream_key", ""))
+    if not stream_key:
+        return None
+    row = conn.execute(
+        """
+        SELECT * FROM hh_stream_runs
+        WHERE run_id = ? AND source = 'hh' AND stream_key = ?
+        """,
+        (run_id, stream_key),
+    ).fetchone()
+    if row is None:
+        if item.get("state") == "checkpointed":
+            return None
+        return {
+            "action": "build_hh_acquisition_plan",
+            "acquisition_mode": "unplanned",
+        }
+    if row["state"] == "blocked":
+        return {
+            "action": "resolve_hh_capture_blocker",
+            "code": row["blocker_code"] or "",
+            "reason": row["blocker_reason"] or "",
+        }
+    if row["unresolved_drift_page"] is not None:
+        return {
+            "action": "verify_count_drift",
+            "page_index": int(row["unresolved_drift_page"]),
+        }
+    latest_unverified = conn.execute(
+        """
+        SELECT page_index, blockers_json FROM hh_page_captures
+        WHERE run_id = ? AND source = 'hh' AND stream_key = ? AND verified = 0
+        ORDER BY id DESC LIMIT 1
+        """,
+        (run_id, stream_key),
+    ).fetchone()
+    if latest_unverified is not None and int(latest_unverified["page_index"]) == int(
+        row["next_page"]
+    ):
+        blockers = json.loads(str(latest_unverified["blockers_json"] or "[]"))
+        if any(item.get("code") == "unstable_dom" for item in blockers):
+            return {
+                "action": "repeat_unstable_capture",
+                "page_index": int(row["next_page"]),
+            }
+    pending = conn.execute(
+        """
+        SELECT COUNT(*) FROM hh_detail_queue
+        WHERE run_id = ? AND source = 'hh' AND stream_key = ? AND state = 'pending'
+        """,
+        (run_id, stream_key),
+    ).fetchone()
+    if pending is not None and int(pending[0]) > 0:
+        return {"action": "fetch_bounded_new_changed_details", "count": int(pending[0])}
+    if row["state"] == "ready_to_finalize":
+        return {"action": "finalize_hh_stream"}
+    if row["fallback_reason"]:
+        return {
+            "action": "continue_full_scan_after_fallback",
+            "page_index": int(row["next_page"]),
+            "reason": row["fallback_reason"],
+        }
+    return {
+        "action": (
+            "continue_from_page" if int(row["last_verified_page"]) >= 0 else "capture_stable_page"
+        ),
+        "page_index": int(row["next_page"]),
+        "acquisition_mode": row["effective_mode"],
+    }
+
+
 def _next_safe_items(conn: sqlite3.Connection, run_id: str, limit: int = 10) -> list[dict[str, Any]]:
     run = get_run(conn, run_id)
     if run is not None and run["status"] == "finalizing":
@@ -2094,6 +2221,9 @@ def _next_safe_items(conn: sqlite3.Connection, run_id: str, limit: int = 10) -> 
                 if item["scope"].get("state") == "authorized"
                 else "review_draft"
             )
+        p2 = _p2_next_safe_action(conn, run_id, item)
+        if p2 is not None:
+            action = str(p2["action"])
         candidates.append(
             {
                 "step_key": item["step_key"],
@@ -2102,6 +2232,7 @@ def _next_safe_items(conn: sqlite3.Connection, run_id: str, limit: int = 10) -> 
                 "state": item["state"],
                 "action": action,
                 "scope": item["scope"],
+                **({"p2": p2} if p2 is not None else {}),
                 "_step_order": int(item["step_order"]),
             }
         )
@@ -3503,6 +3634,45 @@ def _coverage_closeout_issues(conn: sqlite3.Connection, run: sqlite3.Row) -> lis
         ).fetchone()
         if step is None or not step["required"]:
             continue
+        # P2 HH completion is proved directly by one immutable, validated v2
+        # manifest per required stream. Keep the legacy P1/search_runs contract
+        # unchanged for Telegram and for HH work that did not use P2.
+        if source == "hh" and step["state"] == "completed":
+            required_items = conn.execute(
+                """
+                SELECT item_key, manifest_hash
+                FROM daily_run_work_items
+                WHERE run_id = ? AND step_key = ? AND required = 1
+                ORDER BY order_no, item_key
+                """,
+                (run["run_id"], step_key),
+            ).fetchall()
+            p2_complete = bool(required_items)
+            for item in required_items:
+                manifest = conn.execute(
+                    """
+                    SELECT payload_json FROM daily_run_manifests
+                    WHERE run_id = ? AND step_key = ? AND item_key = ?
+                      AND payload_hash = ? AND manifest_kind = 'hh_stream'
+                      AND validation_status = 'validated'
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (
+                        run["run_id"],
+                        step_key,
+                        item["item_key"],
+                        item["manifest_hash"] or "",
+                    ),
+                ).fetchone()
+                payload = json.loads(str(manifest["payload_json"])) if manifest else {}
+                if not (
+                    payload.get("manifest_version") == 2
+                    and payload.get("remote_boundary_verified") is True
+                ):
+                    p2_complete = False
+                    break
+            if p2_complete:
+                continue
         if run["status"] == "completed":
             manifest_kind = "hh_stream" if source == "hh" else "telegram_channel"
             missing_manifests = 0
