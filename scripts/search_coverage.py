@@ -25,26 +25,26 @@ def _normalized_string_list(value: Any, label: str, *, required: bool) -> list[s
     if value is None and not required:
         return []
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
-        raise ValueError(f"{label} must be an array of strings")
+        raise ValueError(f"{label}: требуется массив строк.")
     result = [_clean_text(item) for item in value if _clean_text(item)]
     if required and not result:
-        raise ValueError(f"{label} must contain at least one value")
+        raise ValueError(f"{label}: требуется хотя бы одно значение.")
     if len({item.casefold() for item in result}) != len(result):
-        raise ValueError(f"{label} must not contain duplicates")
+        raise ValueError(f"{label}: повторяющиеся значения запрещены.")
     return result
 
 
 def _positive_int(value: Any, label: str, *, maximum: int | None = None) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-        raise ValueError(f"{label} must be a positive integer")
+        raise ValueError(f"{label}: требуется положительное целое число.")
     if maximum is not None and value > maximum:
-        raise ValueError(f"{label} must be <= {maximum}")
+        raise ValueError(f"{label}: значение не должно превышать {maximum}.")
     return value
 
 
 def _non_negative_int(value: Any, label: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-        raise ValueError(f"{label} must be a non-negative integer")
+        raise ValueError(f"{label}: требуется неотрицательное целое число.")
     return value
 
 
@@ -81,7 +81,7 @@ def build_hh_query(query: dict[str, Any]) -> dict[str, Any]:
     """Build one deterministic HH query from declarative OR/AND term groups."""
 
     if not isinstance(query, dict):
-        raise ValueError("query must be an object")
+        raise ValueError("Поле query должно быть объектом.")
     any_terms = _normalized_string_list(query.get("any_terms"), "query.any_terms", required=True)
     all_terms = _normalized_string_list(query.get("all_terms", []), "query.all_terms", required=False)
     fields = _normalized_string_list(
@@ -92,7 +92,7 @@ def build_hh_query(query: dict[str, Any]) -> dict[str, Any]:
     fields = [field.upper() for field in fields]
     unsupported = sorted(set(fields) - HH_FIELDS)
     if unsupported:
-        raise ValueError("query.fields contains unsupported HH fields: " + ", ".join(unsupported))
+        raise ValueError("Поле query.fields содержит неподдерживаемые поля HH: " + ", ".join(unsupported))
 
     search_period_days = _positive_int(
         query.get("search_period_days"), "query.search_period_days"
@@ -147,35 +147,35 @@ def build_coverage_plan(
     """Build deterministic HH URLs and an auditable manifest skeleton."""
 
     if not isinstance(payload, dict):
-        raise ValueError("coverage plan must be a JSON object")
+        raise ValueError("План покрытия должен быть объектом JSON.")
     source = _clean_text(payload.get("source") or "hh").lower()
     if source != "hh":
-        raise ValueError("the built-in query planner currently supports source=hh")
+        raise ValueError("Встроенный планировщик запросов сейчас поддерживает только source=hh.")
     run_date = _clean_text(payload.get("run_date"))
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", run_date):
-        raise ValueError("run_date must use YYYY-MM-DD")
+        raise ValueError("Поле run_date должно иметь формат ГГГГ-ММ-ДД.")
     required = list(configured_required_streams)
     requested = payload.get("required_streams")
     if requested is not None:
         declared = _normalized_string_list(requested, "required_streams", required=True)
         missing = [stream for stream in required if stream.casefold() not in {x.casefold() for x in declared}]
         if missing:
-            raise ValueError("required_streams omits configured streams: " + ", ".join(missing))
+            raise ValueError("В required_streams отсутствуют настроенные потоки: " + ", ".join(missing))
         required = declared
     streams = payload.get("streams")
     if not isinstance(streams, list):
-        raise ValueError("streams must be an array")
+        raise ValueError("Поле streams должно быть массивом.")
     built: list[dict[str, Any]] = []
     seen_keys: set[str] = set()
     for index, raw in enumerate(streams):
         if not isinstance(raw, dict):
-            raise ValueError(f"streams[{index}] must be an object")
+            raise ValueError(f"Элемент streams[{index}] должен быть объектом.")
         key = _clean_text(raw.get("key"))
         if not key:
-            raise ValueError(f"streams[{index}].key is required")
+            raise ValueError(f"Требуется поле streams[{index}].key.")
         folded = key.casefold()
         if folded in seen_keys:
-            raise ValueError(f"duplicate stream key: {key}")
+            raise ValueError(f"Повторяется ключ потока: {key}.")
         seen_keys.add(folded)
         query = dict(raw.get("query") or {})
         query.setdefault("search_period_days", default_period_days)
@@ -196,7 +196,7 @@ def build_coverage_plan(
         )
     missing_specs = [stream for stream in required if stream.casefold() not in seen_keys]
     if missing_specs:
-        raise ValueError("streams omits configured required streams: " + ", ".join(missing_specs))
+        raise ValueError("В streams отсутствуют обязательные настроенные потоки: " + ", ".join(missing_specs))
     return {
         "run_date": run_date,
         "source": source,
@@ -213,11 +213,11 @@ def validate_coverage_manifest(
 
     issues: list[str] = []
     if not isinstance(payload, dict):
-        return {"ok": False, "issues": ["manifest must be a JSON object"], "streams": []}
+        return {"ok": False, "issues": ["Манифест должен быть объектом JSON."], "streams": []}
 
     run_date = _clean_text(payload.get("run_date"))
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", run_date):
-        issues.append("run_date must use YYYY-MM-DD")
+        issues.append("Поле run_date должно иметь формат ГГГГ-ММ-ДД.")
     source = _clean_text(payload.get("source") or "hh").lower()
     try:
         declared_required = _normalized_string_list(
@@ -230,34 +230,34 @@ def validate_coverage_manifest(
     declared_folded = {item.casefold() for item in declared_required}
     for stream in required:
         if stream.casefold() not in declared_folded:
-            issues.append(f"required_streams omits configured stream: {stream}")
+            issues.append(f"В required_streams отсутствует настроенный поток: {stream}.")
 
     raw_streams = payload.get("streams")
     if not isinstance(raw_streams, list):
         raw_streams = []
-        issues.append("streams must be an array")
+        issues.append("Поле streams должно быть массивом.")
     normalized_streams: list[dict[str, Any]] = []
     by_key: dict[str, dict[str, Any]] = {}
     for index, raw in enumerate(raw_streams):
         if not isinstance(raw, dict):
-            issues.append(f"streams[{index}] must be an object")
+            issues.append(f"Элемент streams[{index}] должен быть объектом.")
             continue
         key = _clean_text(raw.get("key"))
         if not key:
-            issues.append(f"streams[{index}].key is required")
+            issues.append(f"Требуется поле streams[{index}].key.")
             continue
         folded = key.casefold()
         if folded in by_key:
-            issues.append(f"duplicate stream key: {key}")
+            issues.append(f"Повторяется ключ потока: {key}.")
             continue
         stream_issues: list[str] = []
         status = _clean_text(raw.get("status")).lower()
         if status not in STREAM_STATUSES:
-            stream_issues.append("status must be completed or blocked")
+            stream_issues.append("Поле status должно иметь значение completed или blocked.")
         if status == "blocked":
-            stream_issues.append("required stream is blocked")
+            stream_issues.append("Обязательный поток заблокирован.")
             if not _clean_text(raw.get("error")):
-                stream_issues.append("blocked stream must include error")
+                stream_issues.append("Для заблокированного потока требуется поле error.")
 
         query_result: dict[str, Any] = {}
         query = raw.get("query")
@@ -266,17 +266,17 @@ def validate_coverage_manifest(
                 query_result = build_hh_query(query)
                 actual_url = _clean_text(query.get("url")) if isinstance(query, dict) else ""
                 if not actual_url:
-                    stream_issues.append("query.url is required as execution evidence")
+                    stream_issues.append("Для доказательства выполнения требуется query.url.")
                 else:
                     actual_params = parse_qs(urlsplit(actual_url).query)
                     if "period" in actual_params:
-                        stream_issues.append("query.url uses deprecated period; use search_period")
+                        stream_issues.append("В query.url используется устаревший параметр period; используйте search_period.")
                     if not _same_hh_url(actual_url, query_result["url"]):
-                        stream_issues.append("query.url does not match the declarative OR/search_period plan")
+                        stream_issues.append("Адрес query.url не соответствует декларативному плану OR/search_period.")
             except ValueError as exc:
                 stream_issues.append(str(exc))
         elif not isinstance(query, dict) or not _clean_text(query.get("url")):
-            stream_issues.append("query.url is required")
+            stream_issues.append("Требуется query.url.")
 
         found = raw.get("found")
         page_size = int(query_result.get("items_per_page") or 0)
@@ -294,11 +294,11 @@ def validate_coverage_manifest(
             pages = raw.get("pages")
             if not isinstance(pages, list):
                 pages = []
-                stream_issues.append("pages must be an array")
+                stream_issues.append("Поле pages должно быть массивом.")
             page_map: dict[int, int] = {}
             for page_index, page in enumerate(pages):
                 if not isinstance(page, dict):
-                    stream_issues.append(f"pages[{page_index}] must be an object")
+                    stream_issues.append(f"Элемент pages[{page_index}] должен быть объектом.")
                     continue
                 try:
                     number = _non_negative_int(page.get("page"), f"pages[{page_index}].page")
@@ -309,7 +309,7 @@ def validate_coverage_manifest(
                     stream_issues.append(str(exc))
                     continue
                 if number in page_map:
-                    stream_issues.append(f"duplicate page checkpoint: {number}")
+                    stream_issues.append(f"Повторяется контрольная точка страницы: {number}.")
                     continue
                 page_map[number] = extracted
             pages_visited = len(page_map)
@@ -318,7 +318,8 @@ def validate_coverage_manifest(
                 expected_numbers = set(range(pages_expected))
                 if set(page_map) != expected_numbers:
                     stream_issues.append(
-                        "page checkpoints must cover exactly 0.." + str(max(pages_expected - 1, 0))
+                        "Контрольные точки страниц должны точно покрывать диапазон 0.."
+                        + str(max(pages_expected - 1, 0)) + "."
                     )
                 for number in sorted(expected_numbers & set(page_map)):
                     remaining = max(found - number * page_size, 0)
@@ -327,7 +328,7 @@ def validate_coverage_manifest(
                         expected_count = 0
                     if page_map[number] != expected_count:
                         stream_issues.append(
-                            f"page {number} extracted {page_map[number]}; expected {expected_count} after lazy-load"
+                            f"На странице {number} извлечено {page_map[number]}; после полной подгрузки ожидалось {expected_count}."
                         )
 
         def count_field(name: str) -> int:
@@ -342,9 +343,9 @@ def validate_coverage_manifest(
         known_count = count_field("known")
         new_count = count_field("new")
         if status == "completed" and known_count + new_count != unique_count:
-            stream_issues.append("known + new must equal unique")
+            stream_issues.append("Сумма known и new должна равняться unique.")
         if status == "completed" and unique_count > extracted_total:
-            stream_issues.append("unique cannot exceed extracted page cards")
+            stream_issues.append("Значение unique не может превышать число извлечённых карточек.")
 
         normalized = {
             "key": key,
@@ -369,12 +370,12 @@ def validate_coverage_manifest(
 
     for stream in required:
         if stream.casefold() not in by_key:
-            issues.append(f"missing required stream: {stream}")
+            issues.append(f"Отсутствует обязательный поток: {stream}.")
 
     totals = payload.get("totals")
     normalized_totals = {"unique": 0, "known": 0, "new": 0}
     if not isinstance(totals, dict):
-        issues.append("totals must be an object")
+        issues.append("Поле totals должно быть объектом.")
     else:
         for name in normalized_totals:
             try:
@@ -382,10 +383,10 @@ def validate_coverage_manifest(
             except ValueError as exc:
                 issues.append(str(exc))
         if normalized_totals["known"] + normalized_totals["new"] != normalized_totals["unique"]:
-            issues.append("totals.known + totals.new must equal totals.unique")
+            issues.append("Сумма totals.known и totals.new должна равняться totals.unique.")
         stream_unique_sum = sum(item["unique"] for item in normalized_streams)
         if normalized_totals["unique"] > stream_unique_sum:
-            issues.append("totals.unique cannot exceed the sum of per-stream unique counts")
+            issues.append("Значение totals.unique не может превышать сумму unique по потокам.")
 
     return {
         "ok": not issues,

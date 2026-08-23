@@ -15,11 +15,14 @@ bands. This public workflow defines how to apply them consistently.
    factors; they do not replace strategic fit or automatically change score.
 4. Apply penalties and hard caps after the base score. Record the reason for
    each cap; never let a prestigious title cancel a hard mismatch.
-5. Compare the final score with `automation.apply_threshold`, but treat it as a
-   recommendation threshold unless `automation.auto_apply` is explicitly true.
+5. Compare the final score with `automation.apply_threshold` only to prioritize
+   review. The threshold never authorizes an application, message, follow-up,
+   mailbox mutation, or publication, regardless of `automation.auto_apply`.
 6. Use `needs_input` whenever one unknown fact could materially change the
    score or application truthfulness.
 7. Persist score, role type, reason, risks, open questions, and next action.
+8. Persist the active policy version and structured rule results for rejected
+   or low-priority decisions so false-negative sampling is reproducible.
 
 An AI label in a title is not score evidence. Employer AI adoption is an
 employer signal, not candidate fit. A candidate's use of AI tools does not prove

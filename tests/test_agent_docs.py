@@ -90,9 +90,10 @@ class AgentDocumentationTests(unittest.TestCase):
             "search.required_streams",
             "build-coverage-plan",
             "check-coverage",
-            "search_period",
-            "items_on_page=100",
-            "min(page_size, remaining found results)",
+            "plan-hh-acquisition",
+            "record-hh-page",
+            "source_reported_count_drift",
+            "доказанной границе известных результатов",
             "fail-closed",
             "reports/search_coverage.md",
         )
@@ -102,10 +103,151 @@ class AgentDocumentationTests(unittest.TestCase):
 
         settings = self.read("config/settings.example.toml")
         self.assertIn("[search]", settings)
+        self.assertIn("[search.hh_acquisition]", settings)
         self.assertIn("required_streams", settings)
         self.assertIn("[mail]", settings)
         self.assertIn("scan_linkedin_inbox = false", settings)
         self.assertIn("archive_processed_linkedin = false", settings)
+
+    def test_daily_run_defers_writes_and_has_one_final_render(self) -> None:
+        daily = self.read("prompts/daily_run.md")
+        required_text = (
+            "begin-daily-run",
+            "projection-status",
+            "--defer-render",
+            "--run-lease",
+            "finalize-daily-run",
+            "exactly one full render",
+        )
+        for text in required_text:
+            with self.subTest(text=text):
+                self.assertIn(text, daily)
+
+    def test_daily_run_documents_durable_v10_resume_contract(self) -> None:
+        daily = self.read("prompts/daily_run.md")
+        system = self.read("JOB_SYSTEM.md")
+        architecture = self.read("docs/architecture.md")
+        settings = self.read("config/settings.example.toml")
+        for text in (
+            "daily-run-status",
+            "resume-daily-run",
+            "pause-daily-run",
+            "checkpoint-daily-run-work",
+            "needs_verification",
+            "refresh-daily-run-plan",
+            "operational-doctor --run-id",
+        ):
+            with self.subTest(text=text):
+                self.assertIn(text, daily)
+        for text in (
+            "схема v10",
+            "схема v9",
+            "daily_runs",
+            "daily_run_work_items",
+            "daily_run_manifests",
+            "daily_run_transitions",
+            "manifest_version",
+        ):
+            with self.subTest(text=text):
+                self.assertIn(text, system.lower())
+        normalized_architecture = " ".join(architecture.split())
+        self.assertIn("Срок жизни запуска", normalized_architecture)
+        self.assertIn("срока жизни `lease`", normalized_architecture)
+        self.assertIn("[daily_run]", settings)
+        self.assertIn("[[daily_run.required_gates]]", settings)
+
+    def test_p2_hh_acquisition_contract_is_public_and_fail_closed(self) -> None:
+        candidates = set(self.public_candidates())
+        self.assertIn("scripts/hh_acquisition.py", candidates)
+        self.assertIn("scripts/hh_browser_adapter.js", candidates)
+        self.assertIn("scripts/benchmark_hh_incremental.py", candidates)
+        self.assertIn("tests/fixtures/hh_links_synthetic.json", candidates)
+        self.assertIn("tests/hh_browser_adapter_harness.mjs", candidates)
+        self.assertIn("tests/test_hh_browser_adapter.mjs", candidates)
+
+        daily = self.read("prompts/daily_run.md")
+        system = self.read("JOB_SYSTEM.md")
+        runbook = self.read("docs/agent-runbook.md")
+        architecture = self.read("docs/architecture.md")
+        settings = self.read("config/settings.example.toml")
+        for text in (
+            "авторизованный встроенный браузер",
+            "Не переключайтесь молча",
+            "видимые данные DOM",
+            "capturePersonalRecommendations",
+            "record-hh-detail",
+            "finalize-hh-personal-recommendations",
+            "doctor --strict",
+        ):
+            with self.subTest(text=text):
+                self.assertIn(text, daily)
+        for text in (
+            "hh-dom-v1.0.2",
+            "source_reported_count_drift",
+            "known_unchanged",
+            "duplicate_across_streams",
+            "Манифест HH v2",
+            "incremental_safety_failure",
+        ):
+            with self.subTest(text=text):
+                self.assertIn(text, system)
+        for document_name, document in (
+            ("daily", daily),
+            ("system", system),
+            ("runbook", runbook),
+        ):
+            for text in (
+                "invalidate-hh-zero-evidence-plan",
+                "zero_evidence_plan_invalidated",
+                "zero_evidence_plan_replanned",
+                "source-bearing",
+            ):
+                with self.subTest(document=document_name, text=text):
+                    self.assertIn(text, document)
+        for text in (
+            "full",
+            "shadow",
+            "delta",
+            "resume",
+            "audit",
+            "hh_stream_checkpoints",
+            "hh_page_captures",
+        ):
+            with self.subTest(text=text):
+                self.assertIn(text, architecture)
+        self.assertIn("не переключайтесь молча", runbook.lower())
+        self.assertIn("no_source_evidence_discarded", system)
+        for key in (
+            "incremental_mode",
+            "minimum_overlap_pages",
+            "consecutive_known_boundary_pages",
+            "guard_page_required",
+            "checkpoint_staleness_days",
+            "shadow_runs_required",
+            "full_audit_interval_days",
+            "page_stability_samples",
+            "page_stability_timeout_ms",
+            "count_drift_recaptures",
+            "personal_max_is_completion_boundary",
+            "max_returned_ids",
+        ):
+            with self.subTest(key=key):
+                self.assertIn(key, settings)
+
+    def test_hh_dom_adapter_node_regressions(self) -> None:
+        result = subprocess.run(
+            ["node", "--test", str(ROOT / "tests" / "test_hh_browser_adapter.mjs")],
+            cwd=ROOT,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if result.returncode != 0:
+            self.fail(
+                "HH DOM adapter Node regressions failed "
+                f"({result.returncode})\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+            )
 
     def test_daily_run_requires_complete_linkedin_mail_processing(self) -> None:
         daily = self.read("prompts/daily_run.md")
@@ -134,6 +276,114 @@ class AgentDocumentationTests(unittest.TestCase):
         for text in required_mail_text:
             with self.subTest(text=text):
                 self.assertIn(text, mail_workflow)
+
+    def test_daily_run_requires_success_gated_telegram_backfill_and_delta(self) -> None:
+        daily = self.read("prompts/daily_run.md")
+        system = self.read("JOB_SYSTEM.md")
+        settings = self.read("config/settings.example.toml")
+        required_daily_text = (
+            "telegram.enabled = true",
+            "build-telegram-plan",
+            "check-telegram-coverage",
+            "30 days by default",
+            "telegram:<handle>:<post_id>",
+            "advances a channel cursor only when the entire",
+            "Telegram manifest passes",
+            "reports/source_checkpoints.md",
+        )
+        for text in required_daily_text:
+            with self.subTest(text=text):
+                self.assertIn(text, daily)
+        for text in (
+            "source_checkpoints",
+            "initial backfill",
+            "delta plan",
+            "missing 0–100 score",
+        ):
+            with self.subTest(text=text):
+                self.assertIn(text, system)
+        self.assertIn("[telegram]", settings)
+        self.assertIn("enabled = false", settings)
+        self.assertIn("initial_lookback_days = 30", settings)
+        self.assertIn("channels = []", settings)
+
+    def test_daily_run_documents_blocker_regression_contracts(self) -> None:
+        daily = self.read("prompts/daily_run.md")
+        system = self.read("JOB_SYSTEM.md")
+        runbook = self.read("docs/agent-runbook.md")
+        architecture = self.read("docs/architecture.md")
+        for text in (
+            "telegram_source_units_v1",
+            "raw >= processed >= reconciled",
+            "Граничная публикация `delta`",
+            "external_action_id_floor",
+            "daily_run_external_action_scope_v1",
+            "legacy_backlog",
+            "--reclassify-legacy-external-actions",
+            "reconcile_inbound_after_outbound",
+            "строго более поздним",
+        ):
+            with self.subTest(text=text):
+                self.assertIn(text, system)
+        for document in (daily, runbook):
+            for text in (
+                "telegram_source_units_v1",
+                "reconcile_inbound_after_outbound",
+                "--reclassify-legacy-external-actions",
+            ):
+                with self.subTest(text=text):
+                    self.assertIn(text, document)
+        self.assertIn("external_action_id_floor", architecture)
+
+    def test_daily_run_documents_exact_user_cancelled_followup_resolution(self) -> None:
+        readme = self.read("README.md")
+        daily = self.read("prompts/daily_run.md")
+        system = self.read("JOB_SYSTEM.md")
+        runbook = self.read("docs/agent-runbook.md")
+        for document_name, document in (
+            ("readme", readme),
+            ("daily", daily),
+            ("system", system),
+            ("runbook", runbook),
+        ):
+            with self.subTest(document=document_name):
+                self.assertIn("cancel-due-followup-obligation", document)
+                self.assertIn("user_cancelled_followup_obligation", document)
+        for text in (
+            "--run-id <run_id>",
+            "--item-key <due:item:key>",
+            "--reason",
+            "refresh-daily-run-plan",
+            "finalize-daily-run",
+        ):
+            with self.subTest(text=text):
+                self.assertIn(text, system)
+
+    def test_daily_run_documents_reverified_historical_inbound_resolution(self) -> None:
+        documents = {
+            "readme": self.read("README.md"),
+            "daily": self.read("prompts/daily_run.md"),
+            "system": self.read("JOB_SYSTEM.md"),
+            "runbook": self.read("docs/agent-runbook.md"),
+        }
+        for document_name, document in documents.items():
+            for text in (
+                "resolve-due-followup-from-reverified-inbound",
+                "reverified_historical_inbound_due_resolution",
+                "reverified_historical_inbound_v1",
+                "user_cancelled_followup_obligation",
+            ):
+                with self.subTest(document=document_name, text=text):
+                    self.assertIn(text, document)
+
+        for text in (
+            "returned_adapter_object_v1",
+            "mutation_observer_visible_dom",
+            "timed_visible_dom_sampling",
+            "page_stability_timeout_ms",
+        ):
+            with self.subTest(text=text):
+                self.assertIn(text, documents["runbook"])
 
     def test_outcome_and_ai_evidence_contract_is_public(self) -> None:
         system = self.read("JOB_SYSTEM.md")

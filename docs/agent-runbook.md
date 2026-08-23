@@ -87,6 +87,7 @@ Run health checks in the selected real workspace:
 python3 scripts/jobctl.py doctor --strict --json
 python3 scripts/jobctl.py rebuild --json
 python3 scripts/jobctl.py stats
+python3 scripts/jobctl.py operational-doctor --strict --json
 ```
 
 Use synthetic vacancy data only for a separate smoke test. On POSIX systems:
@@ -101,6 +102,11 @@ JOB_SEARCH_HOME="$SMOKE_WORKSPACE" python3 scripts/jobctl.py doctor --strict --j
 
 The temporary database proves mechanics, not live source access or candidate
 fit. Do not report its vacancies as search results.
+
+Structural health and operational closeout are intentionally separate. A new
+or stale workspace may pass `doctor --strict` while
+`operational-doctor --strict` fails because current required coverage is
+absent. Do not weaken or skip that closeout gate.
 
 ### Upgrade an existing private workspace
 
@@ -117,31 +123,257 @@ JOB_SEARCH_HOME="/path/to/private-workspace" \
   python3 scripts/jobctl.py stats
 ```
 
-Never use `--no-backup` on a live database. Schema v4 preserves the schema-v3
-external-ID aliases, raw source streams, and every existing row. It adds
-canonical stream keys, employer interactions, account radar tables, and
-vacancy factors without inventing any historical outcome or evidence. Restore
-the timestamped backup with the prior Engine version for rollback; there is no
-destructive reverse migration.
+Никогда не используйте `--no-backup` для рабочей базы. Схема v9 обновляет
+поддерживаемые версии v1–v8 и сохраняет исходные находки, каноническую
+идентичность вакансий, псевдонимы, отклики, взаимодействия, карточки
+работодателей, факторы и контрольные точки. Старый подтверждённый отклик
+становится долговечным событием с явно неполной историей и неизвестным прежним
+разрешением; миграция не выдумывает кампанию, резюме, ответ, интервью, оффер,
+причину карантина или полноту источника. Схема v10 сохраняет P0/P1 и добавляет
+только контрольные точки получения HH, снимки страниц и вакансий, ограниченную
+очередь подробностей и историю инкрементальной безопасности. Схема v9 добавила
+структуры плана, шагов, единиц
+работы, манифестов и переходов, а также корректное состояние освобождённого
+`lease`; доказательства и поколения проекций v8 не перезаписываются. Схема v8
+добавила транзакционную актуальность проекций,
+ограниченные блокировки записи и `render`, атомарные поколения результатов и
+один истекающий `lease` ежедневного запуска, не изменяя доказательства v7.
+Схема v7 добавила инвалидации и эффективные состояния взаимодействий и
+откликов; см. [`evidence-corrections.md`](evidence-corrections.md).
+После v10 не открывайте обновлённую базу старой версией Engine. Для отката
+восстановите резервную копию с отметкой времени и используйте предыдущую
+совместимую версию; разрушающей обратной миграции нет. Инструкция по
+восстановлению для оператора приведена в
+[`operations-v6.ru.md`](operations-v6.ru.md).
 
 ## 5. Execute one search cycle
 
 Use [`prompts/daily_run.md`](../prompts/daily_run.md) as the canonical order:
 
 1. load settings and private evidence;
-2. validate and rebuild existing state;
+2. выполнить `daily-run-status --json`; возобновить незавершённый долговечный
+   запуск и обрабатывать только ожидающие или инвалидированные элементы либо,
+   если открытого запуска нет, выполнить `projection-status`, а затем
+   `begin-daily-run`;
 3. reconcile inbound replies and external statuses; record each automated or
-   human employer event with `record-employer-interaction`, then make any
-   evidence-backed stage change separately;
+   human employer event with `record-employer-interaction`, then append precise
+   lifecycle evidence separately;
 4. process authorized Gmail HH mail and every LinkedIn message currently in
    Inbox; score every recommended vacancy and verify each authorized archive;
-5. build the configured source-stream coverage plan, search every generated
-   query through its final fully loaded page, and deduplicate against SQLite;
-6. normalize results into ignored JSON and ingest them;
-7. score the real mandate, hard constraints, and open questions;
-8. prepare or perform only the external actions allowed by current policy;
-9. verify visible success before recording sent state;
-10. run fail-closed `check-coverage`, rebuild, validate, and report.
+5. when Telegram is enabled, build its SQLite-backed backfill/delta plan,
+   inspect every configured channel to the generated boundary, score/import
+   vacancy posts, and pass `check-telegram-coverage` without manually advancing
+   a cursor;
+6. для каждого настроенного потока HH построить план получения P2, открыть
+   точный URL в уже авторизованном встроенном браузере Codex, записывать только
+   устойчивые снимки видимого DOM через `record-hh-page` и следовать
+   возвращённому безопасному действию; обычные и персональные рекомендации не
+   взаимозаменяемы;
+7. позволить SQLite программно классифицировать канонические ID и псевдонимы;
+   открыть страницу вакансии только для ограниченной очереди новых и изменённых
+   записей, затем передать их в существующий путь нормализации, импорта и
+   скоринга. Каждая запись от сверки входящих сообщений до покрытия использует
+   `--defer-render --run-lease <token>`;
+8. score the real mandate, hard constraints, and open questions;
+9. prepare only in-scope actions; persist an exact `authorized` action record
+   before any attempt—score and `auto_apply` are not authorization;
+10. append attempted/blocked/failed evidence and verify visible success before
+    adding `visibly_confirmed`;
+11. после последнего `attempted`/`visibly_confirmed` проверить статус и, если
+    указано `reconcile_inbound_after_outbound`, повторно сверить только входящие
+    источники новым доказательством с более поздним `observed_at`; исходящее
+    действие не повторять;
+12. сохранять каждую проверенную частичную единицу через
+    `checkpoint-daily-run-work`; при внешней блокировке чисто приостановить
+    запуск;
+13. выполнить все включённые проверки источников с отказом при неполноте и теми
+    же флагами отложенного `render`, один раз вызвать
+    `finalize-daily-run --run-lease <token>`, проверить точный запуск через
+    `operational-doctor --run-id <run_id>` и подготовить отчёт.
+
+Отложенные записи фиксируют SQLite и её ревизию `dirty` одной транзакцией, не
+затрагивая ранее опубликованную панель. Если финализация прервана или истекло
+ограниченное ожидание блокировки, повторите ту же финализацию с тем же токеном
+либо после истечения `lease` получите новый токен через `resume-daily-run`.
+Срок жизни запуска не зависит от срока жизни `lease`. Не начинайте второй
+запуск, не очищайте `lease` вручную и не принимайте состояние `dirty` за потерю
+доказательств. При активном `lease` CLI отклоняет обычный `rebuild` и любое
+изменение без отложенного `render`.
+
+При блокировке входом, CAPTCHA или источником зафиксируйте точную причину через
+`block-daily-run-work` или `mark-daily-run-work-uncertain`, затем выполните
+`pause-daily-run --reason ...`. Следующая задача начинает с компактного статуса
+и не повторяет завершённую работу. Если изменился отпечаток конфигурации, только
+`refresh-daily-run-plan --reason ...` может создать новую аудируемую ревизию
+плана; молчаливое сокращение объёма запрещено.
+
+План сохраняет `external_action_id_floor`, поэтому новая запись текущего запуска
+и прежний неопределённый `attempted` требуют сверки, а старые
+`drafted`/`authorized` остаются видимым `legacy_backlog`. Обычный refresh не
+удаляет уже замороженное требование. Для миграции такого active plan используйте
+только явный `--reclassify-legacy-external-actions --reason ...`; это создаёт
+манифест и переход, не меняет append-only журнал и не подтверждает доставку.
+
+### HH P2: рабочий сбор и безопасное продолжение
+
+Сначала используйте авторизованный встроенный браузер Codex и сохраняйте
+текущую сессию. Не переключайтесь молча в Chrome, изолированный профиль
+Playwright, другой аккаунт, HTTP-запросы или скрытый API HH. Адаптер читает
+только видимый DOM и прокручивает страницу вниз для проверки стабильности; он
+не нажимает элементы, изменяющие внешнее состояние. CAPTCHA, страница входа,
+отказ в доступе или недостаточное доказательство DOM фиксируются как
+блокировка точного рабочего элемента P1.
+
+Для каждого потока:
+
+```bash
+python3 scripts/jobctl.py plan-hh-acquisition \
+  --run-id <run_id> --stream-key <stream_key> \
+  --source-kind ordinary_search --query-json tmp/<stream>-query.json \
+  --defer-render --run-lease <token> --json
+python3 scripts/jobctl.py hh-browser-adapter --json
+python3 scripts/jobctl.py record-hh-page \
+  --run-id <run_id> --stream-key <stream_key> \
+  --capture tmp/<stream>-page-NNNN.json \
+  --defer-render --run-lease <token> --json
+python3 scripts/jobctl.py next-hh-work \
+  --run-id <run_id> --stream-key <stream_key> --json
+```
+
+`hh-browser-adapter --json` возвращает контракт
+`returned_adapter_object_v1`. Выполните проверенный файл как выражение в
+авторизованном встроенном браузере, сохраните возвращённый объект локально и
+вызывайте `adapter.captureListPage(...)`,
+`adapter.capturePersonalRecommendations(...)` или
+`adapter.captureVacancyDetail()`. Адаптер не устанавливается в `globalThis`.
+Передавайте `page_stability_samples`, `page_stability_delay_ms` и
+`page_stability_timeout_ms`. Он предпочитает
+`mutation_observer_visible_dom`, а при отсутствующем или непригодном
+`MutationObserver` использует `timed_visible_dom_sampling`. Таймерный путь не
+выдумывает observer-evidence; оба пути требуют непрерывного стабильного окна и
+отдельного совпавшего финального снимка.
+
+Если `plan-hh-acquisition` сообщает, что прежние параметры уже начатого сбора
+не совпадают, сначала отличите пустой замороженный план от реально начатого
+источника. Для обычного потока переоткройте точный элемент
+`hh_coverage/<item_key>` через `invalidate-daily-run-work --reason ...`; для
+персональных рекомендаций переоткройте весь шаг `personal_recommendations`.
+Только если состояние всё ещё `planned`, `next_page = 0`,
+`last_verified_page = -1` и нет ни снимка, карточки, детали, текущей контрольной
+точки, завершающего манифеста или иного прогресса, выполните:
+
+```bash
+python3 scripts/jobctl.py invalidate-hh-zero-evidence-plan \
+  --run-id <run_id> --stream-key <stream_key> \
+  --reason "явное перепланирование после обновления DOM-адаптера" \
+  --defer-render --run-lease <token> --json
+python3 scripts/jobctl.py plan-hh-acquisition \
+  --run-id <run_id> --stream-key <stream_key> \
+  --source-kind ordinary_search --query-json tmp/<stream>-query.json \
+  --defer-render --run-lease <token> --json
+```
+
+Для `personal_recommendations` замените только `--source-kind`, сохранив тот же
+query fingerprint. Первая команда append-only фиксирует `run_id`,
+`stream_key`, прежнюю версию адаптера, прежний отпечаток конфигурации, причину и
+время оператора, а также подтверждение, что доказательства источника не
+отбрасывались. Audit-only blocker/reopen/invalidation манифесты и переходы P1
+остаются append-only; новое событие ссылается на их хеши и ID. Они не считаются
+доказательством HH, пока не содержат снимок, карточку, деталь, сессию, границу,
+контрольную точку, завершение или счётчик. Неизвестный либо source-bearing
+формат блокирует recovery. Для пустого плана `hh-dom-v1.0.1` audit-only blocker
+должен точно подтверждать отсутствующий или непригодный `MutationObserver`;
+иной blocker не разрешает recovery на v1.0.2. Команда удаляет только пустую
+текущую строку плана и
+никогда не изменяет успешную историческую `hh_stream_checkpoints`. Повтор
+команды идемпотентен. Любое обнаруженное доказательство означает отказ: не
+удаляйте его и расследуйте точное состояние потока. После нового плана проверьте события
+`zero_evidence_plan_invalidated` и `zero_evidence_plan_replanned` через
+`inspect-hh-checkpoint`, затем продолжайте обычным `record-hh-page`.
+
+Не используйте точное число карточек как единственное доказательство. Адаптер
+должен вернуть одинаковые снимки набора канонических ID, стабильную высоту или
+признак конца, погасший индикатор загрузки, отсутствие релевантной мутации
+после дополнительной прокрутки вниз, валидные числовые ID и согласованную
+пагинацию. При `source_reported_count_drift` повторите независимый устойчивый
+снимок той же страницы. Различие хеша ID, порядка, навигации или данных сессии
+блокирует поток; 99/100 нельзя принять по одной записи, а устойчивый избыток
+карточек нельзя обрезать.
+
+`record-hh-page` пакетно сверяет ID с каноническими вакансиями и псевдонимами,
+сохраняет контрольную точку P1 и возвращает ограниченный список новых и
+изменённых вакансий. Не пересылайте агенту тысячи известных ID и не пишите
+одноразовый скрипт сверки. Для каждого возвращённого ID получите
+`captureVacancyDetail()` в той же сессии и запишите `record-hh-detail`. Затем
+завершите обычный поток через `finalize-hh-stream`. Персональные рекомендации
+планируются как `source-kind personal_recommendations`, записываются отдельным
+методом адаптера и завершаются только через
+`finalize-hh-personal-recommendations`.
+
+После прерывания сначала выполните `daily-run-status`, затем
+`resume-daily-run`; статус укажет точную страницу, повтор неустойчивого снимка
+или проверки счётчика, ограниченные детали, переход к полному обходу либо
+финализацию. Не восстанавливайте состояние страницы из текстового описания.
+При расхождении полного аудита выполните повторный полный обход или `shadow`;
+небезопасная контрольная точка уже инвалидирована программно. Зелёный
+структурный `doctor --strict` не означает готовность ежедневного запуска к
+закрытию: обязательно нужны `finalize-daily-run` и проверка точного запуска
+командой `operational-doctor --run-id <run_id>`. JSON-снимки храните только
+внутри выбранного `JOB_SEARCH_HOME`; Engine нормализует и сжимает их с SHA-256.
+Не сохраняйте полный HTML авторизованной страницы, cookie, токены или
+идентификаторы аккаунта. Не удаляйте доказательства незавершённого запуска или
+неудачного аудита; старые завершённые артефакты архивируйте только по явно
+заданной локальной политике хранения.
+
+### Явная отмена frozen follow-up
+
+Если пользователь отменяет одно точное наступившее повторное обращение без
+отзыва отклика, найдите `due_followups/<item_key>` в
+`daily-run-status --verbose` и выполните:
+
+```bash
+python3 scripts/jobctl.py cancel-due-followup-obligation \
+  --run-id <run_id> --item-key <due:item:key> \
+  --reason "<точная причина пользователя>" \
+  --defer-render --run-lease <token> --json
+```
+
+Команда сверяет точный frozen scope, очищает только даты follow-up вакансии и
+эффективного отклика, сохраняет их status/stage и `lifecycle_events`, затем
+пишет append-only `user_cancelled_followup_obligation` и завершает item. Она не
+создаёт отказ, отзыв, входящий ответ или доказательство доставки. Точный повтор
+идемпотентен; другой run/item, пустая причина, новая эффективная запись отклика
+или другая текущая дата приводят к отказу. Обычный `refresh-daily-run-plan`
+сохраняет это завершение. Повторное появление той же даты инвалидирует его и
+блокирует `finalize-daily-run` до нового разрешения.
+
+### Повторная проверка старого human inbound
+
+Если frozen follow-up уже разрешён старым `human_reply`, чья правдивая дата
+предшествует запуску, не используйте пользовательскую отмену и не переписывайте
+время взаимодействия. Свежо откройте точный исходный диалог и подготовьте
+`reverified_historical_inbound_v1`, включив immutable dedupe/event/evidence
+hash, точный vacancy/application/follow-up scope, канал, target, remote boundary
+и обязательные true-флаги проверки. Затем выполните:
+
+```bash
+python3 scripts/jobctl.py resolve-due-followup-from-reverified-inbound \
+  --run-id <run_id> --item-key <due:item:key> \
+  --interaction-id <original_interaction_id> \
+  --observed-at <current_iso_timestamp> --channel <exact_channel> \
+  --conversation-target <exact_target> \
+  --remote-evidence-reference <exact_remote_reference> \
+  --manifest tmp/reverified-inbound.json \
+  --defer-render --run-lease <token> --json
+```
+
+Команда принимает только исходный effective `human_reply`, который остаётся
+последним взаимодействием и после которого нет исходящего действия,
+терминального перехода или повторно установленной due date. Она добавляет
+`reverified_historical_inbound_due_resolution`, не создаёт новый inbound, не
+меняет исходный `event_at`, status/stage или lifecycle и не смешивается с
+`user_cancelled_followup_obligation`. Точный повтор идемпотентен; изменение
+run/item/scope/hash/канала/target/remote boundary блокируется.
 
 Use [`prompts/scan_channel.md`](../prompts/scan_channel.md) when the task is
 limited to one company or source. Use
@@ -169,10 +401,17 @@ Preserve source URL, source identity, discovery date, title, company, mandate
 evidence, score, risks, open questions, and next action. Do not manufacture a
 URL or employer identity to make a row importable.
 
-Preserve raw `source_stream`. Local `[source_stream_aliases]` may consolidate
-historical names and case variants for reporting, but unmapped values retain
-their raw identity and remain visible in `reports/source_streams.md`. Aliases do
-not alter the fail-closed `search.required_streams` coverage manifest.
+CAPTCHA, logged-out/access-error pages, malformed payloads, and source-aware
+missing required fields belong in quarantine, not among low-fit vacancies.
+Inspect `quarantine-report`; reprocess one exact ID only after correcting its
+raw/replacement payload. `classify-legacy-records --dry-run` never mutates
+ambiguous history.
+
+Preserve raw `source_stream`. Local `[source_stream_aliases]` may map one whole
+raw label to one or several normalized labels, but arbitrary punctuation is
+never split. Unmapped values retain their raw identity and remain visible in
+`reports/source_streams.md`. Alias changes refresh only derived links on
+rebuild; they do not alter the fail-closed `search.required_streams` manifest.
 
 After ingest, reconcile scan identities by `(channel, external_id)` against
 both `vacancies` and `vacancy_external_aliases`. A semantic repost is healthy
@@ -199,6 +438,35 @@ python3 scripts/jobctl.py check-coverage tmp/search_coverage_YYYY-MM-DD.json
 Do not claim a complete run after a non-zero exit. The SQLite checkpoint and
 `reports/search_coverage.md` preserve the resumable incomplete state.
 
+For configured public Telegram channels, build a plan before browsing:
+
+```bash
+python3 scripts/jobctl.py build-telegram-plan --run-date YYYY-MM-DD \
+  --output tmp/telegram_coverage_YYYY-MM-DD.json --json
+```
+
+Never-completed channels receive the local initial lookback (30 days by
+default); completed channels receive their post-ID delta. Start at each current
+public preview, paginate to the generated date/post boundary, classify every
+fetched post, and ingest every scored vacancy with the exact post URL,
+`source_stream = telegram:<handle>`, and a stable
+`telegram:<handle>:<post_id>` identity (plus a stable item suffix when a post
+contains several vacancies). Then run:
+
+```bash
+python3 scripts/jobctl.py check-telegram-coverage \
+  tmp/telegram_coverage_YYYY-MM-DD.json
+```
+
+The cursor is stored in `source_checkpoints` only after the whole manifest
+passes. Inspect `reports/source_checkpoints.md` when resuming; an incomplete
+attempt in `search_runs` is evidence of a blocker, not permission to skip it.
+Контракт `telegram_source_units_v1` считает граничную `out_of_scope` публикацию
+в `raw` и `processed`, но не в `found`; повторы наблюдений страниц добавляются
+только в `raw`, а неверная запись не считается обработанной. Не подгоняйте
+счётчики вручную: для успешного канала должны выполняться
+`raw >= processed >= reconciled` и проверенная граница.
+
 ### Reconcile downstream outcomes
 
 An automated acknowledgment is an inbound automated employer interaction, not
@@ -207,12 +475,15 @@ interaction only when the actor/humanity classification and evidence note are
 stored. Neither event changes the funnel automatically. Record interview or
 rejection state separately after visible evidence.
 
-Use `conversion-report --as-of YYYY-MM-DD --json` or the generated
-`reports/conversion_cohorts.md`. The cohort grain is one vacancy at its earliest
-confirmed application. Human-reply maturity is 14 calendar days; interview-1
-maturity is 30. First-touch source attribution selects the earliest hit on or
-before the application date, then `source_hits.id`. Never infer historical
-replies from status text; absent structured history must display `n/a`.
+Use `outcome-scorecard --as-of YYYY-MM-DD --json` or the generated
+`reports/outcome_scorecard.md`. The cohort grain is one canonical vacancy at
+its earliest confirmed-application lifecycle event. Human-reply maturity is 14
+calendar days; completed-interview maturity is 30. Invitations and scheduled
+slots are separate and do not count as completed. First-touch source
+attribution uses the explicitly linked application source, otherwise the
+earliest hit on or before application date and then `source_hits.id`. Never
+infer historical outcomes from status text; incomplete history must display
+`n/a`.
 
 ### Maintain employer accounts and factors
 
@@ -222,6 +493,10 @@ company matching is not. `ai_adoption` is an employer signal only. It does not
 prove candidate fit, growth, culture, or enterprise AI transformation
 experience. Vacancy factors such as `hiring_reality` and `human_access` inform
 action planning but never replace strategic fit or change score automatically.
+Maintain the configured active-account portfolio limit, review cadence,
+website/careers freshness, target campaign/role metadata, governance evidence,
+and human-path status. These remain separate from vacancy fit and permission to
+contact a person.
 
 ## 7. Handle blockers
 

@@ -8,22 +8,37 @@ the database and regenerates reader-friendly views plus a static dashboard.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import hashlib
 import html
 import json
 import os
 import re
+import shlex
 import shutil
+import socket
 import sqlite3
 import statistics
 import sys
 import time
 import unicodedata
+import uuid
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from urllib.parse import urlsplit, urlunsplit
+from zoneinfo import ZoneInfo
+
+try:  # POSIX is the primary deployment target; Windows uses the stdlib fallback.
+    import fcntl
+except ImportError:  # pragma: no cover - exercised on Windows only.
+    fcntl = None
+
+try:  # pragma: no cover - exercised on Windows only.
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX path.
+    msvcrt = None
 
 from jobsearch_config import Settings, display_path, load_settings
 from search_coverage import (
@@ -31,10 +46,90 @@ from search_coverage import (
     semantic_vacancy_fingerprint,
     validate_coverage_manifest,
 )
+from telegram_source import build_telegram_plan, validate_telegram_manifest
+
+
+_DAILY_RUN_API: Any | None = None
+_HH_ACQUISITION_API: Any | None = None
+
+
+def _daily_run_api() -> Any:
+    """Load P1 orchestration only for commands that actually need it."""
+    global _DAILY_RUN_API
+    if _DAILY_RUN_API is None:
+        import daily_run_orchestration
+
+        _DAILY_RUN_API = daily_run_orchestration
+    return _DAILY_RUN_API
+
+
+def _lazy_daily_run(name: str) -> Any:
+    def call(*args: Any, **kwargs: Any) -> Any:
+        return getattr(_daily_run_api(), name)(*args, **kwargs)
+
+    return call
+
+
+def _hh_acquisition_api() -> Any:
+    """Load P2 acquisition only for schema or HH commands that need it."""
+    global _HH_ACQUISITION_API
+    if _HH_ACQUISITION_API is None:
+        import hh_acquisition
+
+        _HH_ACQUISITION_API = hh_acquisition
+    return _HH_ACQUISITION_API
+
+
+def _lazy_hh_acquisition(name: str) -> Any:
+    def call(*args: Any, **kwargs: Any) -> Any:
+        return getattr(_hh_acquisition_api(), name)(*args, **kwargs)
+
+    return call
+
+
+append_daily_run_transition = _lazy_daily_run("append_transition")
+bind_daily_run_lease = _lazy_daily_run("bind_lease")
+block_daily_run_work = _lazy_daily_run("block_work")
+cancel_due_followup_obligation_work = _lazy_daily_run(
+    "cancel_due_followup_obligation"
+)
+resolve_due_followup_from_reverified_inbound_work = _lazy_daily_run(
+    "resolve_due_followup_from_reverified_inbound"
+)
+daily_run_closeout_readiness = _lazy_daily_run("closeout_readiness")
+complete_daily_run_work = _lazy_daily_run("complete_work")
+create_durable_daily_run = _lazy_daily_run("create_run")
+ensure_v9_schema = _lazy_daily_run("ensure_v9_schema")
+ensure_v10_schema = _lazy_hh_acquisition("ensure_v10_schema")
+schema_v10_contract_issues = _lazy_hh_acquisition("schema_v10_issues")
+enter_daily_run_finalizing = _lazy_daily_run("enter_finalizing")
+final_render_already_published = _lazy_daily_run("final_render_already_published")
+get_durable_daily_run = _lazy_daily_run("get_run")
+integrate_coverage_result = _lazy_daily_run("integrate_coverage_result")
+invalidate_daily_run_work = _lazy_daily_run("invalidate_work")
+mark_daily_run_completed = _lazy_daily_run("mark_completed")
+mark_daily_run_work_uncertain = _lazy_daily_run("mark_uncertain")
+note_expired_lease = _lazy_daily_run("note_expired_lease")
+note_external_action_event = _lazy_daily_run("note_external_action_event")
+checkpoint_daily_run_work = _lazy_daily_run("record_checkpoint")
+refresh_durable_daily_run_plan = _lazy_daily_run("refresh_plan")
+reclassify_legacy_external_action_work = _lazy_daily_run(
+    "reclassify_legacy_external_action_work"
+)
+refresh_durable_daily_run_snapshot = _lazy_daily_run("refresh_run_snapshot")
+release_daily_run_lease = _lazy_daily_run("release_lease")
+durable_daily_run_status = _lazy_daily_run("run_status")
+start_daily_run_work = _lazy_daily_run("start_work")
 
 
 CODE_ROOT = Path(__file__).resolve().parents[1]
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 10
+DEFAULT_LOCK_TIMEOUT_SECONDS = 30.0
+DEFAULT_DAILY_RUN_LEASE_SECONDS = 4 * 60 * 60
+MAX_DAILY_RUN_LEASE_SECONDS = 24 * 60 * 60
+DAILY_RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+DASHBOARD_VACANCY_LIMIT = 1000
+PROJECTION_GENERATIONS_TO_KEEP = 2
 
 SETTINGS: Settings
 ROOT: Path
@@ -55,7 +150,21 @@ REQUIRED_SEARCH_STREAMS: tuple[str, ...]
 DEFAULT_SEARCH_PERIOD_DAYS: int
 SEARCH_ITEMS_PER_PAGE: int
 CHANNEL_LABELS: dict[str, str]
-SOURCE_STREAM_ALIASES: dict[str, str]
+SOURCE_STREAM_ALIASES: dict[str, tuple[str, ...]]
+TELEGRAM_ENABLED: bool
+TELEGRAM_INITIAL_LOOKBACK_DAYS: int
+TELEGRAM_CHANNELS: tuple[Any, ...]
+DECISION_CAMPAIGN_IDS: tuple[str, ...]
+DECISION_ROLE_FAMILIES: tuple[str, ...]
+DECISION_RESUME_IDS: tuple[str, ...]
+DECISION_MESSAGE_VARIANTS: tuple[str, ...]
+WIP_BUCKETS: tuple[Any, ...]
+WIP_PAGE_SIZE: int
+PERSONAL_RECOMMENDATIONS_ENABLED: bool
+PERSONAL_RECOMMENDATION_STREAM: str
+ACTIVE_POLICY_VERSION: str
+ACTIVE_POLICY_EFFECTIVE_DATE: str
+ACCOUNT_ACTIVE_PORTFOLIO_LIMIT: int
 
 
 def configure_runtime(config_path: Path | None = None) -> None:
@@ -67,7 +176,13 @@ def configure_runtime(config_path: Path | None = None) -> None:
     global DIRECT_OUTREACH_CHANNELS, FOLLOW_UP_CHANNELS
     global MAX_DIRECT_MESSAGES_PER_ROUND, REQUIRED_SEARCH_STREAMS
     global DEFAULT_SEARCH_PERIOD_DAYS, SEARCH_ITEMS_PER_PAGE, CHANNEL_LABELS
-    global SOURCE_STREAM_ALIASES
+    global SOURCE_STREAM_ALIASES, TELEGRAM_ENABLED
+    global TELEGRAM_INITIAL_LOOKBACK_DAYS, TELEGRAM_CHANNELS
+    global DECISION_CAMPAIGN_IDS, DECISION_ROLE_FAMILIES, DECISION_RESUME_IDS
+    global DECISION_MESSAGE_VARIANTS, WIP_BUCKETS, WIP_PAGE_SIZE
+    global PERSONAL_RECOMMENDATIONS_ENABLED, PERSONAL_RECOMMENDATION_STREAM
+    global ACTIVE_POLICY_VERSION, ACTIVE_POLICY_EFFECTIVE_DATE
+    global ACCOUNT_ACTIVE_PORTFOLIO_LIMIT
 
     SETTINGS = load_settings(CODE_ROOT, config_path)
     ROOT = SETTINGS.workspace_root
@@ -89,6 +204,24 @@ def configure_runtime(config_path: Path | None = None) -> None:
     SEARCH_ITEMS_PER_PAGE = SETTINGS.search.items_per_page
     CHANNEL_LABELS = dict(SETTINGS.channel_labels)
     SOURCE_STREAM_ALIASES = dict(SETTINGS.search.stream_aliases)
+    TELEGRAM_ENABLED = SETTINGS.telegram.enabled
+    TELEGRAM_INITIAL_LOOKBACK_DAYS = SETTINGS.telegram.initial_lookback_days
+    TELEGRAM_CHANNELS = SETTINGS.telegram.channels
+    DECISION_CAMPAIGN_IDS = SETTINGS.decision.campaign_ids
+    DECISION_ROLE_FAMILIES = SETTINGS.decision.role_families
+    DECISION_RESUME_IDS = SETTINGS.decision.resume_ids
+    DECISION_MESSAGE_VARIANTS = SETTINGS.decision.message_variants
+    WIP_BUCKETS = SETTINGS.wip.buckets
+    WIP_PAGE_SIZE = SETTINGS.wip.page_size
+    PERSONAL_RECOMMENDATIONS_ENABLED = (
+        SETTINGS.search.personal_recommendations_enabled
+    )
+    PERSONAL_RECOMMENDATION_STREAM = (
+        SETTINGS.search.personal_recommendation_stream
+    )
+    ACTIVE_POLICY_VERSION = SETTINGS.policy.active_version
+    ACTIVE_POLICY_EFFECTIVE_DATE = SETTINGS.policy.effective_date
+    ACCOUNT_ACTIVE_PORTFOLIO_LIMIT = SETTINGS.account.active_portfolio_limit
 
 
 # Load safe built-in defaults at import time. main() reloads the selected local
@@ -123,6 +256,76 @@ EMPLOYER_INTERACTION_TYPES = {
     "rejection",
     "other",
 }
+LIFECYCLE_EVENT_TYPES = {
+    "application_confirmed",
+    "rejected",
+    "interview_invited",
+    "interview_scheduled",
+    "interview_completed",
+    "interview_cancelled",
+    "interview_no_show_candidate",
+    "interview_no_show_employer",
+    "offer_received",
+}
+INTERVIEW_EVENT_TYPES = {
+    "interview_invited",
+    "interview_scheduled",
+    "interview_completed",
+    "interview_cancelled",
+    "interview_no_show_candidate",
+    "interview_no_show_employer",
+}
+EXTERNAL_ACTION_TYPES = {
+    "application",
+    "message",
+    "follow_up",
+    "mailbox_mutation",
+    "publication",
+    "other",
+}
+EXTERNAL_ACTION_STATES = {
+    "drafted",
+    "authorized",
+    "attempted",
+    "visibly_confirmed",
+    "blocked",
+    "failed",
+}
+ACTION_STATES = {
+    "review",
+    "needs_input",
+    "employer_reply",
+    "follow_up",
+    "account_research",
+    "waiting",
+    "none",
+}
+WIP_BUCKET_KEYS = {
+    "urgent",
+    "due_follow_up",
+    "deep_review",
+    "account_research",
+    "backlog",
+}
+HUMAN_PATH_STATUSES = {
+    "unknown",
+    "not_searched",
+    "researching",
+    "verified",
+    "not_found",
+    "blocked",
+}
+HARD_GATE_RESULTS = {"pass", "fail", "unknown"}
+QUARANTINE_CLASSIFICATIONS = {
+    "captcha",
+    "logged_out",
+    "access_error",
+    "malformed",
+    "missing_required_fields",
+    "non_vacancy",
+    "unknown",
+}
+QUARANTINE_STATUSES = {"pending", "reprocessed", "dismissed"}
 EMPLOYER_ACTOR_TYPES = {
     "recruiter",
     "hiring_manager",
@@ -148,30 +351,83 @@ CORE_VACANCY_FACTORS = {
 }
 FACTOR_KEY_RE = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
 EXPECTED_TABLES = {
+    "action_events",
     "applications",
     "contact_searches",
     "employer_contacts",
     "employer_accounts",
     "employer_account_signals",
     "employer_interactions",
+    "employer_interaction_invalidations",
     "evaluations",
     "followup_rounds",
     "import_issues",
     "interview_summaries",
+    "lifecycle_events",
+    "external_actions",
+    "daily_run_leases",
+    "daily_runs",
+    "daily_run_plan_revisions",
+    "daily_run_steps",
+    "daily_run_step_dependencies",
+    "daily_run_work_items",
+    "daily_run_manifests",
+    "daily_run_transitions",
+    "hh_stream_checkpoints",
+    "hh_stream_checkpoint_history",
+    "hh_stream_runs",
+    "hh_page_captures",
+    "hh_page_items",
+    "hh_vacancy_snapshots",
+    "hh_detail_queue",
+    "hh_incremental_events",
+    "migration_log",
     "outreach_messages",
+    "policy_versions",
+    "projection_state",
+    "quarantine_records",
+    "screening_decisions",
     "source_hits",
+    "source_hit_labels",
+    "source_labels",
     "search_coverage",
     "search_runs",
+    "source_checkpoints",
     "stage_events",
     "vacancies",
     "vacancy_employer_accounts",
     "vacancy_external_aliases",
     "vacancy_factors",
     "vacancy_fingerprints",
+    "vacancy_decision_metadata",
 }
 EXPECTED_INDEXES = {
+    "idx_action_events_vacancy",
+    "idx_daily_run_leases_one_active",
+    "idx_daily_run_leases_status",
+    "idx_daily_runs_one_open",
+    "idx_daily_runs_status",
+    "idx_daily_run_steps_state",
+    "idx_daily_run_work_items_state",
+    "idx_daily_run_manifests_lookup",
+    "idx_daily_run_transitions_lookup",
+    "idx_hh_stream_checkpoints_eligibility",
+    "idx_hh_checkpoint_history_lookup",
+    "idx_hh_stream_runs_state",
+    "idx_hh_page_captures_lookup",
+    "idx_hh_page_items_external",
+    "idx_hh_detail_queue_state",
+    "idx_hh_incremental_events_lookup",
     "idx_employer_account_signals_account",
+    "idx_employer_interaction_invalidations_vacancy",
+    "idx_employer_interactions_identity",
     "idx_employer_interactions_vacancy",
+    "idx_external_actions_vacancy",
+    "idx_lifecycle_events_vacancy",
+    "idx_quarantine_status",
+    "idx_screening_decisions_policy",
+    "idx_source_checkpoints_source",
+    "idx_source_hit_labels_label",
     "idx_vacancy_external_aliases_external_id",
     "idx_vacancy_external_aliases_vacancy",
     "idx_vacancy_employer_accounts_account",
@@ -214,15 +470,106 @@ STAGE_PRIORITY = {
 }
 
 STAGE_LABELS = {
-    "seen": "Seen",
-    "needs_input": "Needs Input",
-    "follow_up": "Follow-up",
-    "applied": "Applied",
-    "interview_1": "Interview 1",
-    "interview_2": "Interview 2",
-    "interview_3": "Interview 3",
-    "offer": "Offer",
-    "rejected": "Rejected",
+    "seen": "Новая",
+    "needs_input": "Нужны данные",
+    "follow_up": "Повторное обращение",
+    "applied": "Отклик подтверждён",
+    "interview_1": "Интервью 1",
+    "interview_2": "Интервью 2",
+    "interview_3": "Интервью 3",
+    "offer": "Предложение",
+    "rejected": "Отказ",
+}
+
+ACTION_STATE_LABELS = {
+    "review": "проверка",
+    "needs_input": "нужны данные",
+    "employer_reply": "ответ работодателя",
+    "follow_up": "повторное обращение",
+    "account_research": "исследование работодателя",
+    "waiting": "ожидание",
+    "none": "действий нет",
+}
+
+HUMAN_PATH_LABELS = {
+    "unknown": "неизвестно",
+    "not_searched": "поиск не проводился",
+    "researching": "идёт поиск",
+    "verified": "проверен",
+    "not_found": "не найден",
+    "blocked": "заблокирован",
+}
+
+QUARANTINE_LABELS = {
+    "captcha": "CAPTCHA",
+    "logged_out": "сеанс не авторизован",
+    "access_error": "ошибка доступа",
+    "malformed": "некорректная запись",
+    "missing_required_fields": "нет обязательных полей",
+    "non_vacancy": "не вакансия",
+    "unknown": "неизвестно",
+}
+
+QUARANTINE_STATUS_LABELS = {
+    "pending": "ожидает обработки",
+    "reprocessed": "обработана повторно",
+    "dismissed": "исключена после проверки",
+}
+
+ACCOUNT_PRIORITY_LABELS = {
+    "critical": "критический",
+    "high": "высокий",
+    "medium": "средний",
+    "low": "низкий",
+}
+
+ACCOUNT_STATUS_LABELS = {
+    "target": "целевой",
+    "active": "активный",
+    "watch": "под наблюдением",
+    "paused": "приостановлен",
+    "inactive": "неактивный",
+    "archived": "архивный",
+}
+
+EMPLOYER_SIGNAL_TYPE_LABELS = {
+    "technology_adoption": "внедрение технологий",
+    "ai_adoption": "внедрение ИИ",
+    "hiring_growth": "рост найма",
+    "restructuring": "реструктуризация",
+    "leadership_change": "смена руководства",
+    "culture": "культура",
+    "other": "другое",
+}
+
+EVIDENCE_CONFIDENCE_LABELS = {
+    "unknown": "неизвестна",
+    "low": "низкая",
+    "medium": "средняя",
+    "high": "высокая",
+    "confirmed": "подтверждена",
+}
+
+CONTACT_CONFIDENCE_LABELS = {
+    "confirmed": "подтверждена",
+    "strong": "высокая",
+    "weak": "низкая",
+}
+
+CONTACT_RELATIONSHIP_LABELS = {
+    "hiring_manager": "нанимающий руководитель",
+    "recruiter": "рекрутер",
+    "talent_partner": "партнёр по подбору",
+    "founder": "основатель",
+    "other": "другая",
+}
+
+CONTACT_SEARCH_STATUS_LABELS = {
+    "found": "найден",
+    "reused_verified_contact": "использован проверенный контакт",
+    "not_found": "не найден",
+    "ambiguous": "неоднозначный результат",
+    "unreachable": "недоступен",
 }
 
 FUNNEL_STAGES = [
@@ -243,7 +590,7 @@ def now_iso() -> str:
 
 def add_business_days(value: str, business_days: int) -> str:
     if business_days < 1:
-        raise ValueError("business_days must be positive")
+        raise ValueError("Число рабочих дней должно быть положительным.")
     current = dt.date.fromisoformat(value)
     added = 0
     while added < business_days:
@@ -295,7 +642,7 @@ def unique_outreach_channels(
             continue
         if channel not in allowed_channels:
             allowed = ", ".join(allowed_channels)
-            raise ValueError(f"Unsupported outreach channel '{value}'. Allowed: {allowed}")
+            raise ValueError(f"Неподдерживаемый канал {value!r}. Допустимо: {allowed}.")
         if channel not in result:
             result.append(channel)
     return result
@@ -316,13 +663,104 @@ def clean_cell(value: str | None) -> str:
 
 
 def canonical_source_stream(value: str | None) -> tuple[str, bool]:
-    """Return the current config-backed canonical key while preserving raw input."""
+    """Return the deterministic primary label for compatibility readers."""
 
     raw = clean_cell(value)
     if not raw:
         return "unknown", False
     mapped = SOURCE_STREAM_ALIASES.get(raw.casefold())
-    return (mapped if mapped else raw), mapped is not None
+    labels = mapped or ()
+    return (labels[0] if labels else raw), bool(labels)
+
+
+def canonical_source_labels(value: str | None) -> tuple[tuple[str, ...], str]:
+    """Resolve explicit aliases conservatively and return labels plus mapping kind.
+
+    Raw text is never split on punctuation.  A multi-label result therefore
+    exists only when the local configuration explicitly maps the whole raw key
+    to several canonical labels.
+    """
+
+    raw = clean_cell(value)
+    if not raw:
+        return (("unknown",), "unknown")
+    mapped = SOURCE_STREAM_ALIASES.get(raw.casefold())
+    if mapped:
+        return (mapped, "configured_alias")
+    for configured in REQUIRED_SEARCH_STREAMS:
+        if configured.casefold() == raw.casefold():
+            return ((configured,), "configured_identity")
+    return ((raw,), "raw_identity")
+
+
+def configured_value(
+    value: str | None,
+    allowed: tuple[str, ...],
+    *,
+    label: str,
+    allow_unknown: bool = True,
+) -> str | None:
+    candidate = clean_cell(value)
+    if not candidate:
+        return None if allow_unknown else ""
+    matches = {item.casefold(): item for item in allowed}
+    if candidate.casefold() not in matches:
+        allowed_label = ", ".join(allowed) if allowed else "нет настроенных значений"
+        raise ValueError(
+            f"{label}: значение {candidate!r} отсутствует в локальной конфигурации "
+            f"({allowed_label})"
+        )
+    return matches[candidate.casefold()]
+
+
+def validate_hard_gates(value: Any) -> list[dict[str, str]]:
+    if value in (None, ""):
+        return []
+    if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
+        raise ValueError("hard_gates должен быть массивом объектов.")
+    result: list[dict[str, str]] = []
+    for index, item in enumerate(value, start=1):
+        gate = clean_cell(str(item.get("gate") or item.get("key") or ""))
+        status = clean_cell(str(item.get("result") or item.get("status") or "")).lower()
+        if not gate:
+            raise ValueError(f"Для hard_gates[{index}] требуется поле gate.")
+        if status not in HARD_GATE_RESULTS:
+            raise ValueError(
+                f"Поле hard_gates[{index}].result должно иметь значение pass, fail или unknown."
+            )
+        result.append(
+            {
+                "gate": gate,
+                "result": status,
+                "evidence_note": clean_cell(str(item.get("evidence_note") or "")),
+            }
+        )
+    return result
+
+
+def validate_unresolved_questions(value: Any) -> list[dict[str, str]]:
+    if value in (None, ""):
+        return []
+    if isinstance(value, str):
+        return [{"question": clean_cell(value), "status": "open"}] if clean_cell(value) else []
+    if not isinstance(value, list):
+        raise ValueError("unresolved_questions должен быть строкой или массивом.")
+    result: list[dict[str, str]] = []
+    for index, item in enumerate(value, start=1):
+        if isinstance(item, str):
+            question = clean_cell(item)
+            status = "open"
+        elif isinstance(item, dict):
+            question = clean_cell(str(item.get("question") or item.get("text") or ""))
+            status = clean_cell(str(item.get("status") or "open")).lower()
+        else:
+            raise ValueError(f"unresolved_questions[{index}] должен быть строкой или объектом.")
+        if not question:
+            raise ValueError(f"Для unresolved_questions[{index}] требуется текст вопроса.")
+        if status not in {"open", "resolved"}:
+            raise ValueError(f"Статус unresolved_questions[{index}] должен быть open или resolved.")
+        result.append({"question": question, "status": status})
+    return result
 
 
 def normalized_account_name(value: str | None) -> str:
@@ -335,13 +773,13 @@ def parse_iso_date(value: str, *, label: str) -> dt.date:
     try:
         return dt.date.fromisoformat(candidate)
     except ValueError as exc:
-        raise ValueError(f"{label} must be an ISO date (YYYY-MM-DD)") from exc
+        raise ValueError(f"{label}: требуется дата в формате ГГГГ-ММ-ДД.") from exc
 
 
 def parse_iso_datetime(value: str, *, label: str) -> dt.datetime:
     candidate = clean_cell(value)
     if not candidate:
-        raise ValueError(f"{label} is required")
+        raise ValueError(f"Требуется значение {label}.")
     if candidate.endswith("Z"):
         candidate = candidate[:-1] + "+00:00"
     try:
@@ -351,7 +789,7 @@ def parse_iso_datetime(value: str, *, label: str) -> dt.datetime:
             parsed = dt.datetime.combine(dt.date.fromisoformat(candidate), dt.time())
         except ValueError as exc:
             raise ValueError(
-                f"{label} must be an ISO date or timestamp"
+                f"{label}: требуется дата или отметка времени в формате ISO."
             ) from exc
     if parsed.tzinfo is not None:
         parsed = parsed.astimezone(dt.timezone.utc).replace(tzinfo=None)
@@ -362,13 +800,13 @@ def project_relative_file_path(path: Path) -> str:
     candidate = path if path.is_absolute() else ROOT / path
     resolved = candidate.resolve()
     if not resolved.exists():
-        raise FileNotFoundError(f"File not found: {candidate}")
+        raise FileNotFoundError(f"Файл не найден: {candidate}")
     if not resolved.is_file():
-        raise ValueError(f"Expected a file path: {candidate}")
+        raise ValueError(f"Ожидался путь к файлу: {candidate}")
     try:
         return resolved.relative_to(ROOT).as_posix()
     except ValueError as exc:
-        raise ValueError(f"Interview summary must be inside the project folder: {resolved}") from exc
+        raise ValueError(f"Резюме интервью должно находиться внутри рабочей области: {resolved}") from exc
 
 
 def parse_interview_no(stage: str | None) -> int | None:
@@ -481,6 +919,110 @@ def connect_db(path: Path | None = None) -> sqlite3.Connection:
     return conn
 
 
+class LockTimeoutError(RuntimeError):
+    """A bounded inter-process lock wait expired without changing durable state."""
+
+
+def lock_file_path(db_path: Path, kind: str) -> Path:
+    return db_path.parent / f".{db_path.name}.{kind}.lock"
+
+
+def validate_lock_timeout(value: float) -> float:
+    timeout = float(value)
+    if timeout < 0 or timeout > 3600:
+        raise ValueError("Тайм-аут блокировки должен быть от 0 до 3600 секунд.")
+    return timeout
+
+
+def read_lock_owner(handle: Any) -> str:
+    try:
+        handle.seek(0)
+        payload = handle.read().strip()
+    except OSError:
+        return ""
+    if not payload:
+        return ""
+    try:
+        owner = json.loads(payload)
+    except json.JSONDecodeError:
+        return payload[:240]
+    return ", ".join(
+        f"{key}={owner[key]}"
+        for key in ("kind", "pid", "host", "command", "acquired_at")
+        if owner.get(key) not in (None, "")
+    )
+
+
+def try_lock_file(handle: Any) -> None:
+    if fcntl is not None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return
+    if msvcrt is None:  # pragma: no cover - defensive unsupported platform path.
+        raise RuntimeError("Межпроцессные файловые блокировки недоступны.")
+    handle.seek(0)
+    if not handle.read(1):
+        handle.seek(0)
+        handle.write("0")
+        handle.flush()
+    handle.seek(0)
+    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+
+
+def unlock_file(handle: Any) -> None:
+    if fcntl is not None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return
+    if msvcrt is not None:  # pragma: no cover - Windows only.
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+@contextlib.contextmanager
+def interprocess_lock(
+    db_path: Path,
+    kind: str,
+    *,
+    timeout: float,
+) -> Iterator[None]:
+    """Use an OS-backed lock; stale metadata never blocks after the owner exits."""
+
+    timeout = validate_lock_timeout(timeout)
+    path = lock_file_path(db_path, kind)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + timeout
+    with path.open("a+", encoding="utf-8") as handle:
+        while True:
+            try:
+                try_lock_file(handle)
+                break
+            except (BlockingIOError, OSError) as exc:
+                if time.monotonic() >= deadline:
+                    owner = read_lock_owner(handle)
+                    detail = f" Текущий владелец: {owner}." if owner else ""
+                    raise LockTimeoutError(
+                        f"Блокировка {kind!r} занята дольше {timeout:.3f} с.{detail} "
+                        "Durable SQLite-состояние не откатывается; повторите команду "
+                        "с тем же аргументом или увеличьте --lock-timeout."
+                    ) from exc
+                time.sleep(min(0.05, max(deadline - time.monotonic(), 0.0)))
+        owner = {
+            "kind": kind,
+            "pid": os.getpid(),
+            "host": socket.gethostname(),
+            "command": " ".join(sys.argv[:4]),
+            "acquired_at": now_iso(),
+        }
+        handle.seek(0)
+        handle.truncate()
+        json.dump(owner, handle, ensure_ascii=False, sort_keys=True)
+        handle.flush()
+        os.fsync(handle.fileno())
+        try:
+            yield
+        finally:
+            unlock_file(handle)
+
+
 def missing_schema_tables(conn: sqlite3.Connection) -> list[str]:
     rows = conn.execute(
         "SELECT name FROM sqlite_master WHERE type = 'table'"
@@ -506,7 +1048,7 @@ def vacancy_external_alias_schema_issues(conn: sqlite3.Connection) -> list[str]:
         """
     ).fetchone()
     if not table_exists:
-        return ["table missing"]
+        return ["таблица отсутствует"]
 
     required_columns = {
         "id",
@@ -526,7 +1068,9 @@ def vacancy_external_alias_schema_issues(conn: sqlite3.Connection) -> list[str]:
     issues: list[str] = []
     missing_columns = required_columns - columns
     if missing_columns:
-        issues.append(f"missing columns: {','.join(sorted(missing_columns))}")
+        issues.append(
+            f"отсутствуют столбцы: {','.join(sorted(missing_columns))}"
+        )
 
     unique_channel_external_id = False
     alias_indexes = conn.execute(
@@ -544,7 +1088,7 @@ def vacancy_external_alias_schema_issues(conn: sqlite3.Connection) -> list[str]:
             unique_channel_external_id = True
             break
     if not unique_channel_external_id:
-        issues.append("missing UNIQUE(channel, external_id)")
+        issues.append("отсутствует ограничение UNIQUE(channel, external_id)")
 
     foreign_keys = conn.execute(
         "PRAGMA foreign_key_list(vacancy_external_aliases)"
@@ -557,7 +1101,9 @@ def vacancy_external_alias_schema_issues(conn: sqlite3.Connection) -> list[str]:
         for row in foreign_keys
     )
     if not cascade_fk:
-        issues.append("missing vacancy_id -> vacancies(id) ON DELETE CASCADE")
+        issues.append(
+            "отсутствует внешний ключ vacancy_id -> vacancies(id) ON DELETE CASCADE"
+        )
     return issues
 
 
@@ -602,23 +1148,660 @@ def schema_v4_issues(conn: sqlite3.Connection) -> list[str]:
     }
     for table, columns in required_columns.items():
         if table not in present_tables:
-            issues.append(f"{table}: table missing")
+            issues.append(f"{table}: таблица отсутствует")
             continue
         present_columns = {
             str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
         }
         missing = columns - present_columns
         if missing:
-            issues.append(f"{table}: missing {','.join(sorted(missing))}")
+            issues.append(
+                f"{table}: отсутствуют столбцы {','.join(sorted(missing))}"
+            )
     return issues
+
+
+def schema_v5_issues(conn: sqlite3.Connection) -> list[str]:
+    table_exists = conn.execute(
+        """
+        SELECT 1 FROM sqlite_master
+        WHERE type = 'table' AND name = 'source_checkpoints'
+        """
+    ).fetchone()
+    if not table_exists:
+        return ["source_checkpoints: таблица отсутствует"]
+    required_columns = {
+        "source",
+        "stream_key",
+        "cursor_value",
+        "cursor_date",
+        "initialized_at",
+        "last_completed_run_date",
+        "last_manifest_file",
+        "created_at",
+        "updated_at",
+    }
+    columns = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(source_checkpoints)").fetchall()
+    }
+    missing = required_columns - columns
+    return (
+        ["source_checkpoints: отсутствуют столбцы " + ",".join(sorted(missing))]
+        if missing
+        else []
+    )
+
+
+def table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {
+        str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+
+
+def add_column_if_missing(
+    conn: sqlite3.Connection, table: str, column: str, declaration: str
+) -> None:
+    if column not in table_columns(conn, table):
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+
+
+def ensure_v6_schema(conn: sqlite3.Connection) -> None:
+    """Create additive v6 structures without rewriting legacy evidence."""
+
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS source_labels (
+            label_key TEXT PRIMARY KEY,
+            display_label TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS source_hit_labels (
+            source_hit_id INTEGER NOT NULL,
+            label_key TEXT NOT NULL,
+            mapping_kind TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (source_hit_id, label_key),
+            FOREIGN KEY (source_hit_id) REFERENCES source_hits(id) ON DELETE CASCADE,
+            FOREIGN KEY (label_key) REFERENCES source_labels(label_key) ON DELETE RESTRICT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_source_hit_labels_label
+            ON source_hit_labels(label_key, source_hit_id);
+
+        CREATE TABLE IF NOT EXISTS external_actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            vacancy_id INTEGER,
+            action_key TEXT NOT NULL,
+            action_type TEXT NOT NULL,
+            state TEXT NOT NULL,
+            event_at TEXT NOT NULL,
+            authorization_note TEXT,
+            evidence_note TEXT,
+            evidence_url TEXT,
+            source TEXT NOT NULL,
+            external_reference TEXT,
+            metadata_json TEXT,
+            dedupe_key TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (vacancy_id) REFERENCES vacancies(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_external_actions_vacancy
+            ON external_actions(vacancy_id, action_key, event_at, id);
+
+        CREATE TABLE IF NOT EXISTS lifecycle_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            vacancy_id INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            event_at TEXT NOT NULL,
+            evidence_at TEXT NOT NULL,
+            evidence_note TEXT NOT NULL,
+            evidence_url TEXT,
+            evidence_source TEXT NOT NULL,
+            origin TEXT NOT NULL,
+            external_reference TEXT,
+            round_no INTEGER,
+            scheduled_at TEXT,
+            external_action_id INTEGER,
+            application_source_hit_id INTEGER,
+            campaign_id TEXT,
+            role_family TEXT,
+            confidence TEXT,
+            master_resume_id TEXT,
+            planned_resume_id TEXT,
+            actual_resume_id TEXT,
+            message_variant TEXT,
+            hard_gate_results_json TEXT,
+            unresolved_questions_json TEXT,
+            human_path_status TEXT,
+            history_complete INTEGER NOT NULL DEFAULT 1,
+            authorization_status TEXT NOT NULL DEFAULT 'not_applicable',
+            dedupe_key TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (vacancy_id) REFERENCES vacancies(id) ON DELETE CASCADE,
+            FOREIGN KEY (external_action_id) REFERENCES external_actions(id) ON DELETE SET NULL,
+            FOREIGN KEY (application_source_hit_id) REFERENCES source_hits(id) ON DELETE SET NULL,
+            CHECK(history_complete IN (0, 1))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_lifecycle_events_vacancy
+            ON lifecycle_events(vacancy_id, event_at, id);
+
+        CREATE TABLE IF NOT EXISTS action_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            vacancy_id INTEGER NOT NULL,
+            event_at TEXT NOT NULL,
+            action_state TEXT NOT NULL,
+            bucket TEXT NOT NULL,
+            due_date TEXT,
+            priority INTEGER NOT NULL DEFAULT 0,
+            reason TEXT,
+            evidence_note TEXT,
+            source TEXT NOT NULL,
+            dedupe_key TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (vacancy_id) REFERENCES vacancies(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_action_events_vacancy
+            ON action_events(vacancy_id, event_at, id);
+
+        CREATE TABLE IF NOT EXISTS vacancy_decision_metadata (
+            vacancy_id INTEGER PRIMARY KEY,
+            campaign_id TEXT,
+            role_family TEXT,
+            confidence TEXT,
+            hard_gate_results_json TEXT,
+            unresolved_questions_json TEXT,
+            master_resume_id TEXT,
+            planned_resume_id TEXT,
+            actual_resume_id TEXT,
+            message_variant TEXT,
+            application_source_hit_id INTEGER,
+            human_path_status TEXT,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (vacancy_id) REFERENCES vacancies(id) ON DELETE CASCADE,
+            FOREIGN KEY (application_source_hit_id) REFERENCES source_hits(id) ON DELETE SET NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS quarantine_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            origin_file TEXT NOT NULL,
+            line_no INTEGER NOT NULL,
+            source_name TEXT,
+            source_stream TEXT,
+            classification TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            evidence_note TEXT,
+            raw_payload_json TEXT NOT NULL,
+            retry_context_json TEXT,
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            reprocessed_vacancy_id INTEGER,
+            dedupe_key TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (reprocessed_vacancy_id) REFERENCES vacancies(id) ON DELETE SET NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_quarantine_status
+            ON quarantine_records(status, classification, id);
+
+        CREATE TABLE IF NOT EXISTS policy_versions (
+            version TEXT PRIMARY KEY,
+            effective_date TEXT NOT NULL,
+            is_active INTEGER NOT NULL,
+            source TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            CHECK(is_active IN (0, 1))
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_policy_versions_one_active
+            ON policy_versions(is_active) WHERE is_active = 1;
+
+        CREATE TABLE IF NOT EXISTS screening_decisions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            vacancy_id INTEGER NOT NULL,
+            evaluated_at TEXT NOT NULL,
+            decision TEXT NOT NULL,
+            score INTEGER,
+            priority TEXT,
+            policy_version TEXT NOT NULL,
+            policy_effective_date TEXT NOT NULL,
+            rule_results_json TEXT NOT NULL,
+            evidence_note TEXT,
+            dedupe_key TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (vacancy_id) REFERENCES vacancies(id) ON DELETE CASCADE,
+            FOREIGN KEY (policy_version) REFERENCES policy_versions(version) ON DELETE RESTRICT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_screening_decisions_policy
+            ON screening_decisions(policy_version, decision, vacancy_id);
+
+        CREATE TABLE IF NOT EXISTS migration_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            from_version INTEGER NOT NULL,
+            to_version INTEGER NOT NULL,
+            applied_at TEXT NOT NULL,
+            backup_path TEXT,
+            row_counts_json TEXT NOT NULL,
+            notes TEXT,
+            UNIQUE(from_version, to_version)
+        );
+        """
+    )
+
+    for column, declaration in (
+        ("lifecycle_event_id", "INTEGER REFERENCES lifecycle_events(id)"),
+        ("application_source_hit_id", "INTEGER REFERENCES source_hits(id)"),
+        ("campaign_id", "TEXT"),
+        ("role_family", "TEXT"),
+        ("actual_resume_version", "TEXT"),
+        ("message_variant", "TEXT"),
+    ):
+        add_column_if_missing(conn, "applications", column, declaration)
+
+    for column, declaration in (
+        ("confirms_completion", "INTEGER NOT NULL DEFAULT 0"),
+        ("completion_lifecycle_event_id", "INTEGER REFERENCES lifecycle_events(id)"),
+    ):
+        add_column_if_missing(conn, "interview_summaries", column, declaration)
+
+    for column, declaration in (
+        ("portfolio_limit", "INTEGER"),
+        ("review_cadence_days", "INTEGER"),
+        ("next_review_date", "TEXT"),
+        ("website_checked_date", "TEXT"),
+        ("careers_checked_date", "TEXT"),
+        ("target_campaigns_json", "TEXT"),
+        ("target_role_families_json", "TEXT"),
+        ("owner_evidence", "TEXT"),
+        ("sponsor_evidence", "TEXT"),
+        ("governance_evidence", "TEXT"),
+        ("human_path_status", "TEXT"),
+    ):
+        add_column_if_missing(conn, "employer_accounts", column, declaration)
+
+    add_column_if_missing(
+        conn,
+        "outreach_messages",
+        "external_action_id",
+        "INTEGER REFERENCES external_actions(id)",
+    )
+    add_column_if_missing(
+        conn,
+        "employer_interactions",
+        "external_action_id",
+        "INTEGER REFERENCES external_actions(id)",
+    )
+
+
+def ensure_v7_schema(conn: sqlite3.Connection) -> None:
+    """Create append-only evidence corrections and deterministic read models."""
+
+    conn.executescript(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_employer_interactions_identity
+            ON employer_interactions(id, vacancy_id);
+
+        CREATE TABLE IF NOT EXISTS employer_interaction_invalidations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            interaction_id INTEGER NOT NULL,
+            vacancy_id INTEGER NOT NULL,
+            corrected_at TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            evidence_note TEXT NOT NULL,
+            source TEXT NOT NULL,
+            operator_context TEXT NOT NULL,
+            dedupe_key TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (interaction_id, vacancy_id)
+                REFERENCES employer_interactions(id, vacancy_id) ON DELETE CASCADE,
+            UNIQUE(interaction_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_employer_interaction_invalidations_vacancy
+            ON employer_interaction_invalidations(vacancy_id, corrected_at, id);
+
+        CREATE VIEW IF NOT EXISTS effective_employer_interactions AS
+        SELECT interaction.*
+        FROM employer_interactions interaction
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM employer_interaction_invalidations invalidation
+            WHERE invalidation.interaction_id = interaction.id
+        );
+
+        CREATE VIEW IF NOT EXISTS effective_applications AS
+        SELECT application.*
+        FROM applications application
+        WHERE application.id = (
+            SELECT MAX(candidate.id)
+            FROM applications candidate
+            WHERE candidate.vacancy_id = application.vacancy_id
+        );
+        """
+    )
+
+
+def ensure_v8_schema(conn: sqlite3.Connection) -> None:
+    """Add projection freshness state and a bounded orchestration lease."""
+
+    timestamp = now_iso()
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS projection_state (
+            singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1),
+            dirty_revision INTEGER NOT NULL DEFAULT 0,
+            rendered_revision INTEGER NOT NULL DEFAULT 0,
+            dirty_at TEXT,
+            rendered_at TEXT,
+            published_generation TEXT,
+            CHECK(dirty_revision >= rendered_revision)
+        );
+
+        CREATE TABLE IF NOT EXISTS daily_run_leases (
+            token TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            owner TEXT NOT NULL,
+            status TEXT NOT NULL,
+            lease_seconds INTEGER NOT NULL,
+            acquired_at TEXT NOT NULL,
+            heartbeat_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            released_at TEXT,
+            release_reason TEXT,
+            CHECK(status IN ('active', 'finalized', 'expired')),
+            CHECK(lease_seconds >= 60 AND lease_seconds <= 86400)
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_daily_run_leases_one_active
+            ON daily_run_leases(status) WHERE status = 'active';
+
+        CREATE INDEX IF NOT EXISTS idx_daily_run_leases_status
+            ON daily_run_leases(status, expires_at, acquired_at);
+        """
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO projection_state (
+            singleton_id, dirty_revision, rendered_revision, dirty_at
+        ) VALUES (1, 1, 0, ?)
+        """,
+        (timestamp,),
+    )
+
+
+def schema_v6_issues(conn: sqlite3.Connection) -> list[str]:
+    required_columns = {
+        "lifecycle_events": {
+            "vacancy_id",
+            "event_type",
+            "event_at",
+            "evidence_at",
+            "evidence_note",
+            "evidence_source",
+            "dedupe_key",
+            "history_complete",
+            "authorization_status",
+        },
+        "action_events": {
+            "vacancy_id",
+            "event_at",
+            "action_state",
+            "bucket",
+            "priority",
+            "dedupe_key",
+        },
+        "external_actions": {
+            "action_key",
+            "action_type",
+            "state",
+            "event_at",
+            "dedupe_key",
+        },
+        "source_hit_labels": {"source_hit_id", "label_key", "mapping_kind"},
+        "quarantine_records": {
+            "classification",
+            "status",
+            "raw_payload_json",
+            "retry_context_json",
+            "dedupe_key",
+        },
+        "vacancy_decision_metadata": {
+            "campaign_id",
+            "role_family",
+            "confidence",
+            "hard_gate_results_json",
+            "unresolved_questions_json",
+            "master_resume_id",
+            "planned_resume_id",
+            "actual_resume_id",
+            "message_variant",
+            "human_path_status",
+        },
+    }
+    present_tables = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    issues: list[str] = []
+    for table, expected in required_columns.items():
+        if table not in present_tables:
+            issues.append(f"{table}: таблица отсутствует")
+            continue
+        missing = expected - table_columns(conn, table)
+        if missing:
+            issues.append(
+                f"{table}: отсутствуют столбцы {','.join(sorted(missing))}"
+            )
+    return issues
+
+
+def schema_v7_issues(conn: sqlite3.Connection) -> list[str]:
+    required_columns = {
+        "interaction_id",
+        "vacancy_id",
+        "corrected_at",
+        "reason",
+        "evidence_note",
+        "source",
+        "operator_context",
+        "dedupe_key",
+        "created_at",
+    }
+    present = table_columns(conn, "employer_interaction_invalidations")
+    issues: list[str] = []
+    missing = required_columns - present
+    if missing:
+        issues.append(
+            "employer_interaction_invalidations: отсутствуют столбцы "
+            + ",".join(sorted(missing))
+        )
+    views = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'view'"
+        ).fetchall()
+    }
+    for view in ("effective_employer_interactions", "effective_applications"):
+        if view not in views:
+            issues.append(f"{view}: представление отсутствует")
+    return issues
+
+
+def schema_v8_issues(conn: sqlite3.Connection) -> list[str]:
+    issues: list[str] = []
+    present_tables = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    required = {
+        "projection_state": {
+            "singleton_id",
+            "dirty_revision",
+            "rendered_revision",
+            "dirty_at",
+            "rendered_at",
+            "published_generation",
+        },
+        "daily_run_leases": {
+            "token",
+            "run_id",
+            "owner",
+            "status",
+            "lease_seconds",
+            "acquired_at",
+            "heartbeat_at",
+            "expires_at",
+            "released_at",
+            "release_reason",
+        },
+    }
+    for table, columns in required.items():
+        if table not in present_tables:
+            issues.append(f"{table}: таблица отсутствует")
+            continue
+        present = table_columns(conn, table)
+        missing = columns - present
+        if missing:
+            issues.append(f"{table}: отсутствуют столбцы {','.join(sorted(missing))}")
+    if "projection_state" in present_tables:
+        state = conn.execute(
+            "SELECT dirty_revision, rendered_revision FROM projection_state WHERE singleton_id = 1"
+        ).fetchone()
+        if state is None:
+            issues.append("projection_state: отсутствует singleton-строка")
+        elif int(state[1]) > int(state[0]):
+            issues.append("projection_state: rendered_revision новее dirty_revision")
+    return issues
+
+
+def schema_v9_issues(conn: sqlite3.Connection) -> list[str]:
+    """Validate the compact v9 contract without loading the orchestration module."""
+    required = {
+        "daily_runs": {"run_id", "run_date", "status", "plan_fingerprint"},
+        "daily_run_plan_revisions": {"run_id", "revision", "scope_json"},
+        "daily_run_steps": {"run_id", "step_key", "state", "manifest_hash"},
+        "daily_run_step_dependencies": {
+            "run_id",
+            "step_key",
+            "depends_on_step_key",
+        },
+        "daily_run_work_items": {"run_id", "step_key", "item_key", "state"},
+        "daily_run_manifests": {"run_id", "payload_hash", "record_type"},
+        "daily_run_transitions": {"run_id", "event_hash", "event_type"},
+    }
+    issues: list[str] = []
+    for table, columns in required.items():
+        present = table_columns(conn, table)
+        missing = sorted(columns - present)
+        if missing:
+            issues.append(f"{table}: отсутствуют столбцы {', '.join(missing)}")
+    return issues
+
+
+def ensure_active_policy(conn: sqlite3.Connection) -> None:
+    """Persist one unambiguous active policy version from local configuration."""
+
+    timestamp = now_iso()
+    current = conn.execute(
+        "SELECT version, effective_date FROM policy_versions WHERE is_active = 1"
+    ).fetchone()
+    if (
+        current
+        and current["version"] == ACTIVE_POLICY_VERSION
+        and current["effective_date"] == ACTIVE_POLICY_EFFECTIVE_DATE
+    ):
+        return
+    conn.execute("UPDATE policy_versions SET is_active = 0, updated_at = ?", (timestamp,))
+    conn.execute(
+        """
+        INSERT INTO policy_versions (
+            version, effective_date, is_active, source, created_at, updated_at
+        )
+        VALUES (?, ?, 1, 'local_config', ?, ?)
+        ON CONFLICT(version) DO UPDATE SET
+            effective_date = excluded.effective_date,
+            is_active = 1,
+            source = excluded.source,
+            updated_at = excluded.updated_at
+        """,
+        (
+            ACTIVE_POLICY_VERSION,
+            ACTIVE_POLICY_EFFECTIVE_DATE,
+            timestamp,
+            timestamp,
+        ),
+    )
+
+
+def refresh_source_hit_labels(conn: sqlite3.Connection) -> int:
+    """Rebuild derived many-to-many labels from preserved raw stream keys."""
+
+    changed = 0
+    timestamp = now_iso()
+    rows = conn.execute(
+        "SELECT id, source_stream, canonical_source_stream FROM source_hits ORDER BY id"
+    ).fetchall()
+    for row in rows:
+        hit_id = int(row["id"])
+        labels, mapping_kind = canonical_source_labels(row["source_stream"])
+        primary = labels[0]
+        if clean_cell(row["canonical_source_stream"]) != primary:
+            conn.execute(
+                "UPDATE source_hits SET canonical_source_stream = ? WHERE id = ?",
+                (primary, hit_id),
+            )
+            changed += 1
+        existing = {
+            (str(item["label_key"]), str(item["mapping_kind"]))
+            for item in conn.execute(
+                "SELECT label_key, mapping_kind FROM source_hit_labels WHERE source_hit_id = ?",
+                (hit_id,),
+            ).fetchall()
+        }
+        desired = {(label, mapping_kind) for label in labels}
+        if existing == desired:
+            continue
+        conn.execute("DELETE FROM source_hit_labels WHERE source_hit_id = ?", (hit_id,))
+        for label in labels:
+            conn.execute(
+                """
+                INSERT INTO source_labels (label_key, display_label, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(label_key) DO UPDATE SET
+                    display_label = excluded.display_label,
+                    updated_at = excluded.updated_at
+                """,
+                (label, label, timestamp, timestamp),
+            )
+            conn.execute(
+                """
+                INSERT INTO source_hit_labels (
+                    source_hit_id, label_key, mapping_kind, created_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (hit_id, label, mapping_kind, timestamp),
+            )
+        changed += 1
+    return changed
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
     version = int(conn.execute("PRAGMA user_version").fetchone()[0])
     if version > SCHEMA_VERSION:
         raise RuntimeError(
-            f"Database schema version {version} is newer than supported version "
-            f"{SCHEMA_VERSION}"
+            f"Версия схемы базы данных {version} новее поддерживаемой версии "
+            f"{SCHEMA_VERSION}."
         )
     exists = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'vacancies'"
@@ -628,36 +1811,101 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     else:
         if version < SCHEMA_VERSION:
             raise RuntimeError(
-                f"Database schema version {version} requires an explicit migration to "
-                f"{SCHEMA_VERSION}. Run: jobctl migrate-schema"
+                f"Схему базы данных версии {version} требуется явно перенести на "
+                f"версию {SCHEMA_VERSION}. Выполните: jobctl migrate-schema"
             )
-        ensure_auxiliary_schema(conn)
         missing = missing_schema_tables(conn)
+        missing_indexes = missing_schema_indexes(conn)
+        if missing or missing_indexes:
+            # Current healthy databases stay on a fast path. Additive repair is
+            # retained for older workspaces that already report the current
+            # version but lack an auxiliary object.
+            ensure_auxiliary_schema(conn)
+            missing = missing_schema_tables(conn)
+            missing_indexes = missing_schema_indexes(conn)
         if missing:
             raise RuntimeError(
-                "Database is missing required tables: " + ", ".join(missing)
+                "В базе данных отсутствуют обязательные таблицы: " + ", ".join(missing)
             )
-        missing_indexes = missing_schema_indexes(conn)
         if missing_indexes:
             raise RuntimeError(
-                "Database is missing required indexes: " + ", ".join(missing_indexes)
+                "В базе данных отсутствуют обязательные индексы: " + ", ".join(missing_indexes)
             )
         alias_schema_issues = vacancy_external_alias_schema_issues(conn)
         if alias_schema_issues:
             raise RuntimeError(
-                "Database vacancy external alias schema is invalid: "
+                "Некорректна схема внешних псевдонимов вакансий: "
                 + "; ".join(alias_schema_issues)
             )
         v4_issues = schema_v4_issues(conn)
         if v4_issues:
             raise RuntimeError(
-                "Database schema v4 contract is invalid: " + "; ".join(v4_issues)
+                "Нарушен контракт схемы базы данных v4: " + "; ".join(v4_issues)
+            )
+        v5_issues = schema_v5_issues(conn)
+        if v5_issues:
+            raise RuntimeError(
+                "Нарушен контракт схемы базы данных v5: " + "; ".join(v5_issues)
+            )
+        v6_issues = schema_v6_issues(conn)
+        if v6_issues:
+            raise RuntimeError(
+                "Нарушен контракт схемы базы данных v6: " + "; ".join(v6_issues)
+            )
+        v7_issues = schema_v7_issues(conn)
+        if v7_issues:
+            raise RuntimeError(
+                "Нарушен контракт схемы базы данных v7: " + "; ".join(v7_issues)
+            )
+        v8_issues = schema_v8_issues(conn)
+        if v8_issues:
+            raise RuntimeError(
+                "Нарушен контракт схемы базы данных v8: " + "; ".join(v8_issues)
+            )
+        v9_issues = schema_v9_issues(conn)
+        if v9_issues:
+            raise RuntimeError(
+                "Нарушен контракт схемы базы данных v9: " + "; ".join(v9_issues)
+            )
+        v10_issues = schema_v10_contract_issues(conn)
+        if v10_issues:
+            raise RuntimeError(
+                "Нарушен контракт схемы базы данных v10: " + "; ".join(v10_issues)
             )
 
 
 def reset_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(
         """
+        DROP VIEW IF EXISTS effective_applications;
+        DROP VIEW IF EXISTS effective_employer_interactions;
+        DROP TABLE IF EXISTS hh_incremental_events;
+        DROP TABLE IF EXISTS hh_detail_queue;
+        DROP TABLE IF EXISTS hh_vacancy_snapshots;
+        DROP TABLE IF EXISTS hh_page_items;
+        DROP TABLE IF EXISTS hh_page_captures;
+        DROP TABLE IF EXISTS hh_stream_runs;
+        DROP TABLE IF EXISTS hh_stream_checkpoint_history;
+        DROP TABLE IF EXISTS hh_stream_checkpoints;
+        DROP TABLE IF EXISTS daily_run_transitions;
+        DROP TABLE IF EXISTS daily_run_manifests;
+        DROP TABLE IF EXISTS daily_run_work_items;
+        DROP TABLE IF EXISTS daily_run_step_dependencies;
+        DROP TABLE IF EXISTS daily_run_steps;
+        DROP TABLE IF EXISTS daily_run_plan_revisions;
+        DROP TABLE IF EXISTS daily_runs;
+        DROP TABLE IF EXISTS daily_run_leases;
+        DROP TABLE IF EXISTS projection_state;
+        DROP TABLE IF EXISTS migration_log;
+        DROP TABLE IF EXISTS screening_decisions;
+        DROP TABLE IF EXISTS policy_versions;
+        DROP TABLE IF EXISTS quarantine_records;
+        DROP TABLE IF EXISTS vacancy_decision_metadata;
+        DROP TABLE IF EXISTS action_events;
+        DROP TABLE IF EXISTS lifecycle_events;
+        DROP TABLE IF EXISTS external_actions;
+        DROP TABLE IF EXISTS source_hit_labels;
+        DROP TABLE IF EXISTS source_labels;
         DROP TABLE IF EXISTS outreach_messages;
         DROP TABLE IF EXISTS followup_rounds;
         DROP TABLE IF EXISTS contact_searches;
@@ -665,8 +1913,10 @@ def reset_schema(conn: sqlite3.Connection) -> None:
         DROP TABLE IF EXISTS employer_account_signals;
         DROP TABLE IF EXISTS vacancy_employer_accounts;
         DROP TABLE IF EXISTS employer_accounts;
+        DROP TABLE IF EXISTS employer_interaction_invalidations;
         DROP TABLE IF EXISTS employer_interactions;
         DROP TABLE IF EXISTS vacancy_factors;
+        DROP TABLE IF EXISTS source_checkpoints;
         DROP TABLE IF EXISTS search_coverage;
         DROP TABLE IF EXISTS search_runs;
         DROP TABLE IF EXISTS source_hits;
@@ -791,6 +2041,23 @@ def reset_schema(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX idx_search_coverage_run
             ON search_coverage(search_run_id, stream_key);
+
+        CREATE TABLE source_checkpoints (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT NOT NULL,
+            stream_key TEXT NOT NULL,
+            cursor_value TEXT,
+            cursor_date TEXT,
+            initialized_at TEXT NOT NULL,
+            last_completed_run_date TEXT NOT NULL,
+            last_manifest_file TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(source, stream_key)
+        );
+
+        CREATE INDEX idx_source_checkpoints_source
+            ON source_checkpoints(source, stream_key);
 
         CREATE TABLE evaluations (
             id INTEGER PRIMARY KEY,
@@ -1027,6 +2294,12 @@ def reset_schema(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    ensure_v6_schema(conn)
+    ensure_v7_schema(conn)
+    ensure_v8_schema(conn)
+    ensure_v9_schema(conn)
+    ensure_v10_schema(conn)
+    ensure_active_policy(conn)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
 
@@ -1110,6 +2383,23 @@ def ensure_auxiliary_schema(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_search_coverage_run
             ON search_coverage(search_run_id, stream_key);
+
+        CREATE TABLE IF NOT EXISTS source_checkpoints (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT NOT NULL,
+            stream_key TEXT NOT NULL,
+            cursor_value TEXT,
+            cursor_date TEXT,
+            initialized_at TEXT NOT NULL,
+            last_completed_run_date TEXT NOT NULL,
+            last_manifest_file TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(source, stream_key)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_source_checkpoints_source
+            ON source_checkpoints(source, stream_key);
 
         CREATE TABLE IF NOT EXISTS interview_summaries (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1291,7 +2581,179 @@ def ensure_auxiliary_schema(conn: sqlite3.Connection) -> None:
             ON vacancy_factors(vacancy_id, factor_key, observed_date, id);
         """
     )
+    ensure_v6_schema(conn)
+    ensure_v7_schema(conn)
+    ensure_v8_schema(conn)
+    ensure_v9_schema(conn)
+    ensure_v10_schema(conn)
+    ensure_active_policy(conn)
     conn.commit()
+
+
+def projection_state_data(conn: sqlite3.Connection) -> dict[str, Any]:
+    row = conn.execute(
+        """
+        SELECT dirty_revision, rendered_revision, dirty_at, rendered_at,
+               published_generation
+        FROM projection_state WHERE singleton_id = 1
+        """
+    ).fetchone()
+    if row is None:
+        raise RuntimeError("Не найдена обязательная строка projection_state.")
+    dirty_revision = int(row["dirty_revision"])
+    rendered_revision = int(row["rendered_revision"])
+    return {
+        "dirty_revision": dirty_revision,
+        "rendered_revision": rendered_revision,
+        "dirty": dirty_revision > rendered_revision,
+        "dirty_at": row["dirty_at"] or "",
+        "rendered_at": row["rendered_at"] or "",
+        "published_generation": row["published_generation"] or "",
+    }
+
+
+def mark_projections_dirty(conn: sqlite3.Connection) -> int:
+    timestamp = now_iso()
+    conn.execute(
+        """
+        UPDATE projection_state
+        SET dirty_revision = dirty_revision + 1,
+            dirty_at = ?
+        WHERE singleton_id = 1
+        """,
+        (timestamp,),
+    )
+    return int(
+        conn.execute(
+            "SELECT dirty_revision FROM projection_state WHERE singleton_id = 1"
+        ).fetchone()[0]
+    )
+
+
+def commit_projection_write(conn: sqlite3.Connection) -> int:
+    """Commit the domain mutation and its projection invalidation atomically."""
+
+    revision = mark_projections_dirty(conn)
+    conn.commit()
+    return revision
+
+
+def mark_projections_rendered(
+    conn: sqlite3.Connection,
+    *,
+    revision: int,
+    generation: str,
+) -> None:
+    current = projection_state_data(conn)
+    if revision > int(current["dirty_revision"]):
+        raise RuntimeError("Нельзя опубликовать проекцию новее долговечной ревизии SQLite.")
+    conn.execute(
+        """
+        UPDATE projection_state
+        SET rendered_revision = MAX(rendered_revision, ?),
+            rendered_at = ?,
+            published_generation = ?
+        WHERE singleton_id = 1
+        """,
+        (revision, now_iso(), generation),
+    )
+
+
+def expire_stale_daily_run_lease(conn: sqlite3.Connection) -> int:
+    now = now_iso()
+    stale = conn.execute(
+        """
+        SELECT token, run_id FROM daily_run_leases
+        WHERE status = 'active' AND expires_at <= ?
+        ORDER BY acquired_at, token
+        """,
+        (now,),
+    ).fetchall()
+    changed = int(
+        conn.execute(
+            """
+            UPDATE daily_run_leases
+            SET status = 'expired', released_at = ?,
+                release_reason = 'lease_expired'
+            WHERE status = 'active' AND expires_at <= ?
+            """,
+            (now, now),
+        ).rowcount
+    )
+    for row in stale:
+        note_expired_lease(conn, str(row["run_id"]), str(row["token"]))
+    return changed
+
+
+def active_daily_run_lease(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    expire_stale_daily_run_lease(conn)
+    return conn.execute(
+        """
+        SELECT * FROM daily_run_leases
+        WHERE status = 'active'
+        ORDER BY acquired_at DESC LIMIT 1
+        """
+    ).fetchone()
+
+
+def durable_daily_run_row(
+    conn: sqlite3.Connection,
+    run_id: str | None = None,
+    *,
+    open_only: bool = False,
+) -> sqlite3.Row | None:
+    """Read the durable-run snapshot without importing the full P1 control plane."""
+    clauses: list[str] = []
+    params: list[str] = []
+    if run_id:
+        clauses.append("run_id = ?")
+        params.append(run_id)
+    if open_only:
+        clauses.append("status <> 'completed'")
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    return conn.execute(
+        "SELECT * FROM daily_runs" + where + " ORDER BY created_at DESC LIMIT 1",
+        params,
+    ).fetchone()
+
+
+def require_daily_run_lease(
+    conn: sqlite3.Connection,
+    supplied_token: str,
+    *,
+    heartbeat: bool,
+) -> sqlite3.Row | None:
+    active = active_daily_run_lease(conn)
+    token = clean_cell(supplied_token)
+    if active is None:
+        if token:
+            raise RuntimeError(
+                "Переданный lease ежедневного запуска не активен. Начните новый запуск через "
+                "begin-daily-run или уберите устаревший --run-lease."
+            )
+        return None
+    if token != str(active["token"]):
+        raise RuntimeError(
+            "Уже активен другой ежедневный запуск: "
+            f"run_id={active['run_id']}, owner={active['owner']}, "
+            f"expires_at={active['expires_at']}. Передайте его точный --run-lease "
+            "или дождитесь истечения; одновременные активные запуски запрещены."
+        )
+    if heartbeat:
+        now = dt.datetime.now().replace(microsecond=0)
+        expires = now + dt.timedelta(seconds=int(active["lease_seconds"]))
+        conn.execute(
+            """
+            UPDATE daily_run_leases
+            SET heartbeat_at = ?, expires_at = ?
+            WHERE token = ? AND status = 'active'
+            """,
+            (now.isoformat(), expires.isoformat(), token),
+        )
+        active = conn.execute(
+            "SELECT * FROM daily_run_leases WHERE token = ?", (token,)
+        ).fetchone()
+    return active
 
 
 def merge_origin(existing: str | None, new_origin: str) -> str:
@@ -1316,7 +2778,7 @@ def store_vacancy_external_alias(
     channel = clean_cell(channel)
     external_id = clean_cell(external_id)
     if not channel or not external_id:
-        raise ValueError("Vacancy external aliases require channel and external_id")
+        raise ValueError("Для псевдонима вакансии требуются channel и external_id.")
     norm_url = normalize_url(url)
     timestamp = timestamp or now_iso()
     conflicting = conn.execute(
@@ -1329,8 +2791,8 @@ def store_vacancy_external_alias(
     ).fetchone()
     if conflicting:
         raise RuntimeError(
-            f"External ID {external_id!r} is already assigned to vacancy "
-            f"{conflicting['vacancy_id']} in another channel"
+            f"Внешний идентификатор {external_id!r} уже относится к вакансии "
+            f"№{conflicting['vacancy_id']} в другом канале."
         )
     existing = conn.execute(
         """
@@ -1343,8 +2805,8 @@ def store_vacancy_external_alias(
     if existing:
         if int(existing["vacancy_id"]) != vacancy_id:
             raise RuntimeError(
-                f"External ID {external_id!r} in channel {channel!r} is already "
-                f"assigned to vacancy {existing['vacancy_id']}"
+                f"Внешний идентификатор {external_id!r} в канале {channel!r} уже "
+                f"относится к вакансии №{existing['vacancy_id']}."
             )
         observed_dates = [
             value
@@ -1448,6 +2910,342 @@ def backfill_canonical_source_streams(conn: sqlite3.Connection) -> int:
         )
         updated += 1
     return updated
+
+
+def dedupe_hash(payload: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def append_lifecycle_event(
+    conn: sqlite3.Connection,
+    *,
+    vacancy_id: int,
+    event_type: str,
+    event_at: str,
+    evidence_at: str,
+    evidence_note: str,
+    evidence_source: str,
+    origin: str,
+    evidence_url: str = "",
+    external_reference: str = "",
+    round_no: int | None = None,
+    scheduled_at: str = "",
+    external_action_id: int | None = None,
+    application_source_hit_id: int | None = None,
+    metadata: dict[str, Any] | None = None,
+    history_complete: bool = True,
+    authorization_status: str = "not_applicable",
+) -> tuple[int, bool]:
+    event_type = clean_cell(event_type).lower()
+    if event_type not in LIFECYCLE_EVENT_TYPES:
+        raise ValueError("Неподдерживаемый тип события жизненного цикла.")
+    event_at_value = parse_iso_datetime(event_at, label="event_at").isoformat()
+    evidence_at_value = parse_iso_datetime(evidence_at, label="evidence_at").isoformat()
+    evidence_note = clean_cell(evidence_note)
+    evidence_source = clean_cell(evidence_source)
+    if not evidence_note or not evidence_source:
+        raise ValueError("Для события жизненного цикла требуются примечание и источник доказательства.")
+    evidence_url = validate_optional_external_url(
+        evidence_url, label="evidence_url"
+    )
+    if event_type in INTERVIEW_EVENT_TYPES:
+        if round_no is None or round_no < 1:
+            raise ValueError("Для события интервью требуется положительный номер раунда.")
+    elif round_no is not None and round_no < 1:
+        raise ValueError("Значение round_no должно быть положительным.")
+    if scheduled_at:
+        scheduled_at = parse_iso_datetime(
+            scheduled_at, label="scheduled_at"
+        ).isoformat()
+    if event_type == "interview_scheduled" and not scheduled_at:
+        raise ValueError("Для interview_scheduled требуется scheduled_at.")
+    if event_type == "application_confirmed":
+        if authorization_status not in {"explicit", "legacy_unknown"}:
+            raise ValueError(
+                "Подтверждённый отклик требует доказательства явного разрешения."
+            )
+        if authorization_status == "explicit" and external_action_id is None:
+            raise ValueError(
+                "Для явно подтверждённого отклика требуется запись внешнего действия."
+            )
+    rejection = conn.execute(
+        """
+        SELECT event_at FROM lifecycle_events
+        WHERE vacancy_id = ? AND event_type = 'rejected'
+        ORDER BY event_at, id LIMIT 1
+        """,
+        (vacancy_id,),
+    ).fetchone()
+    positive_after_rejection = {
+        "application_confirmed",
+        "interview_invited",
+        "interview_scheduled",
+        "interview_completed",
+        "offer_received",
+    }
+    if (
+        rejection
+        and event_type in positive_after_rejection
+        and event_at_value >= str(rejection["event_at"])
+    ):
+        raise ValueError(
+            "Отклонённую каноническую вакансию нельзя вернуть к положительному состоянию жизненного цикла."
+        )
+
+    metadata = metadata or {}
+    external_reference = clean_cell(external_reference)
+    if external_reference:
+        dedupe_material = {
+            "vacancy_id": vacancy_id,
+            "event_type": event_type,
+            "external_reference": external_reference,
+        }
+    else:
+        dedupe_material = {
+            "vacancy_id": vacancy_id,
+            "event_type": event_type,
+            "event_at": event_at_value,
+            "round_no": round_no,
+            "scheduled_at": scheduled_at,
+            "evidence_note": evidence_note,
+            "origin": origin,
+        }
+    dedupe_key = dedupe_hash(dedupe_material)
+    before = conn.total_changes
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO lifecycle_events (
+            vacancy_id, event_type, event_at, evidence_at, evidence_note,
+            evidence_url, evidence_source, origin, external_reference,
+            round_no, scheduled_at, external_action_id,
+            application_source_hit_id, campaign_id, role_family, confidence,
+            master_resume_id, planned_resume_id, actual_resume_id,
+            message_variant, hard_gate_results_json,
+            unresolved_questions_json, human_path_status, history_complete,
+            authorization_status, dedupe_key, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            vacancy_id,
+            event_type,
+            event_at_value,
+            evidence_at_value,
+            evidence_note,
+            evidence_url,
+            evidence_source,
+            clean_cell(origin),
+            external_reference,
+            round_no,
+            scheduled_at,
+            external_action_id,
+            application_source_hit_id,
+            metadata.get("campaign_id"),
+            metadata.get("role_family"),
+            metadata.get("confidence"),
+            metadata.get("master_resume_id"),
+            metadata.get("planned_resume_id"),
+            metadata.get("actual_resume_id"),
+            metadata.get("message_variant"),
+            json.dumps(metadata.get("hard_gates"), ensure_ascii=False)
+            if "hard_gates" in metadata
+            else None,
+            json.dumps(metadata.get("unresolved_questions"), ensure_ascii=False)
+            if "unresolved_questions" in metadata
+            else None,
+            metadata.get("human_path_status"),
+            1 if history_complete else 0,
+            authorization_status,
+            dedupe_key,
+            now_iso(),
+        ),
+    )
+    created = conn.total_changes > before
+    row = conn.execute(
+        "SELECT id FROM lifecycle_events WHERE dedupe_key = ?", (dedupe_key,)
+    ).fetchone()
+    return int(row["id"]), created
+
+
+def append_action_event(
+    conn: sqlite3.Connection,
+    *,
+    vacancy_id: int,
+    action_state: str,
+    bucket: str,
+    event_at: str,
+    due_date: str = "",
+    priority: int = 0,
+    reason: str = "",
+    evidence_note: str = "",
+    source: str,
+) -> tuple[int, bool]:
+    action_state = clean_cell(action_state).lower()
+    bucket = clean_cell(bucket).lower()
+    if action_state not in ACTION_STATES:
+        raise ValueError("Неподдерживаемое текущее рабочее состояние.")
+    if bucket not in WIP_BUCKET_KEYS:
+        raise ValueError("Неподдерживаемая группа незавершённой работы.")
+    event_at_value = parse_iso_datetime(event_at, label="event_at").isoformat()
+    if due_date:
+        parse_iso_date(due_date, label="due_date")
+    if priority < 0 or priority > 100:
+        raise ValueError("Значение priority должно быть от 0 до 100.")
+    payload = {
+        "vacancy_id": vacancy_id,
+        "action_state": action_state,
+        "bucket": bucket,
+        "event_at": event_at_value,
+        "due_date": due_date,
+        "priority": priority,
+        "reason": clean_cell(reason),
+        "source": clean_cell(source),
+    }
+    dedupe_key = dedupe_hash(payload)
+    before = conn.total_changes
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO action_events (
+            vacancy_id, event_at, action_state, bucket, due_date, priority,
+            reason, evidence_note, source, dedupe_key, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            vacancy_id,
+            event_at_value,
+            action_state,
+            bucket,
+            due_date,
+            priority,
+            clean_cell(reason),
+            clean_cell(evidence_note),
+            clean_cell(source),
+            dedupe_key,
+            now_iso(),
+        ),
+    )
+    created = conn.total_changes > before
+    row = conn.execute(
+        "SELECT id FROM action_events WHERE dedupe_key = ?", (dedupe_key,)
+    ).fetchone()
+    return int(row["id"]), created
+
+
+def action_from_legacy_row(row: sqlite3.Row) -> tuple[str, str, str, int]:
+    stage = canonical_stage(row["latest_stage"])
+    if stage == "needs_input":
+        return ("needs_input", "urgent", clean_cell(row["follow_up_date"]), 100)
+    if stage == "follow_up":
+        return ("follow_up", "due_follow_up", clean_cell(row["follow_up_date"]), 90)
+    status_text = " ".join(
+        clean_cell(row[key]).casefold()
+        for key in ("latest_status", "next_action", "open_questions")
+    )
+    if stage == "seen" and any(
+        marker in status_text for marker in ("review", "провер", "уточн")
+    ):
+        return ("review", "deep_review", "", min(int(row["score"] or 0), 100))
+    if stage in {"applied", "interview_1", "interview_2", "interview_3", "offer"}:
+        return ("waiting", "backlog", clean_cell(row["follow_up_date"]), 20)
+    return ("none", "backlog", "", 0)
+
+
+def backfill_v6_evidence(conn: sqlite3.Connection) -> dict[str, int]:
+    """Translate only evidence already represented by legacy supported rows."""
+
+    counts = {
+        "lifecycle_applications": 0,
+        "lifecycle_rejections": 0,
+        "action_events": 0,
+    }
+    application_columns = table_columns(conn, "applications")
+    rows = conn.execute(
+        "SELECT * FROM applications ORDER BY id"
+    ).fetchall()
+    for row in rows:
+        if not application_row_is_confirmed(row):
+            continue
+        applied_date = clean_cell(row["applied_date"])
+        try:
+            event_at = parse_iso_datetime(applied_date, label="applied_date").isoformat()
+        except ValueError:
+            continue
+        event_id, created = append_lifecycle_event(
+            conn,
+            vacancy_id=int(row["vacancy_id"]),
+            event_type="application_confirmed",
+            event_at=event_at,
+            evidence_at=event_at,
+            evidence_note=f"Подтверждённая историческая запись отклика №{row['id']}.",
+            evidence_source="legacy_applications",
+            origin="migration:v6",
+            external_reference=f"legacy-application:{row['id']}",
+            history_complete=False,
+            authorization_status="legacy_unknown",
+            metadata={
+                "actual_resume_id": clean_cell(row["resume_version"]),
+            },
+        )
+        if created:
+            counts["lifecycle_applications"] += 1
+        if "lifecycle_event_id" in application_columns:
+            conn.execute(
+                "UPDATE applications SET lifecycle_event_id = ? WHERE id = ?",
+                (event_id, int(row["id"])),
+            )
+
+    for row in conn.execute(
+        """
+        SELECT id, vacancy_id, event_date, note, origin_file
+        FROM stage_events
+        WHERE stage = 'rejected' AND TRIM(COALESCE(note, '')) != ''
+        ORDER BY id
+        """
+    ).fetchall():
+        date = clean_cell(row["event_date"])
+        try:
+            event_at = parse_iso_datetime(date, label="event_date").isoformat()
+        except ValueError:
+            continue
+        _, created = append_lifecycle_event(
+            conn,
+            vacancy_id=int(row["vacancy_id"]),
+            event_type="rejected",
+            event_at=event_at,
+            evidence_at=event_at,
+            evidence_note=clean_cell(row["note"]),
+            evidence_source="legacy_stage_events",
+            origin="migration:v6",
+            external_reference=f"legacy-stage-event:{row['id']}",
+            history_complete=False,
+            authorization_status="not_applicable",
+        )
+        if created:
+            counts["lifecycle_rejections"] += 1
+
+    for row in conn.execute("SELECT * FROM vacancies ORDER BY id").fetchall():
+        action_state, bucket, due_date, priority = action_from_legacy_row(row)
+        raw_event_at = clean_cell(row["updated_at"]) or clean_cell(row["last_seen_date"])
+        try:
+            event_at = parse_iso_datetime(raw_event_at, label="updated_at").isoformat()
+        except ValueError:
+            event_at = now_iso()
+        _, created = append_action_event(
+            conn,
+            vacancy_id=int(row["id"]),
+            action_state=action_state,
+            bucket=bucket,
+            event_at=event_at,
+            due_date=due_date,
+            priority=priority,
+            reason=clean_cell(row["next_action"]) or clean_cell(row["open_questions"]),
+            evidence_note="Текущее рабочее состояние перенесено без изменения фактов жизненного цикла.",
+            source="migration:v6",
+        )
+        if created:
+            counts["action_events"] += 1
+    return counts
 
 
 def upsert_vacancy(
@@ -1678,15 +3476,15 @@ def origin_for(path: Path) -> str:
         return str(path)
 
 
-def payload_items(payload: Any) -> list[dict[str, Any]]:
+def payload_items(payload: Any) -> list[Any]:
     if isinstance(payload, list):
-        return [item for item in payload if isinstance(item, dict)]
+        return payload
     if not isinstance(payload, dict):
         return []
     for key in ("vacancies", "items", "jobs", "data"):
         value = payload.get(key)
         if isinstance(value, list):
-            return [item for item in value if isinstance(item, dict)]
+            return value
     return []
 
 
@@ -1725,11 +3523,11 @@ def insert_source_hit_once(
     next_action: str,
     origin_file: str,
     line_no: int,
-) -> None:
+) -> int:
     canonical_stream, _ = canonical_source_stream(source_stream)
     existing = conn.execute(
         """
-        SELECT 1
+        SELECT id
         FROM source_hits
         WHERE vacancy_id = ?
           AND COALESCE(seen_date, '') = COALESCE(?, '')
@@ -1741,8 +3539,8 @@ def insert_source_hit_once(
         (vacancy_id, seen_date, source_stream, raw_status, origin_file),
     ).fetchone()
     if existing:
-        return
-    conn.execute(
+        return int(existing["id"])
+    cur = conn.execute(
         """
         INSERT INTO source_hits (
             vacancy_id, seen_date, source_name, source_stream,
@@ -1765,6 +3563,7 @@ def insert_source_hit_once(
             line_no,
         ),
     )
+    return int(cur.lastrowid)
 
 
 def insert_evaluation_once(
@@ -1890,28 +3689,28 @@ def insert_vacancy_factor_once(
     factor_key = clean_cell(str(factor.get("factor_key") or factor.get("key") or "")).lower()
     if not FACTOR_KEY_RE.fullmatch(factor_key):
         raise ValueError(
-            "factor key must use lowercase snake_case (2-64 characters)"
+            "Ключ фактора должен быть записан в нижнем регистре snake_case и содержать от 2 до 64 знаков."
         )
     raw_value = factor.get("value", factor.get("level"))
     if raw_value is None or isinstance(raw_value, (dict, list)):
-        raise ValueError(f"factor {factor_key!r} requires a scalar value or level")
+        raise ValueError(f"Для фактора {factor_key!r} требуется скалярное поле value или level.")
     factor_value = clean_cell(str(raw_value))
     if not factor_value:
-        raise ValueError(f"factor {factor_key!r} requires a non-empty value")
+        raise ValueError(f"Для фактора {factor_key!r} требуется непустое значение.")
     observed_date = clean_cell(
         str(factor.get("observed_date") or factor.get("evaluation_date") or default_date)
     )
     parse_iso_date(observed_date, label=f"factor {factor_key} observed_date")
     evidence_note = clean_cell(str(factor.get("evidence_note") or ""))
     if not evidence_note:
-        raise ValueError(f"factor {factor_key!r} requires evidence_note")
+        raise ValueError(f"Для фактора {factor_key!r} требуется evidence_note.")
     evidence_url = normalize_url(str(factor.get("evidence_url") or ""))
     if evidence_url and not safe_external_url(evidence_url):
-        raise ValueError(f"factor {factor_key!r} evidence_url must use http or https")
+        raise ValueError(f"Для фактора {factor_key!r} адрес evidence_url должен использовать http или https.")
     confidence = clean_cell(str(factor.get("confidence") or "")).lower()
     if confidence not in EVIDENCE_CONFIDENCE:
         raise ValueError(
-            f"factor {factor_key!r} confidence must be one of: "
+            f"Для фактора {factor_key!r} поле confidence должно иметь одно из значений: "
             + ", ".join(sorted(EVIDENCE_CONFIDENCE))
         )
     before = conn.total_changes
@@ -1937,6 +3736,417 @@ def insert_vacancy_factor_once(
     return conn.total_changes > before
 
 
+def extract_decision_metadata(item: dict[str, Any]) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    field_specs = (
+        ("campaign_id", DECISION_CAMPAIGN_IDS, "campaign_id"),
+        ("role_family", DECISION_ROLE_FAMILIES, "role_family"),
+        ("master_resume_id", DECISION_RESUME_IDS, "master_resume_id"),
+        ("planned_resume_id", DECISION_RESUME_IDS, "planned_resume_id"),
+        ("actual_resume_id", DECISION_RESUME_IDS, "actual_resume_id"),
+        ("message_variant", DECISION_MESSAGE_VARIANTS, "message_variant"),
+    )
+    for key, allowed, label in field_specs:
+        if key in item:
+            metadata[key] = configured_value(item.get(key), allowed, label=label)
+    if "actual_submitted_resume_version" in item and "actual_resume_id" not in metadata:
+        metadata["actual_resume_id"] = configured_value(
+            item.get("actual_submitted_resume_version"),
+            DECISION_RESUME_IDS,
+            label="actual_submitted_resume_version",
+        )
+    if "confidence" in item:
+        confidence = clean_cell(str(item.get("confidence") or "")).lower()
+        if confidence and confidence not in EVIDENCE_CONFIDENCE | {"unknown"}:
+            raise ValueError(
+                "Поле confidence должно иметь одно из значений: "
+                + ", ".join(sorted(EVIDENCE_CONFIDENCE | {"unknown"}))
+            )
+        metadata["confidence"] = confidence or None
+    if "hard_gates" in item:
+        metadata["hard_gates"] = validate_hard_gates(item.get("hard_gates"))
+    if "unresolved_questions" in item:
+        metadata["unresolved_questions"] = validate_unresolved_questions(
+            item.get("unresolved_questions")
+        )
+    if "human_path_status" in item:
+        human_path_status = clean_cell(
+            str(item.get("human_path_status") or "")
+        ).lower()
+        if human_path_status and human_path_status not in HUMAN_PATH_STATUSES:
+            raise ValueError(
+                "Поле human_path_status должно иметь одно из значений: "
+                + ", ".join(sorted(HUMAN_PATH_STATUSES))
+            )
+        metadata["human_path_status"] = human_path_status or None
+    return metadata
+
+
+def upsert_decision_metadata(
+    conn: sqlite3.Connection,
+    *,
+    vacancy_id: int,
+    metadata: dict[str, Any],
+    application_source_hit_id: int | None = None,
+) -> None:
+    if not metadata and application_source_hit_id is None:
+        return
+    row = conn.execute(
+        "SELECT * FROM vacancy_decision_metadata WHERE vacancy_id = ?",
+        (vacancy_id,),
+    ).fetchone()
+
+    def selected(key: str) -> Any:
+        if key in metadata:
+            return metadata[key]
+        return row[key] if row else None
+
+    hard_gates_json = (
+        json.dumps(metadata["hard_gates"], ensure_ascii=False)
+        if "hard_gates" in metadata
+        else (row["hard_gate_results_json"] if row else None)
+    )
+    questions_json = (
+        json.dumps(metadata["unresolved_questions"], ensure_ascii=False)
+        if "unresolved_questions" in metadata
+        else (row["unresolved_questions_json"] if row else None)
+    )
+    conn.execute(
+        """
+        INSERT INTO vacancy_decision_metadata (
+            vacancy_id, campaign_id, role_family, confidence,
+            hard_gate_results_json, unresolved_questions_json,
+            master_resume_id, planned_resume_id, actual_resume_id,
+            message_variant, application_source_hit_id, human_path_status,
+            updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(vacancy_id) DO UPDATE SET
+            campaign_id = excluded.campaign_id,
+            role_family = excluded.role_family,
+            confidence = excluded.confidence,
+            hard_gate_results_json = excluded.hard_gate_results_json,
+            unresolved_questions_json = excluded.unresolved_questions_json,
+            master_resume_id = excluded.master_resume_id,
+            planned_resume_id = excluded.planned_resume_id,
+            actual_resume_id = excluded.actual_resume_id,
+            message_variant = excluded.message_variant,
+            application_source_hit_id = excluded.application_source_hit_id,
+            human_path_status = excluded.human_path_status,
+            updated_at = excluded.updated_at
+        """,
+        (
+            vacancy_id,
+            selected("campaign_id"),
+            selected("role_family"),
+            selected("confidence"),
+            hard_gates_json,
+            questions_json,
+            selected("master_resume_id"),
+            selected("planned_resume_id"),
+            selected("actual_resume_id"),
+            selected("message_variant"),
+            application_source_hit_id
+            if application_source_hit_id is not None
+            else (row["application_source_hit_id"] if row else None),
+            selected("human_path_status"),
+            now_iso(),
+        ),
+    )
+
+
+def append_external_action(
+    conn: sqlite3.Connection,
+    *,
+    vacancy_id: int | None,
+    action_key: str,
+    action_type: str,
+    state: str,
+    event_at: str,
+    authorization_note: str,
+    evidence_note: str,
+    evidence_url: str,
+    source: str,
+    external_reference: str = "",
+    metadata: dict[str, Any] | None = None,
+) -> tuple[int, bool]:
+    action_key = clean_cell(action_key)
+    action_type = clean_cell(action_type).lower()
+    state = clean_cell(state).lower()
+    if not action_key:
+        raise ValueError("Требуется action_key.")
+    if action_type not in EXTERNAL_ACTION_TYPES:
+        raise ValueError("Неподдерживаемый тип внешнего действия.")
+    if state not in EXTERNAL_ACTION_STATES:
+        raise ValueError("Неподдерживаемое состояние внешнего действия.")
+    event_at_value = parse_iso_datetime(event_at, label="event_at").isoformat()
+    authorization_note = clean_cell(authorization_note)
+    evidence_note = clean_cell(evidence_note)
+    existing_context = conn.execute(
+        """
+        SELECT vacancy_id, action_type FROM external_actions
+        WHERE action_key = ? ORDER BY id LIMIT 1
+        """,
+        (action_key,),
+    ).fetchone()
+    if existing_context and (
+        existing_context["vacancy_id"] != vacancy_id
+        or str(existing_context["action_type"]) != action_type
+    ):
+        raise ValueError(
+            "action_key уже относится к другой вакансии или другому типу действия."
+        )
+    prior_authorization = conn.execute(
+        """
+        SELECT 1 FROM external_actions
+        WHERE action_key = ? AND action_type = ?
+          AND vacancy_id IS ? AND state = 'authorized'
+        LIMIT 1
+        """,
+        (action_key, action_type, vacancy_id),
+    ).fetchone()
+    if state == "authorized" and not authorization_note:
+        raise ValueError("Для состояния authorized требуется пояснение разрешения.")
+    if state in {"attempted", "visibly_confirmed"} and not prior_authorization:
+        raise ValueError(
+            "Перед попыткой или подтверждением требуется сохранённое состояние authorized."
+        )
+    if state in {"attempted", "visibly_confirmed", "blocked", "failed"} and not evidence_note:
+        raise ValueError("Для этого состояния внешнего действия требуется доказательное примечание.")
+    if state == "visibly_confirmed" and not external_reference:
+        raise ValueError("Для видимого подтверждения требуется внешняя ссылка или идентификатор.")
+    evidence_url = validate_optional_external_url(
+        evidence_url, label="evidence_url"
+    )
+    if clean_cell(external_reference):
+        payload = {
+            "vacancy_id": vacancy_id,
+            "action_key": action_key,
+            "action_type": action_type,
+            "state": state,
+            "external_reference": clean_cell(external_reference),
+        }
+    else:
+        payload = {
+            "vacancy_id": vacancy_id,
+            "action_key": action_key,
+            "action_type": action_type,
+            "state": state,
+            "event_at": event_at_value,
+        }
+    dedupe_key = dedupe_hash(payload)
+    before = conn.total_changes
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO external_actions (
+            vacancy_id, action_key, action_type, state, event_at,
+            authorization_note, evidence_note, evidence_url, source,
+            external_reference, metadata_json, dedupe_key, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            vacancy_id,
+            action_key,
+            action_type,
+            state,
+            event_at_value,
+            authorization_note,
+            evidence_note,
+            evidence_url,
+            clean_cell(source),
+            clean_cell(external_reference),
+            json.dumps(metadata or {}, ensure_ascii=False, sort_keys=True),
+            dedupe_key,
+            now_iso(),
+        ),
+    )
+    created = conn.total_changes > before
+    row = conn.execute(
+        "SELECT id FROM external_actions WHERE dedupe_key = ?", (dedupe_key,)
+    ).fetchone()
+    return int(row["id"]), created
+
+
+def classify_ingestion_record(
+    item: dict[str, Any], *, channel: str
+) -> tuple[str, list[str]]:
+    explicit = clean_cell(
+        str(item.get("record_classification") or item.get("classification") or "")
+    ).lower()
+    if explicit in QUARANTINE_CLASSIFICATIONS:
+        return explicit, []
+    record_type = clean_cell(
+        str(item.get("record_type") or item.get("kind") or "")
+    ).lower()
+    if record_type in {"non_vacancy", "technical", "error"} or item.get("is_vacancy") is False:
+        return "non_vacancy", []
+    technical_text = " ".join(
+        str(item.get(key) or "")
+        for key in ("title", "status", "error", "message", "body", "description")
+    ).casefold()
+    if any(marker in technical_text for marker in ("captcha", "капча", "robot check")):
+        return "captcha", []
+    if any(
+        marker in technical_text
+        for marker in ("logged out", "sign in to continue", "login required", "требуется вход")
+    ):
+        return "logged_out", []
+    if any(
+        marker in technical_text
+        for marker in ("access denied", "forbidden", "429 too many", "доступ запрещён")
+    ):
+        return "access_error", []
+
+    title = clean_cell(str(item.get("title") or item.get("vacancy_title") or item.get("name") or ""))
+    company = clean_cell(str(item.get("company") or item.get("employer") or ""))
+    url = clean_cell(str(item.get("url") or item.get("href") or ""))
+    missing: list[str] = []
+    if not title:
+        missing.append("title")
+    if not url:
+        missing.append("url")
+    if channel in {"hh", "linkedin", "telegram", "company_site", "gmail_hh"} and not company:
+        missing.append("company")
+    if missing:
+        return "missing_required_fields", missing
+    if not safe_external_url(normalize_url(url)):
+        return "malformed", ["url"]
+    return "", []
+
+
+def store_quarantine_record(
+    conn: sqlite3.Connection,
+    *,
+    item: Any,
+    origin_file: str,
+    line_no: int,
+    source_name: str,
+    source_stream: str,
+    classification: str,
+    evidence_note: str,
+    retry_context: dict[str, Any] | None = None,
+) -> tuple[int, bool]:
+    if classification not in QUARANTINE_CLASSIFICATIONS:
+        raise ValueError("Неподдерживаемая классификация записи карантина.")
+    raw_payload = json.dumps(item, ensure_ascii=False, sort_keys=True)
+    dedupe_key = dedupe_hash(
+        {
+            "origin_file": origin_file,
+            "line_no": line_no,
+            "raw_payload": raw_payload,
+            "classification": classification,
+        }
+    )
+    timestamp = now_iso()
+    before = conn.total_changes
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO quarantine_records (
+            origin_file, line_no, source_name, source_stream, classification,
+            status, evidence_note, raw_payload_json, retry_context_json,
+            retry_count, dedupe_key, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, 0, ?, ?, ?)
+        """,
+        (
+            origin_file,
+            line_no,
+            source_name,
+            source_stream,
+            classification,
+            clean_cell(evidence_note),
+            raw_payload,
+            json.dumps(retry_context or {}, ensure_ascii=False, sort_keys=True),
+            dedupe_key,
+            timestamp,
+            timestamp,
+        ),
+    )
+    created = conn.total_changes > before
+    row = conn.execute(
+        "SELECT id FROM quarantine_records WHERE dedupe_key = ?", (dedupe_key,)
+    ).fetchone()
+    return int(row["id"]), created
+
+
+def validate_rule_results(value: Any) -> list[dict[str, str]]:
+    if value in (None, ""):
+        return []
+    if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
+        raise ValueError("Поле rule_results должно быть массивом объектов.")
+    result: list[dict[str, str]] = []
+    for index, item in enumerate(value, start=1):
+        key = clean_cell(str(item.get("rule") or item.get("rule_key") or ""))
+        outcome = clean_cell(str(item.get("result") or "unknown")).lower()
+        if not key:
+            raise ValueError(f"Для rule_results[{index}] требуется rule_key.")
+        if outcome not in {"matched", "not_matched", "unknown"}:
+            raise ValueError(
+                f"Поле rule_results[{index}].result должно иметь значение matched, not_matched или unknown."
+            )
+        result.append(
+            {
+                "rule_key": key,
+                "result": outcome,
+                "note": clean_cell(str(item.get("note") or "")),
+            }
+        )
+    return result
+
+
+def insert_screening_decision(
+    conn: sqlite3.Connection,
+    *,
+    vacancy_id: int,
+    item: dict[str, Any],
+    date: str,
+    score: int | None,
+    stage: str,
+    status: str,
+) -> None:
+    explicit_decision = clean_cell(str(item.get("screening_decision") or "")).lower()
+    if explicit_decision:
+        decision = explicit_decision
+    elif stage == "rejected" or any(
+        marker in status.casefold() for marker in ("low_fit", "skip", "reject")
+    ):
+        decision = "rejected"
+    elif clean_cell(str(item.get("priority") or "")).lower() == "low":
+        decision = "low_priority"
+    else:
+        return
+    if decision not in {"rejected", "low_priority", "review"}:
+        raise ValueError("Поле screening_decision должно иметь значение rejected, low_priority или review.")
+    rule_results = validate_rule_results(item.get("rule_results"))
+    payload = {
+        "vacancy_id": vacancy_id,
+        "evaluated_at": date,
+        "decision": decision,
+        "policy_version": ACTIVE_POLICY_VERSION,
+        "rule_results": rule_results,
+    }
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO screening_decisions (
+            vacancy_id, evaluated_at, decision, score, priority,
+            policy_version, policy_effective_date, rule_results_json,
+            evidence_note, dedupe_key, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            vacancy_id,
+            parse_iso_datetime(date, label="evaluation date").isoformat(),
+            decision,
+            score,
+            clean_cell(str(item.get("priority") or "")),
+            ACTIVE_POLICY_VERSION,
+            ACTIVE_POLICY_EFFECTIVE_DATE,
+            json.dumps(rule_results, ensure_ascii=False),
+            clean_cell(str(item.get("decision_evidence_note") or item.get("reason") or "")),
+            dedupe_hash(payload),
+            now_iso(),
+        ),
+    )
+
+
 def ingest_item(
     conn: sqlite3.Connection,
     item: dict[str, Any],
@@ -1945,8 +4155,42 @@ def ingest_item(
     default_source: str = "",
     origin_file: str = "",
     line_no: int = 0,
+    ingestion_stats: dict[str, int] | None = None,
 ) -> int | None:
+    ingestion_stats = ingestion_stats if ingestion_stats is not None else {}
     channel = infer_channel(item, default_channel)
+    raw_source_stream_value = item.get("source_stream", item.get("stream"))
+    source_hint = clean_cell(str(item.get("source") or default_source or "manual_json"))
+    source_stream = (
+        str(raw_source_stream_value)
+        if raw_source_stream_value is not None
+        else source_hint
+    )
+    classification, classification_details = classify_ingestion_record(
+        item, channel=channel
+    )
+    if classification:
+        note = clean_cell(str(item.get("quarantine_note") or ""))
+        if not note and classification_details:
+            note = "Не пройдена проверка полей: " + ", ".join(classification_details)
+        if not note:
+            note = "Запись исключена из показателей вакансий до явной повторной обработки."
+        store_quarantine_record(
+            conn,
+            item=item,
+            origin_file=origin_file,
+            line_no=line_no,
+            source_name=channel,
+                source_stream=source_stream,
+            classification=classification,
+            evidence_note=note,
+            retry_context=item.get("retry_context")
+            if isinstance(item.get("retry_context"), dict)
+            else {},
+        )
+        ingestion_stats["quarantined"] = ingestion_stats.get("quarantined", 0) + 1
+        return None
+
     title = clean_cell(str(item.get("title") or item.get("vacancy_title") or item.get("name") or ""))
     company = clean_cell(str(item.get("company") or item.get("employer") or ""))
     description = str(
@@ -1958,9 +4202,6 @@ def ingest_item(
     )
     url = clean_cell(str(item.get("url") or item.get("href") or ""))
     external_id = clean_cell(str(item.get("external_id") or ""))
-    if not title and not url:
-        return None
-
     date = clean_cell(
         str(
             item.get("date")
@@ -1970,8 +4211,23 @@ def ingest_item(
             or dt.date.today().isoformat()
         )
     )
+    try:
+        parse_iso_datetime(date, label="record date")
+    except ValueError:
+        store_quarantine_record(
+            conn,
+            item=item,
+            origin_file=origin_file,
+            line_no=line_no,
+            source_name=channel,
+            source_stream=source_stream,
+            classification="malformed",
+            evidence_note="Дата записи не соответствует ISO 8601.",
+            retry_context={},
+        )
+        ingestion_stats["quarantined"] = ingestion_stats.get("quarantined", 0) + 1
+        return None
     source = clean_cell(str(item.get("source") or default_source or "manual_json"))
-    source_stream = clean_cell(str(item.get("source_stream") or item.get("stream") or source))
     status = clean_cell(str(item.get("status") or item.get("latest_status") or "DISCOVERED"))
     stage = clean_cell(str(item.get("stage") or item.get("latest_stage") or ""))
     if not stage:
@@ -1987,6 +4243,7 @@ def ingest_item(
     role_type = clean_cell(str(item.get("role_type") or ""))
     resume_version = clean_cell(str(item.get("resume_version") or ""))
     cover_letter = clean_cell(str(item.get("cover_letter") or ""))
+    decision_metadata = extract_decision_metadata(item)
 
     vacancy_id = upsert_vacancy(
         conn,
@@ -2012,7 +4269,7 @@ def ingest_item(
         origin_file=origin_file,
     )
 
-    insert_source_hit_once(
+    source_hit_id = insert_source_hit_once(
         conn,
         vacancy_id=vacancy_id,
         seen_date=date,
@@ -2024,6 +4281,14 @@ def ingest_item(
         next_action=next_action,
         origin_file=origin_file,
         line_no=line_no,
+    )
+    upsert_decision_metadata(
+        conn,
+        vacancy_id=vacancy_id,
+        metadata=decision_metadata,
+        application_source_hit_id=(
+            source_hit_id if item.get("application_source") is True else None
+        ),
     )
 
     if kind in {"review", "shortlist", "evaluation"} or stage in ACTIVE_REVIEW_STAGES:
@@ -2074,7 +4339,7 @@ def ingest_item(
     if not isinstance(factors, list) or not all(
         isinstance(factor, dict) for factor in factors
     ):
-        raise ValueError("factors must be an array of objects")
+        raise ValueError("Поле factors должно быть массивом объектов.")
     for factor in factors:
         insert_vacancy_factor_once(
             conn,
@@ -2082,6 +4347,163 @@ def ingest_item(
             factor=factor,
             default_date=date,
         )
+
+    insert_screening_decision(
+        conn,
+        vacancy_id=vacancy_id,
+        item=item,
+        date=date,
+        score=score,
+        stage=stage,
+        status=status,
+    )
+
+    external_action_id: int | None = None
+    external_action = item.get("external_action")
+    if external_action is not None:
+        if not isinstance(external_action, dict):
+            raise ValueError("Поле external_action должно быть объектом.")
+        action_metadata = dict(decision_metadata)
+        action_type = clean_cell(
+            str(external_action.get("action_type") or "application")
+        ).lower()
+        action_state = clean_cell(str(external_action.get("state") or "")).lower()
+        external_action_id, _ = append_external_action(
+            conn,
+            vacancy_id=vacancy_id,
+            action_key=clean_cell(str(external_action.get("action_key") or "")),
+            action_type=action_type,
+            state=action_state,
+            event_at=clean_cell(str(external_action.get("event_at") or date)),
+            authorization_note=clean_cell(
+                str(external_action.get("authorization_note") or "")
+            ),
+            evidence_note=clean_cell(
+                str(external_action.get("evidence_note") or "")
+            ),
+            evidence_url=clean_cell(str(external_action.get("evidence_url") or "")),
+            source=clean_cell(str(external_action.get("source") or source)),
+            external_reference=clean_cell(
+                str(external_action.get("external_reference") or "")
+            ),
+            metadata=action_metadata,
+        )
+        if action_type == "application" and action_state == "visibly_confirmed":
+            lifecycle_id, _ = append_lifecycle_event(
+                conn,
+                vacancy_id=vacancy_id,
+                event_type="application_confirmed",
+                event_at=clean_cell(str(external_action.get("event_at") or date)),
+                evidence_at=clean_cell(
+                    str(external_action.get("evidence_at") or now_iso())
+                ),
+                evidence_note=clean_cell(
+                    str(external_action.get("evidence_note") or "")
+                ),
+                evidence_source=clean_cell(
+                    str(external_action.get("source") or source)
+                ),
+                origin=origin_file or "ingest-json",
+                evidence_url=clean_cell(
+                    str(external_action.get("evidence_url") or "")
+                ),
+                external_reference=clean_cell(
+                    str(external_action.get("external_reference") or "")
+                ),
+                external_action_id=external_action_id,
+                application_source_hit_id=(
+                    source_hit_id if item.get("application_source") is True else None
+                ),
+                metadata=action_metadata,
+                history_complete=True,
+                authorization_status="explicit",
+            )
+            application = conn.execute(
+                "SELECT id FROM applications WHERE vacancy_id = ? ORDER BY id DESC LIMIT 1",
+                (vacancy_id,),
+            ).fetchone()
+            if application:
+                conn.execute(
+                    """
+                    UPDATE applications
+                    SET lifecycle_event_id = ?, application_source_hit_id = ?,
+                        campaign_id = ?, role_family = ?, actual_resume_version = ?,
+                        message_variant = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        lifecycle_id,
+                        source_hit_id if item.get("application_source") is True else None,
+                        decision_metadata.get("campaign_id"),
+                        decision_metadata.get("role_family"),
+                        decision_metadata.get("actual_resume_id"),
+                        decision_metadata.get("message_variant"),
+                        int(application["id"]),
+                    ),
+                )
+
+    lifecycle_items = item.get("lifecycle_events", [])
+    if lifecycle_items is None:
+        lifecycle_items = []
+    if not isinstance(lifecycle_items, list) or not all(
+        isinstance(event, dict) for event in lifecycle_items
+    ):
+        raise ValueError("Поле lifecycle_events должно быть массивом объектов.")
+    for event in lifecycle_items:
+        event_type = clean_cell(str(event.get("event_type") or event.get("type") or ""))
+        if event_type == "application_confirmed":
+            raise ValueError(
+                "Событие application_confirmed можно записать только через видимо подтверждённое external_action."
+            )
+        append_lifecycle_event(
+            conn,
+            vacancy_id=vacancy_id,
+            event_type=event_type,
+            event_at=clean_cell(str(event.get("event_at") or date)),
+            evidence_at=clean_cell(str(event.get("evidence_at") or now_iso())),
+            evidence_note=clean_cell(str(event.get("evidence_note") or "")),
+            evidence_source=clean_cell(str(event.get("source") or source)),
+            origin=origin_file or "ingest-json",
+            evidence_url=clean_cell(str(event.get("evidence_url") or "")),
+            external_reference=clean_cell(
+                str(event.get("external_reference") or "")
+            ),
+            round_no=to_int(str(event.get("round_no") or event.get("interview_no") or "")),
+            scheduled_at=clean_cell(str(event.get("scheduled_at") or "")),
+            metadata=decision_metadata,
+            history_complete=True,
+            authorization_status="not_applicable",
+        )
+
+    action_state = clean_cell(str(item.get("action_state") or "")).lower()
+    action_bucket = clean_cell(str(item.get("action_bucket") or "")).lower()
+    if not action_state or not action_bucket:
+        legacy_action = {
+            "latest_stage": stage,
+            "latest_status": status,
+            "next_action": next_action,
+            "open_questions": open_questions,
+            "follow_up_date": follow_up_date,
+            "score": score,
+        }
+        action_state, action_bucket, derived_due, derived_priority = action_from_legacy_row(
+            legacy_action  # type: ignore[arg-type]
+        )
+    else:
+        derived_due = follow_up_date
+        derived_priority = int(score or 0)
+    append_action_event(
+        conn,
+        vacancy_id=vacancy_id,
+        action_state=action_state,
+        bucket=action_bucket,
+        event_at=clean_cell(str(item.get("action_at") or date)),
+        due_date=clean_cell(str(item.get("action_due_date") or derived_due)),
+        priority=to_int(str(item.get("action_priority") or derived_priority)) or 0,
+        reason=clean_cell(str(item.get("priority_reason") or next_action or open_questions or reason)),
+        evidence_note=clean_cell(str(item.get("action_evidence_note") or "")),
+        source=origin_file or source,
+    )
 
     insert_stage_event(
         conn,
@@ -2093,6 +4515,7 @@ def ingest_item(
         origin_file,
         line_no,
     )
+    ingestion_stats["ingested"] = ingestion_stats.get("ingested", 0) + 1
     return vacancy_id
 
 
@@ -2246,7 +4669,7 @@ def aggregate_conversion_group(
     }
 
 
-def build_conversion_report_data(
+def build_legacy_conversion_report_data(
     conn: sqlite3.Connection, as_of: dt.date
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     cohorts, invalid_application_dates = first_application_cohorts(conn, as_of)
@@ -2255,14 +4678,14 @@ def build_conversion_report_data(
     interactions = conn.execute(
         """
         SELECT vacancy_id, event_at
-        FROM employer_interactions
+        FROM effective_employer_interactions
         WHERE direction = 'inbound' AND is_human = 1
         ORDER BY event_at, id
         """
     ).fetchall()
     interaction_history_available = bool(
         conn.execute(
-            "SELECT 1 FROM employer_interactions WHERE event_at <= ? LIMIT 1",
+            "SELECT 1 FROM effective_employer_interactions WHERE event_at <= ? LIMIT 1",
             (as_of.isoformat() + "T23:59:59",),
         ).fetchone()
     )
@@ -2350,36 +4773,510 @@ def build_conversion_report_data(
         ]
 
     caveats = [
-        "One cohort member is the earliest confirmed application row per unique vacancy.",
-        "Canonical stream attribution is the earliest source hit on or before the first application date; ties use source_hits.id.",
-        "Human replies are inbound interactions marked human after the application date; automated acknowledgments are excluded.",
-        "Interview conversion requires an interview_1 stage event with a non-empty evidence note.",
+        "Единица когорты — самая ранняя подтверждённая строка отклика для одной уникальной вакансии.",
+        "Канонический поток определяется по самому раннему касанию до отклика; равные даты разрешаются по source_hits.id.",
+        "Ответы людей — входящие взаимодействия после отклика с признаком человека; автоматические подтверждения исключены.",
+        "Для конверсии интервью требуется этап interview_1 с непустым доказательным примечанием.",
     ]
     if not interaction_history_available:
         caveats.append(
-            "No employer interaction history is recorded, so reply counts and rates are n/a rather than zero."
+            "История взаимодействий с работодателями отсутствует, поэтому ответы и доли равны n/a, а не нулю."
         )
     else:
         caveats.append(
-            "Reply metrics reflect recorded interactions only; the engine does not reconstruct historical replies from status text."
+            "Показатели ответов учитывают только сохранённые взаимодействия; система не восстанавливает историю из текста состояния."
         )
     if invalid_application_dates:
         caveats.append(
-            f"Excluded {invalid_application_dates} application row(s) with invalid dates."
+            f"Исключено строк откликов с некорректной датой: {invalid_application_dates}."
         )
     return (
         {
             "as_of": as_of.isoformat(),
             "interaction_history_available": interaction_history_available,
             "methodology": {
-                "grain": "one unique vacancy with its earliest confirmed application",
+                "grain": "одна уникальная вакансия и её самый ранний подтверждённый отклик",
                 "reply_maturity_days": 14,
                 "interview_maturity_days": 30,
-                "stream_attribution": "earliest source hit on or before application date; source_hits.id breaks ties; unknown when absent",
+                "stream_attribution": "самое раннее касание до даты отклика; source_hits.id разрешает равные даты; отсутствие означает неизвестный источник",
             },
             "overall": overall,
             "breakdowns": breakdowns,
             "caveats": caveats,
+        },
+        cohorts,
+    )
+
+
+def first_confirmed_application_cohorts(
+    conn: sqlite3.Connection, as_of: dt.date
+) -> tuple[list[dict[str, Any]], int]:
+    """Reduce append-only evidence to one earliest confirmed event per vacancy."""
+
+    end_at = dt.datetime.combine(as_of + dt.timedelta(days=1), dt.time())
+    first_by_vacancy: dict[int, dict[str, Any]] = {}
+    invalid_dates = 0
+    rows = conn.execute(
+        """
+        SELECT le.*, v.channel AS vacancy_channel, v.company, v.title
+        FROM lifecycle_events le
+        JOIN vacancies v ON v.id = le.vacancy_id
+        WHERE le.event_type = 'application_confirmed'
+        ORDER BY le.event_at, le.id
+        """
+    ).fetchall()
+    for row in rows:
+        try:
+            application_at = parse_iso_datetime(row["event_at"], label="event_at")
+        except ValueError:
+            invalid_dates += 1
+            continue
+        if application_at >= end_at:
+            continue
+        vacancy_id = int(row["vacancy_id"])
+        if vacancy_id in first_by_vacancy:
+            continue
+        first_by_vacancy[vacancy_id] = {
+            "vacancy_id": vacancy_id,
+            "application_event_id": int(row["id"]),
+            "application_at": application_at,
+            "application_date": application_at.date(),
+            "application_month": application_at.strftime("%Y-%m"),
+            "age_days": (as_of - application_at.date()).days,
+            "company": clean_cell(row["company"]),
+            "title": clean_cell(row["title"]),
+            "vacancy_channel": clean_cell(row["vacancy_channel"]) or "unknown",
+            "history_complete": bool(row["history_complete"]),
+            "authorization_status": clean_cell(row["authorization_status"]),
+            "campaign_id": clean_cell(row["campaign_id"]) or "unknown",
+            "role_family": clean_cell(row["role_family"]) or "unknown",
+            "confidence": clean_cell(row["confidence"]) or "unknown",
+            "master_resume_id": clean_cell(row["master_resume_id"]) or "unknown",
+            "planned_resume_id": clean_cell(row["planned_resume_id"]) or "unknown",
+            "actual_resume_version": clean_cell(row["actual_resume_id"]) or "unknown",
+            "message_variant": clean_cell(row["message_variant"]) or "unknown",
+            "hard_gate_results_known": row["hard_gate_results_json"] is not None,
+            "unresolved_questions_known": row["unresolved_questions_json"] is not None,
+            "human_path_status": clean_cell(row["human_path_status"]) or "unknown",
+            "explicit_application_source_hit_id": row["application_source_hit_id"],
+        }
+
+    hits_by_vacancy: dict[int, list[sqlite3.Row]] = defaultdict(list)
+    for hit in conn.execute(
+        """
+        SELECT id, vacancy_id, seen_date, source_name, source_stream
+        FROM source_hits ORDER BY COALESCE(seen_date, ''), id
+        """
+    ).fetchall():
+        hits_by_vacancy[int(hit["vacancy_id"])].append(hit)
+
+    account_by_vacancy = {
+        int(row["vacancy_id"]): clean_cell(row["canonical_name"]) or "unknown"
+        for row in conn.execute(
+            """
+            SELECT l.vacancy_id, a.canonical_name
+            FROM vacancy_employer_accounts l
+            JOIN employer_accounts a ON a.id = l.account_id
+            """
+        ).fetchall()
+    }
+    for cohort in first_by_vacancy.values():
+        selected_hit: sqlite3.Row | None = None
+        explicit_id = cohort["explicit_application_source_hit_id"]
+        if explicit_id is not None:
+            selected_hit = conn.execute(
+                """
+                SELECT id, vacancy_id, seen_date, source_name, source_stream
+                FROM source_hits WHERE id = ? AND vacancy_id = ?
+                """,
+                (int(explicit_id), cohort["vacancy_id"]),
+            ).fetchone()
+        if selected_hit is None:
+            for hit in hits_by_vacancy.get(cohort["vacancy_id"], []):
+                try:
+                    hit_at = parse_iso_datetime(hit["seen_date"], label="seen_date")
+                except ValueError:
+                    continue
+                if hit_at.date() <= cohort["application_date"]:
+                    selected_hit = hit
+                    break
+        if selected_hit is None:
+            cohort.update(
+                {
+                    "source_channel": "unknown",
+                    "source_stream": "unknown",
+                    "source_labels": ["unknown"],
+                    "raw_source_stream": "",
+                    "source_attribution": "unknown",
+                }
+            )
+        else:
+            labels, _ = canonical_source_labels(selected_hit["source_stream"])
+            cohort.update(
+                {
+                    "source_channel": clean_cell(selected_hit["source_name"]) or cohort["vacancy_channel"],
+                    "source_stream": labels[0],
+                    "source_labels": list(labels),
+                    "raw_source_stream": selected_hit["source_stream"] or "",
+                    "source_attribution": "explicit_application_source"
+                    if explicit_id is not None
+                    else "deterministic_first_touch",
+                }
+            )
+        cohort["employer_account"] = account_by_vacancy.get(
+            cohort["vacancy_id"], "unknown"
+        )
+        cohort["first_human_reply_at"] = None
+        cohort["screening_request"] = False
+        cohort["automated_acknowledgments"] = 0
+        cohort["interview_invited"] = False
+        cohort["interview_scheduled"] = False
+        cohort["completed_first_interview"] = False
+        cohort["later_interview_round"] = False
+        cohort["offer_received"] = False
+        cohort["interview_cancelled"] = False
+        cohort["candidate_no_show"] = False
+        cohort["employer_no_show"] = False
+        cohort["contact_search_completed"] = False
+        cohort["verified_human_path"] = cohort["human_path_status"] == "verified"
+
+    return (
+        sorted(first_by_vacancy.values(), key=lambda item: item["application_event_id"]),
+        invalid_dates,
+    )
+
+
+def rate_payload(
+    numerator: int | None, denominator: int, *, available: bool = True
+) -> dict[str, Any]:
+    percent_value = None
+    if available and numerator is not None and denominator:
+        percent_value = round(numerator / denominator * 100, 1)
+    return {
+        "numerator": numerator if available else None,
+        "denominator": denominator,
+        "percent": percent_value,
+        "available": bool(available and numerator is not None),
+    }
+
+
+def aggregate_outcome_group(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    confirmed = len(rows)
+    matured_14 = [row for row in rows if row["age_days"] >= 14]
+    matured_30 = [row for row in rows if row["age_days"] >= 30]
+    reply_complete = all(row["history_complete"] for row in matured_14)
+    interview_complete = all(row["history_complete"] for row in matured_30)
+    all_complete = all(row["history_complete"] for row in rows)
+
+    human_replies_count = sum(bool(row["first_human_reply_at"]) for row in matured_14)
+    screening_request_count = sum(bool(row["screening_request"]) for row in rows)
+    reply_times = [
+        (
+            parse_iso_datetime(row["first_human_reply_at"], label="event_at")
+            - row["application_at"]
+        ).total_seconds()
+        / 86400
+        for row in rows
+        if row["first_human_reply_at"]
+    ]
+    invitation_count = sum(bool(row["interview_invited"]) for row in rows)
+    scheduled_count = sum(bool(row["interview_scheduled"]) for row in rows)
+    completed_first_count = sum(
+        bool(row["completed_first_interview"]) for row in matured_30
+    )
+    later_round_count = sum(bool(row["later_interview_round"]) for row in rows)
+    offer_count = sum(bool(row["offer_received"]) for row in rows)
+    contact_search_count = sum(bool(row["contact_search_completed"]) for row in rows)
+    human_path_count = sum(bool(row["verified_human_path"]) for row in rows)
+
+    def conservative_count(count: int, complete: bool) -> int | None:
+        return count if complete or count > 0 else None
+
+    completeness_fields = (
+        "campaign_id",
+        "role_family",
+        "confidence",
+        "master_resume_id",
+        "planned_resume_id",
+        "actual_resume_version",
+        "message_variant",
+        "human_path_status",
+        "employer_account",
+    )
+    filled = 0
+    for row in rows:
+        filled += sum(
+            1 for field in completeness_fields if row.get(field) not in {None, "", "unknown"}
+        )
+        filled += int(row["hard_gate_results_known"])
+        filled += int(row["unresolved_questions_known"])
+    possible = confirmed * (len(completeness_fields) + 2)
+
+    human_replies = conservative_count(human_replies_count, reply_complete)
+    screening_requests = conservative_count(screening_request_count, all_complete)
+    completed_first = conservative_count(completed_first_count, interview_complete)
+    invitations = conservative_count(invitation_count, all_complete)
+    scheduled = conservative_count(scheduled_count, all_complete)
+    later_rounds = conservative_count(later_round_count, all_complete)
+    offers = conservative_count(offer_count, all_complete)
+    contact_searches = conservative_count(contact_search_count, all_complete)
+    verified_paths = conservative_count(human_path_count, all_complete)
+    return {
+        "confirmed_applications": confirmed,
+        "matured_for_human_reply_14d": len(matured_14),
+        "recorded_inbound_human_replies": human_replies,
+        "screening_requests": screening_requests,
+        "first_human_reply_sample": len(reply_times),
+        "median_time_to_first_human_reply_days": (
+            round(statistics.median(reply_times), 2) if reply_times else None
+        ),
+        "average_time_to_first_human_reply_days": (
+            round(statistics.mean(reply_times), 2) if reply_times else None
+        ),
+        "human_reply_rate_14d": rate_payload(
+            human_replies,
+            len(matured_14),
+            available=reply_complete,
+        ),
+        "matured_for_interview_outcomes_30d": len(matured_30),
+        "interview_invitations": invitations,
+        "scheduled_interviews": scheduled,
+        "completed_first_interviews": completed_first,
+        "completed_first_interview_rate_30d": rate_payload(
+            completed_first,
+            len(matured_30),
+            available=interview_complete,
+        ),
+        "later_interview_rounds": later_rounds,
+        "offers": offers,
+        "contact_searches_completed": contact_searches,
+        "contact_search_coverage": rate_payload(
+            contact_searches,
+            confirmed,
+            available=all_complete,
+        ),
+        "verified_human_paths": verified_paths,
+        "verified_human_path_coverage": rate_payload(
+            verified_paths,
+            confirmed,
+            available=all_complete,
+        ),
+        "field_values_present": filled,
+        "field_values_expected": possible,
+        "field_completeness": rate_payload(filled, possible, available=True),
+        "history_complete": all_complete,
+        "small_sample": 0 < confirmed < 10,
+    }
+
+
+def build_outcome_scorecard_data(
+    conn: sqlite3.Connection, as_of: dt.date
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    cohorts, invalid_application_dates = first_confirmed_application_cohorts(
+        conn, as_of
+    )
+    cohort_by_vacancy = {row["vacancy_id"]: row for row in cohorts}
+    end_at = dt.datetime.combine(as_of + dt.timedelta(days=1), dt.time())
+
+    for interaction in conn.execute(
+        """
+        SELECT vacancy_id, event_at, direction, event_type, is_human
+        FROM effective_employer_interactions
+        ORDER BY event_at, id
+        """
+    ).fetchall():
+        cohort = cohort_by_vacancy.get(int(interaction["vacancy_id"]))
+        if not cohort:
+            continue
+        try:
+            event_at = parse_iso_datetime(interaction["event_at"], label="event_at")
+        except ValueError:
+            continue
+        if not (cohort["application_at"] <= event_at < end_at):
+            continue
+        if interaction["event_type"] == "automated_ack" or not int(interaction["is_human"]):
+            cohort["automated_acknowledgments"] += 1
+        elif interaction["direction"] == "inbound" and cohort["first_human_reply_at"] is None:
+            cohort["first_human_reply_at"] = event_at.isoformat()
+            if interaction["event_type"] == "screening_request":
+                cohort["screening_request"] = True
+        elif (
+            interaction["direction"] == "inbound"
+            and interaction["event_type"] == "screening_request"
+        ):
+            cohort["screening_request"] = True
+
+    for event in conn.execute(
+        """
+        SELECT vacancy_id, event_type, event_at, round_no
+        FROM lifecycle_events
+        WHERE event_type != 'application_confirmed'
+        ORDER BY event_at, id
+        """
+    ).fetchall():
+        cohort = cohort_by_vacancy.get(int(event["vacancy_id"]))
+        if not cohort:
+            continue
+        try:
+            event_at = parse_iso_datetime(event["event_at"], label="event_at")
+        except ValueError:
+            continue
+        if not (cohort["application_at"] <= event_at < end_at):
+            continue
+        event_type = str(event["event_type"])
+        round_no = int(event["round_no"] or 0)
+        if round_no > 1 and event_type in {
+            "interview_invited",
+            "interview_scheduled",
+            "interview_completed",
+        }:
+            cohort["later_interview_round"] = True
+        if event_type == "interview_invited":
+            cohort["interview_invited"] = True
+        elif event_type == "interview_scheduled":
+            cohort["interview_scheduled"] = True
+        elif event_type == "interview_completed":
+            if round_no == 1:
+                cohort["completed_first_interview"] = True
+        elif event_type == "offer_received":
+            cohort["offer_received"] = True
+        elif event_type == "interview_cancelled":
+            cohort["interview_cancelled"] = True
+        elif event_type == "interview_no_show_candidate":
+            cohort["candidate_no_show"] = True
+        elif event_type == "interview_no_show_employer":
+            cohort["employer_no_show"] = True
+
+    for row in conn.execute(
+        "SELECT vacancy_id, search_date FROM contact_searches ORDER BY search_date, id"
+    ).fetchall():
+        cohort = cohort_by_vacancy.get(int(row["vacancy_id"]))
+        if not cohort:
+            continue
+        try:
+            searched_at = parse_iso_datetime(row["search_date"], label="search_date")
+        except ValueError:
+            continue
+        if cohort["application_at"].date() <= searched_at.date() <= as_of:
+            cohort["contact_search_completed"] = True
+
+    for row in conn.execute(
+        """
+        SELECT vacancy_id, verified_date FROM employer_contacts
+        WHERE is_active = 1 AND confidence IN ('confirmed', 'strong')
+        """
+    ).fetchall():
+        cohort = cohort_by_vacancy.get(int(row["vacancy_id"]))
+        if not cohort:
+            continue
+        verified_date = clean_cell(row["verified_date"])
+        if not verified_date or verified_date[:10] <= as_of.isoformat():
+            cohort["verified_human_path"] = True
+
+    overall = aggregate_outcome_group(cohorts)
+    groupings = (
+        "campaign_id",
+        "role_family",
+        "source_stream",
+        "source_channel",
+        "employer_account",
+        "actual_resume_version",
+        "message_variant",
+        "application_month",
+    )
+    breakdowns: dict[str, list[dict[str, Any]]] = {}
+    for grouping in groupings:
+        grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for row in cohorts:
+            grouped[str(row.get(grouping) or "unknown")].append(row)
+        breakdowns[grouping] = [
+            {grouping: key, **aggregate_outcome_group(grouped[key])}
+            for key in sorted(grouped, key=str.casefold)
+        ]
+
+    caveats = [
+        "Единица анализа — одна каноническая вакансия и самое раннее подтверждённое событие отклика.",
+        "Автоматические подтверждения отделены от ответов людей и не входят в показатель ответов.",
+        "Приглашение или назначенное время не считаются завершённым интервью: требуется отдельное событие завершения или проверенное резюме интервью.",
+        "Если исходная история неполна, отсутствие события показывается как «н/д», а не как ноль.",
+        "Источник отклика используется только при явной ссылке; иначе применяется первое касание до отклика с развязкой по идентификатору записи.",
+        "Небольшие выборки не используются как доказательство превосходства кампании или источника.",
+    ]
+    if invalid_application_dates:
+        caveats.append(
+            f"Исключено записей отклика с некорректной датой: {invalid_application_dates}."
+        )
+    return (
+        {
+            "as_of": as_of.isoformat(),
+            "methodology": {
+                "grain": "одна каноническая вакансия и самое раннее подтверждённое событие отклика",
+                "human_reply_maturity_days": 14,
+                "interview_outcome_maturity_days": 30,
+                "source_attribution": "явно указанный источник отклика; иначе самое раннее касание до отклика с развязкой по source_hits.id",
+                "completed_interview_evidence": "явное событие interview_completed или приложенное резюме интервью, прошедшее правило доказательности",
+            },
+            "overall": overall,
+            "breakdowns": breakdowns,
+            "caveats": caveats,
+            "small_sample_warning": (
+                "Выборка меньше 10 подтверждённых откликов; сравнения носят описательный характер."
+                if overall["small_sample"]
+                else ""
+            ),
+        },
+        cohorts,
+    )
+
+
+def build_conversion_report_data(
+    conn: sqlite3.Connection, as_of: dt.date
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Backward-compatible projection of the v6 outcome scorecard."""
+
+    scorecard, cohorts = build_outcome_scorecard_data(conn, as_of)
+
+    def project(item: dict[str, Any]) -> dict[str, Any]:
+        reply = item["human_reply_rate_14d"]
+        interview = item["completed_first_interview_rate_30d"]
+        human_path = item["verified_human_path_coverage"]
+        contact = item["contact_search_coverage"]
+        return {
+            "applications_unique": item["confirmed_applications"],
+            "matured_applications_14d": item["matured_for_human_reply_14d"],
+            "human_replies": item["recorded_inbound_human_replies"],
+            "screening_requests": item["screening_requests"],
+            "human_reply_rate_14d": reply["percent"],
+            "matured_applications_30d": item["matured_for_interview_outcomes_30d"],
+            "interview_1_ever": item["completed_first_interviews"],
+            "interview_1_rate_30d": interview["percent"],
+            "first_human_reply_sample": item["first_human_reply_sample"],
+            "median_time_to_first_human_reply_days": item[
+                "median_time_to_first_human_reply_days"
+            ],
+            "average_time_to_first_human_reply_days": item[
+                "average_time_to_first_human_reply_days"
+            ],
+            "verified_contacts": item["verified_human_paths"],
+            "verified_contact_coverage": human_path["percent"],
+            "contact_search_completed": item["contact_searches_completed"],
+            "contact_search_coverage": contact["percent"],
+        }
+
+    breakdowns: dict[str, list[dict[str, Any]]] = {}
+    for grouping in ("source_channel", "source_stream", "application_month"):
+        breakdowns[grouping] = [
+            {grouping: row[grouping], **project(row)}
+            for row in scorecard["breakdowns"][grouping]
+        ]
+    return (
+        {
+            "as_of": scorecard["as_of"],
+            "interaction_history_available": scorecard["overall"]["history_complete"],
+            "methodology": scorecard["methodology"],
+            "overall": project(scorecard["overall"]),
+            "breakdowns": breakdowns,
+            "caveats": scorecard["caveats"],
         },
         cohorts,
     )
@@ -2396,22 +5293,36 @@ def build_source_quality_data(
     signal_statuses = {"POTENTIAL", "NEEDS_REVIEW", "SHORTLISTED", "APPLIED"}
     for row in conn.execute(
         """
-        SELECT vacancy_id, source_stream, raw_status
-        FROM source_hits
-        ORDER BY id
+        SELECT sh.id, sh.vacancy_id, sh.source_stream, sh.raw_status,
+               labels.label_key, labels.mapping_kind
+        FROM source_hits sh
+        JOIN source_hit_labels labels ON labels.source_hit_id = sh.id
+        ORDER BY sh.id, labels.label_key COLLATE NOCASE
         """
     ).fetchall():
-        raw = clean_cell(row["source_stream"]) or "unknown"
-        canonical, mapped = canonical_source_stream(raw)
+        raw = row["source_stream"] if row["source_stream"] not in (None, "") else "unknown"
+        canonical = clean_cell(row["label_key"]) or "unknown"
+        mapped = row["mapping_kind"] == "configured_alias"
         vacancy_id = int(row["vacancy_id"])
         screening[canonical]["seen"].add(vacancy_id)
         if clean_cell(row["raw_status"]).upper() in signal_statuses:
             screening[canonical]["signals"].add(vacancy_id)
         diagnostic = raw_streams.setdefault(
             raw,
-            {"raw_stream": raw, "canonical_stream": canonical, "mapped": mapped, "hits": 0},
+            {
+                "raw_stream": raw,
+                "canonical_stream": canonical,
+                "canonical_labels": [],
+                "mapped": mapped,
+                "hit_ids": set(),
+                "hits": 0,
+            },
         )
-        diagnostic["hits"] += 1
+        if canonical not in diagnostic["canonical_labels"]:
+            diagnostic["canonical_labels"].append(canonical)
+        diagnostic["mapped"] = diagnostic["mapped"] or mapped
+        diagnostic["hit_ids"].add(int(row["id"]))
+        diagnostic["hits"] = len(diagnostic["hit_ids"])
 
     downstream = {
         row["source_stream"]: row
@@ -2438,8 +5349,256 @@ def build_source_quality_data(
                 "interview_rate": outcomes.get("interview_1_rate_30d"),
             }
         )
-    diagnostics = sorted(raw_streams.values(), key=lambda row: (row["canonical_stream"], row["raw_stream"]))
+    diagnostics = []
+    for diagnostic in raw_streams.values():
+        diagnostic = dict(diagnostic)
+        diagnostic.pop("hit_ids", None)
+        diagnostic["canonical_labels"].sort(key=str.casefold)
+        diagnostic["canonical_stream"] = diagnostic["canonical_labels"][0]
+        diagnostics.append(diagnostic)
+    diagnostics.sort(key=lambda row: (row["canonical_stream"], row["raw_stream"]))
     return result, diagnostics
+
+
+def durable_lifecycle_by_vacancy(
+    conn: sqlite3.Connection,
+) -> dict[int, dict[str, Any]]:
+    events: dict[int, list[sqlite3.Row]] = defaultdict(list)
+    for row in conn.execute(
+        """
+        SELECT id, vacancy_id, event_type, event_at, round_no,
+               history_complete, evidence_note
+        FROM lifecycle_events ORDER BY event_at, id
+        """
+    ).fetchall():
+        events[int(row["vacancy_id"])].append(row)
+    result: dict[int, dict[str, Any]] = {}
+    for vacancy_id, items in events.items():
+        types = {str(item["event_type"]) for item in items}
+        if "rejected" in types:
+            state = "rejected"
+        elif "offer_received" in types:
+            state = "offer"
+        else:
+            completed_rounds = [
+                int(item["round_no"] or 0)
+                for item in items
+                if item["event_type"] == "interview_completed"
+            ]
+            if completed_rounds:
+                state = f"interview_{min(max(completed_rounds), 3)}"
+            elif "application_confirmed" in types:
+                state = "applied"
+            else:
+                state = "seen"
+        result[vacancy_id] = {
+            "state": state,
+            "known": True,
+            "events": len(items),
+            "history_complete": all(bool(item["history_complete"]) for item in items),
+        }
+    return result
+
+
+def latest_actions_by_vacancy(
+    conn: sqlite3.Connection,
+) -> dict[int, dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT current.*
+        FROM action_events current
+        WHERE current.id = (
+            SELECT candidate.id FROM action_events candidate
+            WHERE candidate.vacancy_id = current.vacancy_id
+            ORDER BY candidate.event_at DESC, candidate.id DESC LIMIT 1
+        )
+        """
+    ).fetchall()
+    return {int(row["vacancy_id"]): dict(row) for row in rows}
+
+
+def materialize_wip_queue(
+    conn: sqlite3.Connection,
+    *,
+    as_of: dt.date,
+    bucket_filter: str = "",
+) -> dict[str, Any]:
+    """Build the actionable queue once; pagination only slices this result."""
+
+    if bucket_filter and bucket_filter not in WIP_BUCKET_KEYS:
+        raise ValueError("Неподдерживаемый фильтр группы незавершённой работы.")
+    bucket_config = {bucket.key: bucket for bucket in WIP_BUCKETS}
+    bucket_order = {bucket.key: index for index, bucket in enumerate(WIP_BUCKETS)}
+    latest = latest_actions_by_vacancy(conn)
+    vacancies = {
+        int(row["id"]): row
+        for row in conn.execute(
+            """
+            SELECT id, channel, company, title, url, score, first_seen_date,
+                   last_seen_date, updated_at
+            FROM vacancies
+            """
+        ).fetchall()
+    }
+    lifecycle = durable_lifecycle_by_vacancy(conn)
+    items: list[dict[str, Any]] = []
+    for vacancy_id, action in latest.items():
+        vacancy = vacancies.get(vacancy_id)
+        if vacancy is None:
+            continue
+        action_state = clean_cell(action.get("action_state")).lower()
+        if action_state == "none":
+            continue
+        bucket_key = clean_cell(action.get("bucket")) or "backlog"
+        if bucket_filter and bucket_key != bucket_filter:
+            continue
+        bucket = bucket_config[bucket_key]
+        if not bucket.active:
+            continue
+        state = lifecycle.get(vacancy_id, {}).get("state", "seen")
+        if state in {"rejected", "offer"}:
+            continue
+        try:
+            action_at = parse_iso_datetime(action["event_at"], label="event_at")
+        except ValueError:
+            action_at = dt.datetime.combine(as_of, dt.time())
+        age_days = max((as_of - action_at.date()).days, 0)
+        explicit_due = clean_cell(action.get("due_date"))
+        if explicit_due:
+            try:
+                due = parse_iso_date(explicit_due, label="due_date")
+            except ValueError:
+                due = action_at.date() + dt.timedelta(days=bucket.sla_days)
+        else:
+            due = action_at.date() + dt.timedelta(days=bucket.sla_days)
+        overdue_days = max((as_of - due).days, 0)
+        items.append(
+            {
+                "vacancy_id": vacancy_id,
+                "action_event_id": int(action["id"]),
+                "action_state": action_state,
+                "bucket": bucket_key,
+                "bucket_label": bucket.label,
+                "company": vacancy["company"] or "",
+                "title": vacancy["title"] or "",
+                "url": vacancy["url"] or "",
+                "channel": vacancy["channel"] or "",
+                "score": vacancy["score"],
+                "priority": int(action.get("priority") or 0),
+                "priority_reason": action.get("reason") or "",
+                "action_at": action_at.isoformat(),
+                "age_days": age_days,
+                "due_date": due.isoformat(),
+                "overdue": as_of > due,
+                "overdue_days": overdue_days,
+                "sla_days": bucket.sla_days,
+                "terminal_lifecycle": False,
+                "active_bucket": bucket.active,
+            }
+        )
+
+    items.sort(
+        key=lambda item: (
+            bucket_order[item["bucket"]],
+            0 if item["overdue"] else 1,
+            -item["overdue_days"],
+            -item["priority"],
+            item["due_date"],
+            item["action_at"],
+            item["vacancy_id"],
+        )
+    )
+    per_bucket: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for item in items:
+        per_bucket[item["bucket"]].append(item)
+    bucket_summaries: list[dict[str, Any]] = []
+    for bucket in WIP_BUCKETS:
+        bucket_items = per_bucket.get(bucket.key, [])
+        for index, item in enumerate(bucket_items, start=1):
+            item["bucket_rank"] = index
+            item["in_active_wip"] = bool(
+                bucket.active and bucket.limit > 0 and index <= bucket.limit
+            )
+            item["wip_overflow"] = bool(
+                bucket.active and (bucket.limit == 0 or index > bucket.limit)
+            )
+        bucket_summaries.append(
+            {
+                "bucket": bucket.key,
+                "label": bucket.label,
+                "total": len(bucket_items),
+                "limit": bucket.limit,
+                "active": min(len(bucket_items), bucket.limit) if bucket.active else 0,
+                "overflow": max(len(bucket_items) - bucket.limit, 0)
+                if bucket.active
+                else 0,
+                "overdue": sum(bool(item["overdue"]) for item in bucket_items),
+                "sla_days": bucket.sla_days,
+                "is_active_bucket": bucket.active,
+            }
+        )
+
+    return {
+        "as_of": as_of.isoformat(),
+        "items": items,
+        "buckets": bucket_summaries,
+        "overflow_total": sum(item["overflow"] for item in bucket_summaries),
+        "overdue_total": sum(item["overdue"] for item in bucket_summaries),
+        "active_wip_total": sum(item["active"] for item in bucket_summaries),
+        "ordering": [
+            "bucket_order",
+            "overdue_first",
+            "overdue_days_desc",
+            "priority_desc",
+            "due_date",
+            "action_at",
+            "vacancy_id",
+        ],
+    }
+
+
+def paginate_wip_queue(
+    materialized: dict[str, Any],
+    *,
+    page: int,
+    page_size: int,
+) -> dict[str, Any]:
+    if page < 1:
+        raise ValueError("Номер страницы должен быть не меньше 1.")
+    if page_size < 1 or page_size > 500:
+        raise ValueError("Размер страницы должен быть от 1 до 500.")
+    all_items = materialized["items"]
+    total = len(all_items)
+    pages = max((total + page_size - 1) // page_size, 1)
+    offset = (page - 1) * page_size
+    result = dict(materialized)
+    result["items"] = all_items[offset : offset + page_size] if page <= pages else []
+    result["pagination"] = {
+        "page": page,
+        "page_size": page_size,
+        "total_items": total,
+        "total_pages": pages,
+        "has_previous": page > 1,
+        "has_next": page < pages,
+    }
+    return result
+
+
+def build_wip_queue_data(
+    conn: sqlite3.Connection,
+    *,
+    as_of: dt.date,
+    page: int = 1,
+    page_size: int | None = None,
+    bucket_filter: str = "",
+) -> dict[str, Any]:
+    page_size = page_size or WIP_PAGE_SIZE
+    materialized = materialize_wip_queue(
+        conn,
+        as_of=as_of,
+        bucket_filter=bucket_filter,
+    )
+    return paginate_wip_queue(materialized, page=page, page_size=page_size)
 
 
 def build_snapshot(
@@ -2457,8 +5616,24 @@ def build_snapshot(
             """
         ).fetchall()
     )
+    lifecycle_states = durable_lifecycle_by_vacancy(conn)
+    current_actions = latest_actions_by_vacancy(conn)
     for vacancy in vacancies:
-        vacancy["latest_stage"] = canonical_stage(vacancy.get("latest_stage"))
+        vacancy_id = int(vacancy["id"])
+        legacy_stage = canonical_stage(vacancy.get("latest_stage"))
+        lifecycle = lifecycle_states.get(vacancy_id)
+        vacancy["legacy_stage"] = legacy_stage
+        vacancy["durable_lifecycle_known"] = bool(lifecycle)
+        vacancy["durable_lifecycle_state"] = (
+            lifecycle["state"] if lifecycle else "seen"
+        )
+        vacancy["latest_stage"] = vacancy["durable_lifecycle_state"]
+        action = current_actions.get(vacancy_id, {})
+        vacancy["current_action_state"] = action.get("action_state") or "none"
+        vacancy["action_bucket"] = action.get("bucket") or "backlog"
+        vacancy["action_due_date"] = action.get("due_date") or ""
+        vacancy["action_priority"] = int(action.get("priority") or 0)
+        vacancy["action_reason"] = action.get("reason") or ""
 
     interview_summaries = rows_to_dicts(
         conn.execute(
@@ -2575,17 +5750,11 @@ def build_snapshot(
         for row in conn.execute(
             """
             SELECT DISTINCT vacancy_id
-            FROM applications
-            WHERE stage IN ('applied', 'follow_up', 'interview_1', 'interview_2', 'interview_3', 'offer', 'rejected')
-              AND LOWER(COALESCE(status, '')) NOT LIKE '%не отправлен%'
+            FROM lifecycle_events
+            WHERE event_type = 'application_confirmed'
             """
         ).fetchall()
     }
-    applied_ids.update(
-        int(v["id"])
-        for v in vacancies
-        if v["latest_stage"] in {"applied", "follow_up", "interview_1", "interview_2", "interview_3", "offer"}
-    )
 
     funnel_by_channel: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     for vacancy in vacancies:
@@ -2598,8 +5767,8 @@ def build_snapshot(
             funnel_by_channel[channel][stage] += 1
 
     def review_candidate(vacancy: dict[str, Any]) -> bool:
-        stage = vacancy.get("latest_stage") or "seen"
-        if stage in ACTIVE_REVIEW_STAGES:
+        action_state = vacancy.get("current_action_state") or "none"
+        if action_state in {"needs_input", "follow_up", "employer_reply", "review"}:
             return True
         status_text = " ".join(
             str(vacancy.get(field) or "").lower()
@@ -2624,7 +5793,11 @@ def build_snapshot(
         v
         for v in vacancies
         if review_candidate(v)
-        and (v["score"] is None or int(v["score"]) >= 65 or v["latest_stage"] in ACTIVE_REVIEW_STAGES)
+        and (
+            v["score"] is None
+            or int(v["score"]) >= 65
+            or v["current_action_state"] in {"needs_input", "follow_up", "employer_reply"}
+        )
     ]
     active_review.sort(
         key=lambda v: (
@@ -2642,11 +5815,20 @@ def build_snapshot(
             """
             SELECT v.id, v.channel, v.company, v.title, v.url, v.score, a.status,
                    a.follow_up_date, a.why_applied, a.risks
-            FROM applications a
+            FROM effective_applications a
             JOIN vacancies v ON v.id = a.vacancy_id
             WHERE COALESCE(a.follow_up_date, '') NOT IN ('', '-', '—')
               AND LOWER(a.status) NOT LIKE '%reject%'
-              AND COALESCE(v.latest_stage, '') != 'rejected'
+              AND EXISTS (
+                  SELECT 1 FROM lifecycle_events le
+                  WHERE le.vacancy_id = v.id
+                    AND le.event_type = 'application_confirmed'
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM lifecycle_events le
+                  WHERE le.vacancy_id = v.id
+                    AND le.event_type = 'rejected'
+              )
             ORDER BY a.follow_up_date ASC, v.company ASC
             """
         ).fetchall()
@@ -2697,15 +5879,28 @@ def build_snapshot(
     needs_input = [
         v
         for v in vacancies
-        if v["latest_stage"] == "needs_input"
+        if v["current_action_state"] == "needs_input"
     ]
     needs_action = [
         v
         for v in vacancies
-        if v["latest_stage"] in {"needs_input", "follow_up"}
+        if v["current_action_state"] in {
+            "needs_input",
+            "follow_up",
+            "employer_reply",
+            "review",
+            "account_research",
+        }
     ]
 
+    outcome_scorecard, _ = build_outcome_scorecard_data(conn, dt.date.today())
     conversion_report, _ = build_conversion_report_data(conn, dt.date.today())
+    wip_materialized = materialize_wip_queue(
+        conn, as_of=dt.date.today()
+    )
+    wip_queue = paginate_wip_queue(
+        wip_materialized, page=1, page_size=WIP_PAGE_SIZE
+    )
     source_quality, source_stream_diagnostics = build_source_quality_data(
         conn, conversion_report
     )
@@ -2742,25 +5937,60 @@ def build_snapshot(
         conn.execute(
             """
             SELECT a.*,
-                   COUNT(l.vacancy_id) AS linked_vacancies,
-                   SUM(CASE WHEN l.vacancy_id IS NOT NULL
-                                  AND COALESCE(v.latest_stage, 'seen') != 'rejected'
-                            THEN 1 ELSE 0 END) AS active_target_vacancies
+                   COUNT(l.vacancy_id) AS linked_vacancies
             FROM employer_accounts a
             LEFT JOIN vacancy_employer_accounts l ON l.account_id = a.id
-            LEFT JOIN vacancies v ON v.id = l.vacancy_id
             GROUP BY a.id
             ORDER BY COALESCE(a.priority, ''), a.canonical_name
             """
         ).fetchall()
     )
+    linked_vacancies_by_account: dict[int, list[int]] = defaultdict(list)
+    for link in conn.execute(
+        "SELECT account_id, vacancy_id FROM vacancy_employer_accounts"
+    ).fetchall():
+        linked_vacancies_by_account[int(link["account_id"])].append(
+            int(link["vacancy_id"])
+        )
     for account in employer_accounts:
         signals = signals_by_account.get(int(account["id"]), [])
         account["latest_signal"] = signals[0] if signals else None
         account["signals"] = signals
+        account["active_target_vacancies"] = sum(
+            lifecycle_states.get(vacancy_id, {}).get("state", "seen") != "rejected"
+            for vacancy_id in linked_vacancies_by_account.get(int(account["id"]), [])
+        )
+        for json_field, output_field in (
+            ("target_campaigns_json", "target_campaigns"),
+            ("target_role_families_json", "target_role_families"),
+        ):
+            try:
+                account[output_field] = json.loads(account.get(json_field) or "[]")
+            except json.JSONDecodeError:
+                account[output_field] = []
+        limit = int(account.get("portfolio_limit") or ACCOUNT_ACTIVE_PORTFOLIO_LIMIT)
+        account["portfolio_limit_effective"] = limit
+        account["portfolio_overflow"] = max(
+            int(account.get("active_target_vacancies") or 0) - limit, 0
+        )
+        account["review_overdue"] = bool(
+            account.get("next_review_date")
+            and account["next_review_date"] < dt.date.today().isoformat()
+        )
 
     issue_count = conn.execute("SELECT COUNT(*) AS n FROM import_issues").fetchone()["n"]
+    quarantine_count = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM quarantine_records WHERE status = 'pending'"
+        ).fetchone()[0]
+    )
     conversion_overall = conversion_report["overall"]
+    outcome_overall = outcome_scorecard["overall"]
+    current_interview_stage_count = sum(
+        1
+        for vacancy in vacancies
+        if vacancy["latest_stage"] in {"interview_1", "interview_2", "interview_3"}
+    )
 
     return {
         "generated_at": now_iso(),
@@ -2781,6 +6011,7 @@ def build_snapshot(
                 "matured_applications_14d"
             ],
             "human_replies": conversion_overall["human_replies"],
+            "screening_requests": conversion_overall["screening_requests"],
             "human_reply_rate_14d": conversion_overall["human_reply_rate_14d"],
             "interview_1_rate_30d": conversion_overall[
                 "interview_1_rate_30d"
@@ -2794,10 +6025,40 @@ def build_snapshot(
                 int(account.get("active_target_vacancies") or 0)
                 for account in employer_accounts
             ),
-            "interviews": sum(1 for v in vacancies if v["latest_stage"] in {"interview_1", "interview_2", "interview_3"}),
-            "offers": stage_counts["offer"],
-            "rejected": stage_counts["rejected"],
+            "active_account_portfolio": sum(
+                1
+                for account in employer_accounts
+                if clean_cell(account.get("status")).lower() in {"target", "active"}
+            ),
+            "account_portfolio_limit": ACCOUNT_ACTIVE_PORTFOLIO_LIMIT,
+            "account_portfolio_overflow": max(
+                sum(
+                    1
+                    for account in employer_accounts
+                    if clean_cell(account.get("status")).lower() in {"target", "active"}
+                )
+                - ACCOUNT_ACTIVE_PORTFOLIO_LIMIT,
+                0,
+            ),
+            "interviews": outcome_overall["completed_first_interviews"],
+            "interview_invitations": outcome_overall["interview_invitations"],
+            "scheduled_interviews": outcome_overall["scheduled_interviews"],
+            "completed_first_interviews": outcome_overall[
+                "completed_first_interviews"
+            ],
+            "later_interview_rounds": outcome_overall["later_interview_rounds"],
+            "interview_current_stage": current_interview_stage_count,
+            "offers": outcome_overall["offers"],
+            "rejected": sum(
+                1
+                for state in lifecycle_states.values()
+                if state["state"] == "rejected"
+            ),
             "import_issues": issue_count,
+            "quarantine_pending": quarantine_count,
+            "wip_active": wip_queue["active_wip_total"],
+            "wip_overflow": wip_queue["overflow_total"],
+            "sla_overdue": wip_queue["overdue_total"],
         },
         "channels": dict(channel_counts),
         "stages": dict(stage_counts),
@@ -2812,6 +6073,9 @@ def build_snapshot(
         "source_quality": source_quality,
         "source_stream_diagnostics": source_stream_diagnostics,
         "conversion_report": conversion_report,
+        "outcome_scorecard": outcome_scorecard,
+        "wip_queue": wip_queue,
+        "_wip_materialized": wip_materialized,
         "employer_accounts": employer_accounts,
         "account_signals": account_signals,
         "vacancy_factors": vacancy_factors,
@@ -2824,9 +6088,12 @@ def build_snapshot(
 def md_escape(value: Any) -> str:
     text = "" if value is None else str(value)
     return (
-        text.replace("&", "&amp;")
+        text.replace("\\", "\\\\")
+        .replace("&", "&amp;")
         .replace("<", "&lt;")
         .replace(">", "&gt;")
+        .replace("[", "\\[")
+        .replace("]", "\\]")
         .replace("|", "\\|")
         .replace("\n", " ")
         .strip()
@@ -2844,7 +6111,7 @@ def safe_external_url(value: str) -> str:
 
 
 def md_link(title: str, url: str) -> str:
-    title = md_escape(title or "link")
+    title = md_escape(title or "ссылка")
     safe_url = safe_external_url(url)
     if safe_url:
         return f"[{title}]({safe_url})"
@@ -2862,6 +6129,182 @@ def write_markdown_table(path: Path, title: str, headers: list[str], rows: list[
         lines.append("| " + " | ".join(md_escape(cell) for cell in row) + " |")
     lines.append("")
     path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def scorecard_rate_label(metric: dict[str, Any]) -> str:
+    if not metric.get("available") or metric.get("numerator") is None:
+        return "n/a"
+    percent_value = metric.get("percent")
+    suffix = "n/a" if percent_value is None else f"{float(percent_value):.1f}%"
+    return f"{metric['numerator']}/{metric['denominator']} ({suffix})"
+
+
+def report_group_value(grouping: str, value: Any) -> Any:
+    """Translate controlled presentation values without changing JSON identifiers."""
+
+    if value == "unknown":
+        return "неизвестно"
+    if grouping == "source_channel":
+        return CHANNEL_LABELS.get(str(value), value)
+    return value
+
+
+def render_outcome_scorecard_markdown(scorecard: dict[str, Any]) -> str:
+    overall = scorecard["overall"]
+    lines = [
+        "# Карта исходов поиска работы",
+        "",
+        f"Состояние на {md_escape(scorecard['as_of'])}.",
+        "",
+    ]
+    if scorecard.get("small_sample_warning"):
+        lines.extend(
+            [
+                f"> Предупреждение: {md_escape(scorecard['small_sample_warning'])}",
+                "",
+            ]
+        )
+    lines.extend(
+        [
+            "## Общие результаты",
+            "",
+            "| Показатель | Значение |",
+            "|---|---|",
+            f"| Уникальные подтверждённые отклики | {overall['confirmed_applications']} |",
+            f"| Созревшие к оценке ответа человека (14 дней) | {overall['matured_for_human_reply_14d']} |",
+            "| Ответы людей | "
+            + (
+                str(overall["recorded_inbound_human_replies"])
+                if overall["recorded_inbound_human_replies"] is not None
+                else "n/a"
+            )
+            + " |",
+            "| Запросы на скрининг | "
+            + (
+                str(overall["screening_requests"])
+                if overall["screening_requests"] is not None
+                else "n/a"
+            )
+            + " |",
+            f"| Доля ответов людей | {scorecard_rate_label(overall['human_reply_rate_14d'])} |",
+            f"| Созревшие к оценке интервью (30 дней) | {overall['matured_for_interview_outcomes_30d']} |",
+            "| Приглашения на интервью | "
+            + (str(overall["interview_invitations"]) if overall["interview_invitations"] is not None else "n/a")
+            + " |",
+            "| Назначенные интервью | "
+            + (str(overall["scheduled_interviews"]) if overall["scheduled_interviews"] is not None else "n/a")
+            + " |",
+            "| Завершённые первые интервью | "
+            + (str(overall["completed_first_interviews"]) if overall["completed_first_interviews"] is not None else "n/a")
+            + " |",
+            f"| Доля завершённых первых интервью | {scorecard_rate_label(overall['completed_first_interview_rate_30d'])} |",
+            "| Более поздние раунды интервью | "
+            + (str(overall["later_interview_rounds"]) if overall["later_interview_rounds"] is not None else "n/a")
+            + " |",
+            "| Предложения | "
+            + (str(overall["offers"]) if overall["offers"] is not None else "n/a")
+            + " |",
+            f"| Покрытие поиска контактов | {scorecard_rate_label(overall['contact_search_coverage'])} |",
+            f"| Покрытие проверенного пути к человеку | {scorecard_rate_label(overall['verified_human_path_coverage'])} |",
+            f"| Полнота полей | {scorecard_rate_label(overall['field_completeness'])} |",
+            "",
+        ]
+    )
+    grouping_labels = {
+        "campaign_id": "Кампания",
+        "role_family": "Семейство ролей",
+        "source_stream": "Поток источника",
+        "source_channel": "Канал источника",
+        "employer_account": "Аккаунт работодателя",
+        "actual_resume_version": "Фактически отправленное резюме",
+        "message_variant": "Вариант сообщения",
+        "application_month": "Месяц отклика",
+    }
+    for grouping, title in grouping_labels.items():
+        rows = scorecard["breakdowns"].get(grouping, [])
+        if not rows:
+            continue
+        lines.extend(
+            [
+                f"## {title}",
+                "",
+                "| Значение | Отклики | Ответы за 14 дней | Завершённые первые интервью за 30 дней | Предложения | Поиск контактов | Путь к человеку | Полнота полей |",
+                "|---|---|---|---|---|---|---|---|",
+            ]
+        )
+        for row in rows:
+            grouping_value = report_group_value(grouping, row[grouping])
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        md_escape(grouping_value),
+                        str(row["confirmed_applications"]),
+                        scorecard_rate_label(row["human_reply_rate_14d"]),
+                        scorecard_rate_label(row["completed_first_interview_rate_30d"]),
+                        str(row["offers"]) if row["offers"] is not None else "n/a",
+                        scorecard_rate_label(row["contact_search_coverage"]),
+                        scorecard_rate_label(row["verified_human_path_coverage"]),
+                        scorecard_rate_label(row["field_completeness"]),
+                    ]
+                )
+                + " |"
+            )
+        lines.append("")
+    lines.extend(["## Методика и ограничения", ""])
+    lines.extend(f"- {md_escape(item)}" for item in scorecard["caveats"])
+    lines.append("")
+    return "\n".join(lines)
+
+
+def render_false_negative_markdown(report: dict[str, Any]) -> str:
+    lines = [
+        "# Аудит пропущенных возможностей",
+        "",
+        f"Активная политика: `{md_escape(report['policy_version'])}` от {md_escape(report['policy_effective_date'])}.",
+        f"Детерминированная выборка: {report['sample_size']} из {report['population_size']}; ключ воспроизводимости: `{md_escape(report['seed'])}`.",
+        "",
+        "## Частота срабатывания правил",
+        "",
+        "| Правило | Срабатывания | Доля выборки | Требует проверки |",
+        "|---|---|---|---|",
+    ]
+    for rule in report["rule_counts"]:
+        denominator = int(rule["sample_size"])
+        rate = f"{rule['count']}/{denominator}"
+        lines.append(
+            f"| {md_escape(rule['rule_key'])} | {rule['count']} | {rate} | "
+            f"{'да' if rule['requires_review'] else 'нет'} |"
+        )
+    if not report["rule_counts"]:
+        lines.append("| n/a | n/a | n/a | нет данных |")
+    lines.extend(
+        [
+            "",
+            "## Выборка",
+            "",
+            "| ID | Решение | Балл | Работодатель | Вакансия | Сработавшие правила | Более позднее положительное доказательство |",
+            "|---|---|---|---|---|---|---|",
+        ]
+    )
+    for item in report["sample"]:
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    str(item["vacancy_id"]),
+                    md_escape(item["decision"]),
+                    str(item["score"] if item["score"] is not None else "n/a"),
+                    md_escape(item["company"]),
+                    md_escape(item["title"]),
+                    md_escape(", ".join(item["matched_rules"])),
+                    "да" if item["later_positive_evidence"] else "нет",
+                ]
+            )
+            + " |"
+        )
+    lines.extend(["", f"Методика: {md_escape(report['methodology'])}", ""])
+    return "\n".join(lines)
 
 
 def generate_views(
@@ -2888,10 +6331,10 @@ def generate_views(
         )
     write_markdown_table(
         VIEWS_DIR / "review_active.md",
-        "Active Review Inbox",
-        ["id", "date", "channel", "score", "stage", "company", "vacancy", "why", "questions/action"],
+        "Активная очередь проверки",
+        ["ID", "дата", "канал", "балл", "жизненный цикл", "работодатель", "вакансия", "обоснование", "вопросы или действие"],
         active_rows,
-        f"Generated: {snapshot['generated_at']}. Sorted by score and recency.",
+        f"Сформировано: {snapshot['generated_at']}. Сортировка по баллу и свежести.",
     )
 
     today = dt.date.today().isoformat()
@@ -2914,10 +6357,10 @@ def generate_views(
         )
     write_markdown_table(
         VIEWS_DIR / "today.md",
-        f"Today View ({report_date})",
-        ["date", "channel", "score", "stage", "company", "vacancy", "note"],
+        f"Свежие вакансии ({report_date})",
+        ["дата", "канал", "балл", "жизненный цикл", "работодатель", "вакансия", "примечание"],
         today_rows,
-        "Freshest imported date from the current data set.",
+        "Самая свежая дата импорта в текущем наборе данных.",
     )
 
     funnel_rows = []
@@ -2927,10 +6370,10 @@ def generate_views(
         funnel_rows.append(row)
     write_markdown_table(
         VIEWS_DIR / "funnel.md",
-        "Funnel By Channel",
-        ["channel"] + [STAGE_LABELS[s] for s in FUNNEL_STAGES],
+        "Воронка по каналам",
+        ["канал"] + [STAGE_LABELS[s] for s in FUNNEL_STAGES],
         funnel_rows,
-        f"Generated: {snapshot['generated_at']}. Seen is total unique vacancies per channel; later columns use the current compact stage.",
+        f"Сформировано: {snapshot['generated_at']}. Первый столбец — все уникальные вакансии канала; остальные столбцы отражают доказанный жизненный цикл.",
     )
 
     followup_rows = []
@@ -2950,7 +6393,10 @@ def generate_views(
                     part
                     for part in (
                         item.get("contact_search_date") or "",
-                        item.get("contact_search_status") or "",
+                        CONTACT_SEARCH_STATUS_LABELS.get(
+                            item.get("contact_search_status") or "",
+                            item.get("contact_search_status") or "",
+                        ),
                         item.get("contact_search_note") or "",
                     )
                     if part
@@ -2960,22 +6406,22 @@ def generate_views(
         )
     write_markdown_table(
         VIEWS_DIR / "followups.md",
-        "Follow-ups",
+        "Повторные обращения",
         [
-            "follow_up_date",
-            "source_channel",
-            "score",
-            "company",
-            "vacancy",
-            "status",
-            "direct_contact",
-            "direct_channels",
-            "last_outreach",
-            "contact_search",
-            "note",
+            "дата",
+            "канал источника",
+            "балл",
+            "работодатель",
+            "вакансия",
+            "состояние",
+            "прямой контакт",
+            "каналы контакта",
+            "последнее обращение",
+            "поиск контакта",
+            "примечание",
         ],
         followup_rows,
-        "Due follow-ups with verified direct-contact research and multi-channel outreach history.",
+        "Наступившие сроки повторных обращений с проверкой прямых контактов и историей каналов.",
     )
 
     contact_rows = []
@@ -2984,7 +6430,7 @@ def generate_views(
         profile_url = contact.get("profile_url") or ""
         evidence = contact.get("evidence_note") or ""
         if contact.get("evidence_url"):
-            evidence = md_link(evidence or "source", contact["evidence_url"])
+            evidence = md_link(evidence or "источник", contact["evidence_url"])
         contact_rows.append(
             [
                 contact.get("vacancy_id") or "",
@@ -2992,34 +6438,40 @@ def generate_views(
                 md_link(contact.get("title") or "", contact.get("url") or ""),
                 contact.get("person_name") or "",
                 contact.get("person_role") or "",
-                contact.get("relationship") or "",
-                contact.get("confidence") or "",
+                CONTACT_RELATIONSHIP_LABELS.get(
+                    contact.get("relationship") or "",
+                    contact.get("relationship") or "",
+                ),
+                CONTACT_CONFIDENCE_LABELS.get(
+                    contact.get("confidence") or "",
+                    contact.get("confidence") or "",
+                ),
                 contact.get("channel") or "",
                 md_link(address, profile_url) if profile_url else address,
                 contact.get("verified_date") or "",
-                "active" if int(contact.get("is_active") or 0) else "inactive",
+                "активен" if int(contact.get("is_active") or 0) else "неактивен",
                 evidence,
             ]
         )
     write_markdown_table(
         VIEWS_DIR / "outreach_contacts.md",
-        "Employer Outreach Contacts",
+        "Контакты работодателей",
         [
-            "vacancy_id",
-            "company",
-            "vacancy",
-            "person",
-            "role",
-            "relationship",
-            "confidence",
-            "channel",
-            "contact",
-            "verified_date",
-            "state",
-            "evidence",
+            "ID вакансии",
+            "работодатель",
+            "вакансия",
+            "человек",
+            "должность",
+            "связь с вакансией",
+            "уверенность",
+            "канал",
+            "контакт",
+            "дата проверки",
+            "состояние",
+            "доказательство",
         ],
         contact_rows,
-        "Verified recruiter and hiring-manager contacts. Only confirmed/strong active contacts may be messaged automatically.",
+        "Проверенные контакты рекрутеров и нанимающих руководителей. Наличие контакта не разрешает отправку сообщения.",
     )
 
     def pct_label(value: Any) -> str:
@@ -3034,7 +6486,7 @@ def generate_views(
     for item in snapshot["source_quality"]:
         sources_rows.append(
             [
-                item.get("canonical_source_stream") or "unknown",
+                item.get("canonical_source_stream") or "неизвестно",
                 item.get("seen") or 0,
                 item.get("signals") or 0,
                 pct_label(item.get("signal_rate")),
@@ -3059,114 +6511,115 @@ def generate_views(
         )
     write_markdown_table(
         REPORTS_DIR / "source_quality.md",
-        "Source Quality",
+        "Качество источников",
         [
-            "canonical_source_stream",
-            "seen",
-            "signals",
-            "signal_rate",
-            "applied",
-            "matured_reply_14d",
-            "human_replies",
-            "human_reply_rate",
-            "matured_interview_30d",
-            "interview_1",
-            "interview_rate",
+            "канонический поток",
+            "увидено",
+            "сигналы",
+            "доля сигналов",
+            "отклики",
+            "созрело для ответа, 14 дней",
+            "ответы людей",
+            "доля ответов",
+            "созрело для интервью, 30 дней",
+            "первые интервью завершены",
+            "доля интервью",
         ],
         sources_rows,
         (
-            "Seen/signals use unique vacancy-stream pairs. Downstream outcomes use "
-            "first-touch canonical stream attribution at vacancy-level. Signal means "
-            "POTENTIAL, NEEDS_REVIEW, SHORTLISTED, or APPLIED. Small samples are shown "
-            "with numerator and denominator and are not evidence that a stream is best."
+            "Просмотры и сигналы считаются по уникальным парам «вакансия — поток». "
+            "Исходы относятся к первому касанию до отклика, если источник отклика не "
+            "задан явно. Для каждой доли показаны числитель и знаменатель; небольшая "
+            "выборка не доказывает превосходство потока."
         ),
     )
 
     stream_rows = [
         [
-            item.get("raw_stream") or "unknown",
-            item.get("canonical_stream") or "unknown",
-            "mapped" if item.get("mapped") else "unmapped/identity",
+            item.get("raw_stream") or "неизвестно",
+            ", ".join(item.get("canonical_labels") or ["неизвестно"]),
+            "настроенный псевдоним" if item.get("mapped") else "тождественное сопоставление",
             item.get("hits") or 0,
         ]
         for item in snapshot["source_stream_diagnostics"]
     ]
     write_markdown_table(
         REPORTS_DIR / "source_streams.md",
-        "Source Stream Canonicalization",
-        ["raw_source_stream", "canonical_key", "mapping_state", "hits"],
+        "Нормализация потоков источников",
+        ["сырой поток", "канонические метки", "способ сопоставления", "попадания"],
         stream_rows,
         (
-            "Raw values remain stored in source_hits.source_stream. Current local "
-            "source_stream_aliases are applied at report time; unmapped values retain "
-            "their raw key."
+            "Сырые значения без изменений остаются в source_hits.source_stream. "
+            "Текущие локальные псевдонимы применяются при пересборке; произвольные "
+            "символы «плюс» и другие разделители автоматически не разбираются."
         ),
     )
 
     conversion = snapshot["conversion_report"]
     overall = conversion["overall"]
     conversion_lines = [
-        "# Application Conversion Cohorts",
+        "# Когорты исходов откликов",
         "",
-        f"As of: {md_escape(conversion['as_of'])}.",
+        f"Состояние на {md_escape(conversion['as_of'])}.",
         "",
-        "## Methodology",
+        "## Методика",
         "",
     ]
     conversion_lines.extend(f"- {md_escape(item)}" for item in conversion["caveats"])
     conversion_lines.extend(
         [
             "",
-            "## Overall",
+            "## Общий результат",
             "",
-            "| KPI | value |",
+            "| показатель | значение |",
             "|---|---|",
-            f"| applications_unique | {overall['applications_unique']} |",
-            f"| matured_applications_14d | {overall['matured_applications_14d']} |",
-            "| human_replies | "
+            f"| уникальные подтверждённые отклики | {overall['applications_unique']} |",
+            f"| когорты, созревшие для ответа за 14 дней | {overall['matured_applications_14d']} |",
+            "| зафиксированные ответы людей | "
             + (
                 "n/a |"
                 if overall["human_replies"] is None
                 else f"{overall['human_replies']} |"
             ),
-            "| human_reply_rate_14d | "
+            f"| запросы на скрининг | {overall['screening_requests'] if overall['screening_requests'] is not None else 'n/a'} |",
+            "| доля ответов людей за 14 дней | "
             + ratio_label(
                 overall["human_replies"],
                 overall["matured_applications_14d"],
                 overall["human_reply_rate_14d"],
             )
             + " |",
-            f"| matured_applications_30d | {overall['matured_applications_30d']} |",
-            f"| interview_1_ever | {overall['interview_1_ever']} |",
-            "| interview_1_rate_30d | "
+            f"| когорты, созревшие для исхода интервью за 30 дней | {overall['matured_applications_30d']} |",
+            f"| завершённые первые интервью | {overall['interview_1_ever'] if overall['interview_1_ever'] is not None else 'n/a'} |",
+            "| доля завершённых первых интервью за 30 дней | "
             + ratio_label(
                 overall["interview_1_ever"],
                 overall["matured_applications_30d"],
                 overall["interview_1_rate_30d"],
             )
             + " |",
-            "| median_time_to_first_human_reply_days | "
+            "| медианное время до первого ответа человека, дней | "
             + (
                 "n/a"
                 if overall["median_time_to_first_human_reply_days"] is None
                 else str(overall["median_time_to_first_human_reply_days"])
             )
             + " |",
-            "| average_time_to_first_human_reply_days | "
+            "| среднее время до первого ответа человека, дней | "
             + (
                 "n/a"
                 if overall["average_time_to_first_human_reply_days"] is None
                 else str(overall["average_time_to_first_human_reply_days"])
             )
             + " |",
-            "| verified_contact_coverage | "
+            "| покрытие проверенного пути к человеку | "
             + ratio_label(
                 overall["verified_contacts"],
                 overall["applications_unique"],
                 overall["verified_contact_coverage"],
             )
             + " |",
-            "| contact_search_coverage | "
+            "| покрытие поиска контактов | "
             + ratio_label(
                 overall["contact_search_completed"],
                 overall["applications_unique"],
@@ -3177,24 +6630,25 @@ def generate_views(
         ]
     )
     for grouping, title in (
-        ("source_channel", "Source channel"),
-        ("source_stream", "Canonical source stream"),
-        ("application_month", "Application month"),
+        ("source_channel", "Канал источника"),
+        ("source_stream", "Канонический поток источника"),
+        ("application_month", "Месяц отклика"),
     ):
         conversion_lines.extend(
             [
                 f"## {title}",
                 "",
-                "| key | applied | reply 14d | interview 30d | verified contact | contact search |",
+                "| значение | отклики | ответы за 14 дней | интервью за 30 дней | путь к человеку | поиск контактов |",
                 "|---|---|---|---|---|---|",
             ]
         )
         for row in conversion["breakdowns"][grouping]:
+            grouping_value = report_group_value(grouping, row[grouping])
             conversion_lines.append(
                 "| "
                 + " | ".join(
                     [
-                        md_escape(row[grouping]),
+                        md_escape(grouping_value),
                         str(row["applications_unique"]),
                         ratio_label(
                             row["human_replies"],
@@ -3234,8 +6688,14 @@ def generate_views(
                 part
                 for part in (
                     latest.get("observed_date") or "",
-                    latest.get("signal_type") or "",
-                    latest.get("confidence") or "",
+                    EMPLOYER_SIGNAL_TYPE_LABELS.get(
+                        latest.get("signal_type") or "",
+                        latest.get("signal_type") or "",
+                    ),
+                    EVIDENCE_CONFIDENCE_LABELS.get(
+                        latest.get("confidence") or "",
+                        latest.get("confidence") or "",
+                    ),
                     latest.get("evidence_note") or "",
                 )
                 if part
@@ -3245,13 +6705,35 @@ def generate_views(
             [
                 account.get("id") or "",
                 account.get("canonical_name") or "",
-                account.get("priority") or "",
-                account.get("status") or "",
-                md_link("website", account.get("website") or ""),
-                md_link("careers", account.get("careers_url") or ""),
+                ACCOUNT_PRIORITY_LABELS.get(
+                    account.get("priority") or "",
+                    account.get("priority") or "",
+                ),
+                ACCOUNT_STATUS_LABELS.get(
+                    account.get("status") or "",
+                    account.get("status") or "",
+                ),
+                md_link("сайт", account.get("website") or ""),
+                md_link("вакансии", account.get("careers_url") or ""),
                 account.get("country_market") or "",
                 account.get("linked_vacancies") or 0,
                 account.get("active_target_vacancies") or 0,
+                account.get("portfolio_limit_effective") or ACCOUNT_ACTIVE_PORTFOLIO_LIMIT,
+                account.get("portfolio_overflow") or 0,
+                account.get("review_cadence_days") or "",
+                account.get("next_review_date") or "",
+                "да" if account.get("review_overdue") else "нет",
+                account.get("website_checked_date") or "",
+                account.get("careers_checked_date") or "",
+                ", ".join(account.get("target_campaigns") or []),
+                ", ".join(account.get("target_role_families") or []),
+                HUMAN_PATH_LABELS.get(
+                    account.get("human_path_status") or "unknown",
+                    account.get("human_path_status") or "неизвестно",
+                ),
+                account.get("owner_evidence") or "",
+                account.get("sponsor_evidence") or "",
+                account.get("governance_evidence") or "",
                 latest_signal,
                 account.get("last_checked_date") or "",
                 account.get("notes") or "",
@@ -3259,29 +6741,42 @@ def generate_views(
         )
     write_markdown_table(
         VIEWS_DIR / "employer_accounts.md",
-        "Employer Account Radar",
+        "Портфель целевых работодателей",
         [
-            "account_id",
-            "account",
-            "priority",
-            "status",
-            "website",
-            "careers",
-            "market",
-            "linked_vacancies",
-            "active_targets",
-            "latest_evidence_signal",
-            "last_checked",
-            "notes",
+            "ID аккаунта",
+            "работодатель",
+            "приоритет",
+            "состояние",
+            "сайт",
+            "вакансии",
+            "рынок",
+            "связанные вакансии",
+            "активные цели",
+            "лимит портфеля",
+            "сверх лимита",
+            "каденс, дней",
+            "следующая проверка",
+            "проверка просрочена",
+            "сайт проверен",
+            "карьерный сайт проверен",
+            "целевые кампании",
+            "целевые семейства ролей",
+            "путь к человеку",
+            "доказательство владельца",
+            "доказательство спонсора",
+            "доказательство управления",
+            "последний доказательный сигнал",
+            "дата проверки",
+            "примечания",
         ],
         account_rows,
-        "Accounts and evidence-backed employer signals are separate from candidate fit and vacancy score.",
+        "Сигналы работодателя, соответствие вакансии кандидату и разрешение связаться с человеком — независимые понятия. Сигнал не меняет балл вакансии.",
     )
 
     factor_rows = []
     for factor in snapshot["vacancy_factors"]:
         evidence = md_link(
-            factor.get("evidence_note") or "evidence",
+            factor.get("evidence_note") or "доказательство",
             factor.get("evidence_url") or "",
         )
         factor_rows.append(
@@ -3292,43 +6787,59 @@ def generate_views(
                 factor.get("factor_key") or "",
                 factor.get("factor_value") or "",
                 factor.get("observed_date") or "",
-                factor.get("confidence") or "",
+                EVIDENCE_CONFIDENCE_LABELS.get(
+                    factor.get("confidence") or "",
+                    factor.get("confidence") or "",
+                ),
                 evidence,
             ]
         )
     write_markdown_table(
         VIEWS_DIR / "vacancy_factors.md",
-        "Vacancy Evidence Factors",
+        "Доказательные факторы вакансий",
         [
-            "vacancy_id",
-            "company",
-            "vacancy",
-            "factor",
-            "value",
-            "observed_date",
-            "confidence",
-            "evidence",
+            "ID вакансии",
+            "работодатель",
+            "вакансия",
+            "фактор",
+            "значение",
+            "дата наблюдения",
+            "уверенность",
+            "доказательство",
         ],
         factor_rows,
-        "Factors are evidence records only and never change the candidate-relative score automatically.",
+        "Факторы являются только доказательными записями и никогда автоматически не меняют балл соответствия кандидату.",
     )
 
     coverage_rows: list[list[Any]] = []
-    coverage_intro = "No search coverage manifest has been recorded."
+    coverage_intro = "Манифест покрытия поиска ещё не записан."
     with connect_db(db_path) as conn:
-        latest_run = conn.execute(
+        latest_runs = conn.execute(
             """
-            SELECT * FROM search_runs
-            ORDER BY run_date DESC, id DESC
-            LIMIT 1
+            SELECT current.*
+            FROM search_runs current
+            WHERE current.id = (
+                SELECT candidate.id
+                FROM search_runs candidate
+                WHERE candidate.source = current.source
+                ORDER BY candidate.run_date DESC, candidate.id DESC
+                LIMIT 1
+            )
+            ORDER BY current.source COLLATE NOCASE
             """
-        ).fetchone()
-        if latest_run:
-            coverage_intro = (
-                f"Run {latest_run['run_date']} / {latest_run['source']}: "
-                f"{latest_run['status']}; unique={latest_run['total_unique']}, "
-                f"known={latest_run['known_count']}, new={latest_run['new_count']}, "
-                f"issues={latest_run['issue_count']}."
+        ).fetchall()
+        summaries: list[str] = []
+        for latest_run in latest_runs:
+            run_status_label = {
+                "completed": "завершён",
+                "incomplete": "неполный",
+                "blocked": "заблокирован",
+            }.get(latest_run["status"], latest_run["status"])
+            summaries.append(
+                f"{latest_run['run_date']} / {latest_run['source']}: "
+                f"{run_status_label}; уникальные={latest_run['total_unique']}, "
+                f"известные={latest_run['known_count']}, новые={latest_run['new_count']}, "
+                f"проблемы={latest_run['issue_count']}"
             )
             checkpoints = conn.execute(
                 """
@@ -3344,9 +6855,15 @@ def generate_views(
             for item in checkpoints:
                 coverage_rows.append(
                     [
+                        latest_run["run_date"],
+                        latest_run["source"],
                         item["stream_key"],
-                        item["status"],
-                        md_link("query", item["query_url"] or ""),
+                        {
+                            "completed": "завершён",
+                            "incomplete": "неполный",
+                            "blocked": "заблокирован",
+                        }.get(item["status"], item["status"]),
+                        md_link("запрос", item["query_url"] or ""),
                         item["found"],
                         item["page_size"],
                         f"{item['pages_visited']}/{item['pages_expected']}",
@@ -3357,25 +6874,223 @@ def generate_views(
                         item["error"] or item["issues"] or "",
                     ]
                 )
+        if len(summaries) == 1:
+            coverage_intro = "Последний запуск: " + summaries[0] + "."
+        elif summaries:
+            coverage_intro = "Последние запуски по источникам: " + "; ".join(summaries) + "."
     write_markdown_table(
         REPORTS_DIR / "search_coverage.md",
-        "Search Coverage",
+        "Покрытие поиска",
         [
-            "stream",
-            "status",
-            "query",
-            "found",
-            "page_size",
-            "pages",
-            "extracted",
-            "unique",
-            "known",
-            "new",
-            "error/issues",
+            "дата запуска",
+            "источник",
+            "поток",
+            "состояние",
+            "запрос",
+            "найдено",
+            "размер страницы",
+            "страницы",
+            "извлечено",
+            "уникальные",
+            "известные",
+            "новые",
+            "ошибки",
         ],
         coverage_rows,
         coverage_intro,
     )
+
+    checkpoint_rows: list[list[Any]] = []
+    with connect_db(db_path) as conn:
+        checkpoints = conn.execute(
+            """
+            SELECT source, stream_key, cursor_value, cursor_date,
+                   initialized_at, last_completed_run_date,
+                   last_manifest_file, updated_at
+            FROM source_checkpoints
+            ORDER BY source COLLATE NOCASE, stream_key COLLATE NOCASE
+            """
+        ).fetchall()
+        for item in checkpoints:
+            checkpoint_rows.append(
+                [
+                    item["source"],
+                    item["stream_key"],
+                    item["cursor_value"] or "",
+                    item["cursor_date"] or "",
+                    item["initialized_at"],
+                    item["last_completed_run_date"],
+                    item["last_manifest_file"] or "",
+                    item["updated_at"],
+                ]
+            )
+    write_markdown_table(
+        REPORTS_DIR / "source_checkpoints.md",
+        "Контрольные точки инкрементальных источников",
+        [
+            "источник",
+            "поток",
+            "курсор",
+            "дата курсора",
+            "инициализация",
+            "последний завершённый запуск",
+            "манифест",
+            "обновление",
+        ],
+        checkpoint_rows,
+        (
+            "Курсоры продвигаются только после полного манифеста источника. Пустая "
+            "таблица означает, что ни один инкрементальный источник не завершил первый проход."
+        ),
+    )
+
+    scorecard_markdown = render_outcome_scorecard_markdown(
+        snapshot["outcome_scorecard"]
+    )
+    (REPORTS_DIR / "outcome_scorecard.md").write_text(
+        scorecard_markdown, encoding="utf-8"
+    )
+    # Compatibility path: the legacy cohort report now projects the same
+    # evidence-first methodology rather than a mutable application row.
+    (REPORTS_DIR / "conversion_cohorts.md").write_text(
+        scorecard_markdown, encoding="utf-8"
+    )
+
+    materialized_queue = snapshot["_wip_materialized"]
+    if materialized_queue:
+        queue_first = paginate_wip_queue(
+            materialized_queue, page=1, page_size=WIP_PAGE_SIZE
+        )
+        queue_pages = queue_first["pagination"]["total_pages"]
+        for page_number in range(1, queue_pages + 1):
+            page_data = paginate_wip_queue(
+                materialized_queue,
+                page=page_number,
+                page_size=WIP_PAGE_SIZE,
+            )
+            queue_rows = [
+                [
+                    item["vacancy_id"],
+                    item["bucket_label"],
+                    ACTION_STATE_LABELS.get(item["action_state"], item["action_state"]),
+                    item["priority"],
+                    item["age_days"],
+                    item["due_date"],
+                    "да" if item["overdue"] else "нет",
+                    "да" if item["wip_overflow"] else "нет",
+                    item["company"],
+                    md_link(item["title"], item["url"]),
+                    item["priority_reason"],
+                ]
+                for item in page_data["items"]
+            ]
+            intro = (
+                f"Состояние на {page_data['as_of']}. Страница {page_number} из "
+                f"{queue_pages}; всего записей: {page_data['pagination']['total_items']}; "
+                f"активный WIP: {page_data['active_wip_total']}; сверх лимита: "
+                f"{page_data['overflow_total']}; просрочено по SLA: {page_data['overdue_total']}. "
+                "Старые строки не архивируются и не изменяются автоматически."
+            )
+            page_path = (
+                VIEWS_DIR / f"wip_queue_page_{page_number:04d}.md"
+                if queue_pages > 1
+                else VIEWS_DIR / "wip_queue.md"
+            )
+            write_markdown_table(
+                page_path,
+                "Очередь WIP и SLA",
+                [
+                    "ID",
+                    "корзина",
+                    "действие",
+                    "приоритет",
+                    "возраст, дней",
+                    "срок",
+                    "просрочено",
+                    "сверх WIP",
+                    "работодатель",
+                    "вакансия",
+                    "причина приоритета",
+                ],
+                queue_rows,
+                intro,
+            )
+            if page_number == 1 and queue_pages > 1:
+                (VIEWS_DIR / "wip_queue.md").write_text(
+                    page_path.read_text(encoding="utf-8"), encoding="utf-8"
+                )
+
+    with connect_db(db_path) as conn:
+        quarantine_first = quarantine_report_data(
+            conn,
+            page=1,
+            page_size=50,
+            status="",
+            classification="",
+        )
+        quarantine_pages = quarantine_first["pagination"]["total_pages"]
+        for page_number in range(1, quarantine_pages + 1):
+            page_data = (
+                quarantine_first
+                if page_number == 1
+                else quarantine_report_data(
+                    conn,
+                    page=page_number,
+                    page_size=50,
+                    status="",
+                    classification="",
+                )
+            )
+            quarantine_rows = [
+                [
+                    item["id"],
+                    QUARANTINE_LABELS.get(item["classification"], item["classification"]),
+                    QUARANTINE_STATUS_LABELS.get(item["status"], item["status"]),
+                    item["source_name"],
+                    item["source_stream"],
+                    item["origin_file"],
+                    item["line_no"],
+                    item["retry_count"],
+                    item["evidence_note"],
+                ]
+                for item in page_data["items"]
+            ]
+            quarantine_path = REPORTS_DIR / f"quarantine_page_{page_number:04d}.md"
+            write_markdown_table(
+                quarantine_path,
+                "Карантин импорта",
+                [
+                    "ID",
+                    "классификация",
+                    "состояние",
+                    "источник",
+                    "сырой поток",
+                    "файл",
+                    "строка",
+                    "повторы",
+                    "причина",
+                ],
+                quarantine_rows,
+                (
+                    f"Страница {page_number} из {quarantine_pages}; всего записей: "
+                    f"{page_data['pagination']['total_items']}. Записи исключены из "
+                    "показателей вакансий до явной повторной обработки."
+                ),
+            )
+            if page_number == 1:
+                (REPORTS_DIR / "quarantine.md").write_text(
+                    quarantine_path.read_text(encoding="utf-8"), encoding="utf-8"
+                )
+
+        false_negative = build_false_negative_audit_data(
+            conn,
+            as_of=dt.date.today(),
+            sample_size=25,
+            seed="find-dream-job-v6",
+        )
+        (REPORTS_DIR / "false_negative_audit.md").write_text(
+            render_false_negative_markdown(false_negative), encoding="utf-8"
+        )
 
     issue_rows = []
     # `snapshot` only contains the count; load issue details lazily if possible.
@@ -3392,10 +7107,10 @@ def generate_views(
         issue_rows.append([issue["origin_file"], issue["line_no"], issue["issue"], issue["raw_text"][:160]])
     write_markdown_table(
         REPORTS_DIR / "data_quality.md",
-        "Data Quality",
-        ["file", "line", "issue", "raw"],
+        "Качество данных",
+        ["файл", "строка", "проблема", "сырой фрагмент"],
         issue_rows,
-        f"Import issues: {snapshot['kpis']['import_issues']}. Most unrecognized rows are usually notes or non-vacancy tables.",
+        f"Проблем импорта: {snapshot['kpis']['import_issues']}; записей в карантине: {snapshot['kpis']['quarantine_pending']}.",
     )
 
 
@@ -3412,13 +7127,121 @@ def json_for_script(value: Any) -> str:
     )
 
 
+def select_fields(item: dict[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
+    return {field: item.get(field) for field in fields}
+
+
+def compact_dashboard_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Keep the online snapshot operationally useful without embedding full history."""
+
+    vacancy_fields = (
+        "id",
+        "external_id",
+        "channel",
+        "company",
+        "title",
+        "url",
+        "score",
+        "first_seen_date",
+        "last_seen_date",
+        "latest_stage",
+        "latest_status",
+        "reason",
+        "risks",
+        "open_questions",
+        "next_action",
+        "current_action_state",
+        "action_bucket",
+        "action_due_date",
+        "interview_summaries",
+    )
+    all_vacancies = snapshot["vacancies"]
+    by_id = {int(item["id"]): item for item in all_vacancies}
+    selected_ids: list[int] = []
+    seen_ids: set[int] = set()
+
+    def include(value: Any) -> None:
+        try:
+            vacancy_id = int(value)
+        except (TypeError, ValueError):
+            return
+        if vacancy_id in by_id and vacancy_id not in seen_ids:
+            seen_ids.add(vacancy_id)
+            selected_ids.append(vacancy_id)
+
+    for collection, key in (
+        (snapshot["active_review"], "id"),
+        (snapshot["recent"], "id"),
+        (snapshot["followups"], "id"),
+        (snapshot["wip_queue"]["items"], "vacancy_id"),
+    ):
+        for item in collection:
+            include(item.get(key))
+    for item in all_vacancies:
+        if len(selected_ids) >= DASHBOARD_VACANCY_LIMIT:
+            break
+        include(item.get("id"))
+    selected_ids = selected_ids[:DASHBOARD_VACANCY_LIMIT]
+
+    account_fields = (
+        "id",
+        "canonical_name",
+        "website",
+        "careers_url",
+        "priority",
+        "status",
+        "linked_vacancies",
+        "active_target_vacancies",
+        "portfolio_limit_effective",
+        "portfolio_overflow",
+        "human_path_status",
+        "next_review_date",
+        "latest_signal",
+    )
+    payload = {
+        "generated_at": snapshot["generated_at"],
+        "db_path": snapshot["db_path"],
+        "kpis": snapshot["kpis"],
+        "channels": snapshot["channels"],
+        "funnel_by_channel": snapshot["funnel_by_channel"],
+        "active_review": [
+            select_fields(item, vacancy_fields) for item in snapshot["active_review"][:200]
+        ],
+        "recent": [
+            select_fields(item, vacancy_fields) for item in snapshot["recent"][:120]
+        ],
+        "followups": snapshot["followups"][:DASHBOARD_VACANCY_LIMIT],
+        "wip_queue": snapshot["wip_queue"],
+        "employer_accounts": [
+            select_fields(item, account_fields)
+            for item in snapshot["employer_accounts"][:200]
+        ],
+        "conversion_report": {
+            "interaction_history_available": snapshot["conversion_report"][
+                "interaction_history_available"
+            ]
+        },
+        "vacancies": [
+            select_fields(by_id[vacancy_id], vacancy_fields)
+            for vacancy_id in selected_ids
+        ],
+        "vacancy_projection": {
+            "total": len(all_vacancies),
+            "included": len(selected_ids),
+            "truncated": len(selected_ids) < len(all_vacancies),
+            "full_history": "SQLite and paginated CLI read paths",
+        },
+    }
+    return payload
+
+
 def render_dashboard(snapshot: dict[str, Any]) -> str:
-    data_json = json_for_script(snapshot)
+    data_json = json_for_script(compact_dashboard_snapshot(snapshot))
     stage_labels = json_for_script(STAGE_LABELS)
     funnel_stages = json_for_script(FUNNEL_STAGES)
     channel_labels = json_for_script(CHANNEL_LABELS)
     dashboard_title = html.escape(PROJECT_TITLE, quote=True)
-    dashboard_locale = html.escape(PROJECT_LOCALE, quote=True)
+    dashboard_locale = "ru"
     return f"""<!doctype html>
 <html lang="{dashboard_locale}">
 <head>
@@ -3881,53 +7704,63 @@ def render_dashboard(snapshot: dict[str, Any]) -> str:
 <body>
   <header>
     <h1>{dashboard_title}</h1>
-    <div class="sub">Generated <span id="generated"></span> from <span id="dbPath"></span></div>
+    <div class="sub">Сформировано <span id="generated"></span> из <span id="dbPath"></span></div>
   </header>
   <main>
     <div class="kpis" id="kpis"></div>
     <div id="conversionCaveat" class="note" style="margin: -4px 0 14px;"></div>
     <section>
       <div class="panel">
-        <h2>Employer Account Radar</h2>
+        <h2>Портфель целевых работодателей</h2>
         <div id="accountSummary"></div>
       </div>
     </section>
     <div class="tabs">
-      <button data-tab="review" class="active">Review Inbox</button>
-      <button data-tab="funnel">Funnel</button>
-      <button data-tab="today">Freshest</button>
-      <button data-tab="followups">Follow-ups</button>
+      <button data-tab="review" class="active">Проверка</button>
+      <button data-tab="wip">WIP и SLA</button>
+      <button data-tab="funnel">Воронка</button>
+      <button data-tab="today">Свежие</button>
+      <button data-tab="followups">Повторные обращения</button>
     </div>
     <div class="toolbar">
-      <input id="search" placeholder="Search company, role, reason">
+      <input id="search" placeholder="Поиск по работодателю, роли или причине">
       <div class="multi-filter" id="channelPicker">
         <button id="channelTrigger" class="multi-trigger" type="button" aria-expanded="false" aria-controls="channelMenu">
-          <span id="channelSummary" class="multi-trigger-label">All channels</span>
+          <span id="channelSummary" class="multi-trigger-label">Все каналы</span>
           <span class="multi-trigger-mark">v</span>
         </button>
         <div id="channelMenu" class="multi-menu hidden"></div>
       </div>
       <div class="multi-filter" id="stagePicker">
         <button id="stageTrigger" class="multi-trigger" type="button" aria-expanded="false" aria-controls="stageMenu">
-          <span id="stageSummary" class="multi-trigger-label">All stages</span>
+          <span id="stageSummary" class="multi-trigger-label">Все этапы</span>
           <span class="multi-trigger-mark">v</span>
         </button>
         <div id="stageMenu" class="multi-menu hidden"></div>
       </div>
-      <button id="reset">Reset filters</button>
+      <button id="reset">Сбросить фильтры</button>
     </div>
 
     <section id="tab-review">
       <div class="panel">
-        <h2>Active Review Inbox</h2>
-        <div class="note" style="padding: 0 12px 10px;">Open questions, high-score review items, and roles that need user answers or follow-up.</div>
+        <h2>Активная очередь проверки</h2>
+        <div class="note" style="padding: 0 12px 10px;">Открытые вопросы и рабочие действия показаны отдельно от доказанного жизненного цикла вакансии.</div>
         <div id="reviewTable"></div>
+      </div>
+    </section>
+
+    <section id="tab-wip" class="hidden">
+      <div class="panel">
+        <h2>Очередь WIP и SLA</h2>
+        <div class="note" style="padding: 0 12px 10px;">Показана текущая страница. Полная очередь без обрезания разбита на страницы в views/wip_queue_page_*.md.</div>
+        <div id="wipTable"></div>
       </div>
     </section>
 
     <section id="tab-funnel" class="hidden">
       <div class="panel">
-        <h2>Funnel By Channel</h2>
+        <h2>Воронка по каналам</h2>
+        <div id="vacancyProjectionNote" class="note" style="padding: 0 12px 10px;"></div>
         <div id="funnelTable" class="funnel"></div>
         <div id="funnelVisual" class="funnel-visual"></div>
         <div id="funnelVacancies" class="funnel-vacancies"></div>
@@ -3936,14 +7769,14 @@ def render_dashboard(snapshot: dict[str, Any]) -> str:
 
     <section id="tab-today" class="hidden">
       <div class="panel">
-        <h2>Freshest Imported Vacancies</h2>
+        <h2>Свежие импортированные вакансии</h2>
         <div id="recentTable"></div>
       </div>
     </section>
 
     <section id="tab-followups" class="hidden">
       <div class="panel">
-        <h2>Follow-ups</h2>
+        <h2>Повторные обращения</h2>
         <div id="followupTable"></div>
       </div>
     </section>
@@ -3956,6 +7789,36 @@ def render_dashboard(snapshot: dict[str, Any]) -> str:
     const FUNNEL_STAGES = {funnel_stages};
     const CHANNEL_LABELS = {channel_labels};
     const CHANNEL_PALETTE = ['#315f9f', '#2f7d5f', '#a46b12', '#6e5798', '#8b4b5b', '#4f747d', '#7a6a2d', '#53656f'];
+    const ACTION_LABELS = {{
+      review: 'проверка', needs_input: 'нужны данные', employer_reply: 'ответ работодателя',
+      follow_up: 'повторное обращение', account_research: 'исследование работодателя',
+      waiting: 'ожидание', none: 'действий нет'
+    }};
+    const HUMAN_PATH_LABELS = {{
+      unknown: 'неизвестно', not_searched: 'поиск не проводился', researching: 'идёт поиск',
+      verified: 'проверен', not_found: 'не найден', blocked: 'заблокирован'
+    }};
+    const ACCOUNT_PRIORITY_LABELS = {{
+      critical: 'критический', high: 'высокий', medium: 'средний', low: 'низкий'
+    }};
+    const ACCOUNT_STATUS_LABELS = {{
+      target: 'целевой', active: 'активный', watch: 'под наблюдением',
+      paused: 'приостановлен', inactive: 'неактивный', archived: 'архивный'
+    }};
+    const SIGNAL_TYPE_LABELS = {{
+      technology_adoption: 'внедрение технологий', ai_adoption: 'внедрение ИИ',
+      hiring_growth: 'рост найма', restructuring: 'реструктуризация',
+      leadership_change: 'смена руководства', culture: 'культура', other: 'другое'
+    }};
+    const CONFIDENCE_LABELS = {{
+      unknown: 'неизвестна', low: 'низкая', medium: 'средняя', high: 'высокая',
+      confirmed: 'подтверждена'
+    }};
+    const CONTACT_SEARCH_STATUS_LABELS = {{
+      found: 'найден', reused_verified_contact: 'использован проверенный контакт',
+      not_found: 'не найден', ambiguous: 'неоднозначный результат',
+      unreachable: 'недоступен'
+    }};
     const ALL_CHANNELS = Object.keys(DATA.channels).sort();
     const ALL_STAGES = FUNNEL_STAGES.slice();
 
@@ -3972,7 +7835,7 @@ def render_dashboard(snapshot: dict[str, Any]) -> str:
       return text(v).replace(/[&<>"']/g, ch => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}}[ch]));
     }}
     function link(title, url) {{
-      const label = esc(title || 'link');
+      const label = esc(title || 'ссылка');
       const href = text(url).trim();
       const lowerHref = href.toLowerCase();
       return (lowerHref.startsWith('http://') || lowerHref.startsWith('https://'))
@@ -3984,10 +7847,10 @@ def render_dashboard(snapshot: dict[str, Any]) -> str:
       return '../' + safeParts.map(part => encodeURIComponent(part)).join('/');
     }}
     function stageBadge(stage) {{
-      return `<span class="stage ${{esc(stage)}}">${{esc(STAGE_LABELS[stage] || stage || 'unknown')}}</span>`;
+      return `<span class="stage ${{esc(stage)}}">${{esc(STAGE_LABELS[stage] || stage || 'неизвестно')}}</span>`;
     }}
     function interviewStageLabel(summary) {{
-      return STAGE_LABELS[summary.stage] || `Interview ${{summary.interview_no || ''}}`.trim();
+      return STAGE_LABELS[summary.stage] || `Интервью ${{summary.interview_no || ''}}`.trim();
     }}
     function interviewLinks(row) {{
       const summaries = row.interview_summaries || [];
@@ -4003,7 +7866,7 @@ def render_dashboard(snapshot: dict[str, Any]) -> str:
       const links = interviewLinks(row);
       return base || links ? `${{base}}${{links}}` : '';
     }}
-    function channelLabel(channel) {{ return CHANNEL_LABELS[channel] || channel || 'other'; }}
+    function channelLabel(channel) {{ return CHANNEL_LABELS[channel] || channel || 'другой'; }}
     function channelColor(index) {{ return CHANNEL_PALETTE[index % CHANNEL_PALETTE.length]; }}
     function cell(label, content, cls = '') {{
       const classAttr = cls ? ` class="${{esc(cls)}}"` : '';
@@ -4095,66 +7958,78 @@ def render_dashboard(snapshot: dict[str, Any]) -> str:
     function renderKpis() {{
       const percentMetric = value => value === null || value === undefined ? 'n/a' : `${{Number(value).toFixed(1)}}%`;
       const items = [
-        ['Vacancies', DATA.kpis.vacancies],
-        ['Channels', DATA.kpis.channels],
-        ['Open items', DATA.kpis.active_review],
-        ['Needs input', DATA.kpis.needs_user],
-        ['Follow-ups', DATA.kpis.followups],
-        ['Direct contacts', DATA.kpis.direct_contacts],
-        ['Applied', DATA.kpis.applied],
-        ['Matured 14d', DATA.kpis.matured_applications_14d],
-        ['Human replies', DATA.kpis.human_replies === null ? 'n/a' : DATA.kpis.human_replies],
-        ['Human reply rate', percentMetric(DATA.kpis.human_reply_rate_14d)],
-        ['Interview conversion', percentMetric(DATA.kpis.interview_1_rate_30d)],
-        ['Verified contact coverage', percentMetric(DATA.kpis.verified_contact_coverage)],
-        ['Employer accounts', DATA.kpis.employer_accounts],
-        ['Active account targets', DATA.kpis.active_account_targets],
-        ['Rejected', DATA.kpis.rejected],
+        ['Вакансии', DATA.kpis.vacancies],
+        ['Каналы', DATA.kpis.channels],
+        ['Открытые действия', DATA.kpis.active_review],
+        ['Нужны данные', DATA.kpis.needs_user],
+        ['Повторные обращения', DATA.kpis.followups],
+        ['Прямые контакты', DATA.kpis.direct_contacts],
+        ['Подтверждённые отклики', DATA.kpis.applied],
+        ['Созрело за 14 дней', DATA.kpis.matured_applications_14d],
+        ['Ответы людей', DATA.kpis.human_replies === null ? 'n/a' : DATA.kpis.human_replies],
+        ['Запросы на скрининг', DATA.kpis.screening_requests === null ? 'n/a' : DATA.kpis.screening_requests],
+        ['Доля ответов людей', percentMetric(DATA.kpis.human_reply_rate_14d)],
+        ['Завершённые интервью', percentMetric(DATA.kpis.interview_1_rate_30d)],
+        ['Покрытие контактов', percentMetric(DATA.kpis.verified_contact_coverage)],
+        ['Аккаунты работодателей', DATA.kpis.employer_accounts],
+        ['Активные цели аккаунтов', DATA.kpis.active_account_targets],
+        ['Сверх WIP', DATA.kpis.wip_overflow],
+        ['Просрочено по SLA', DATA.kpis.sla_overdue],
+        ['Карантин', DATA.kpis.quarantine_pending],
+        ['Отказы', DATA.kpis.rejected],
       ];
       $('kpis').innerHTML = items.map(([label, value]) => `
         <div class="kpi"><div class="label">${{esc(label)}}</div><div class="value">${{esc(value)}}</div></div>
       `).join('');
       $('conversionCaveat').textContent = DATA.conversion_report.interaction_history_available
-        ? 'Reply metrics use recorded employer interactions only; no replies are inferred from status text.'
-        : 'Historical employer interactions are absent. Human reply counts and rates are n/a, not zero.';
+        ? 'Ответы считаются только по записанным взаимодействиям; текст состояния не используется для догадок.'
+        : 'Структурированная история ответов неполна. Показатели ответов равны n/a, а не нулю.';
     }}
 
     function renderAccountSummary() {{
       const rows = DATA.employer_accounts || [];
-      const headers = ['Account','Priority','Status','Latest evidence signal','Linked','Active targets','Last checked'];
+      const headers = ['Работодатель','Приоритет','Состояние','Последний доказательный сигнал','Связано','Активные цели','Лимит','Сверх лимита','Путь к человеку','Следующая проверка'];
       $('accountSummary').innerHTML = table(headers, rows, account => {{
         const signal = account.latest_signal || {{}};
-        const signalText = [signal.observed_date, signal.signal_type, signal.confidence, signal.evidence_note].filter(Boolean).join(' · ');
+        const signalText = [
+          signal.observed_date,
+          SIGNAL_TYPE_LABELS[signal.signal_type] || signal.signal_type,
+          CONFIDENCE_LABELS[signal.confidence] || signal.confidence,
+          signal.evidence_note,
+        ].filter(Boolean).join(' · ');
         return `<tr>
           ${{cell(headers[0], link(account.canonical_name, account.website || account.careers_url))}}
-          ${{cell(headers[1], esc(account.priority || ''))}}
-          ${{cell(headers[2], esc(account.status || ''))}}
+          ${{cell(headers[1], esc(ACCOUNT_PRIORITY_LABELS[account.priority] || account.priority || ''))}}
+          ${{cell(headers[2], esc(ACCOUNT_STATUS_LABELS[account.status] || account.status || ''))}}
           ${{cell(headers[3], signal.evidence_url ? link(signalText, signal.evidence_url) : esc(signalText), 'detail-cell')}}
           ${{cell(headers[4], esc(account.linked_vacancies || 0))}}
           ${{cell(headers[5], esc(account.active_target_vacancies || 0))}}
-          ${{cell(headers[6], esc(account.last_checked_date || ''))}}
+          ${{cell(headers[6], esc(account.portfolio_limit_effective || ''))}}
+          ${{cell(headers[7], esc(account.portfolio_overflow || 0))}}
+          ${{cell(headers[8], esc(HUMAN_PATH_LABELS[account.human_path_status] || account.human_path_status || 'неизвестно'))}}
+          ${{cell(headers[9], esc(account.next_review_date || ''))}}
         </tr>`;
       }}, {{ limit: 20 }});
     }}
 
     function renderFilters() {{
-      renderMultiMenu('channelMenu', 'channel', ALL_CHANNELS, state.channels, 'All channels', channelLabel);
-      renderMultiMenu('stageMenu', 'stage', ALL_STAGES, state.stages, 'All stages', stage => STAGE_LABELS[stage] || stage);
-      $('channelSummary').textContent = selectedSummary(state.channels, ALL_CHANNELS, 'All channels', 'No channels', 'channels', channelLabel);
-      $('stageSummary').textContent = selectedSummary(state.stages, ALL_STAGES, 'All stages', 'No stages', 'stages', stage => STAGE_LABELS[stage] || stage);
+      renderMultiMenu('channelMenu', 'channel', ALL_CHANNELS, state.channels, 'Все каналы', channelLabel);
+      renderMultiMenu('stageMenu', 'stage', ALL_STAGES, state.stages, 'Все этапы', stage => STAGE_LABELS[stage] || stage);
+      $('channelSummary').textContent = selectedSummary(state.channels, ALL_CHANNELS, 'Все каналы', 'Каналы не выбраны', 'канала', channelLabel);
+      $('stageSummary').textContent = selectedSummary(state.stages, ALL_STAGES, 'Все этапы', 'Этапы не выбраны', 'этапа', stage => STAGE_LABELS[stage] || stage);
     }}
 
     function table(headers, rows, renderRow, options = {{}}) {{
-      if (!rows.length) return '<div class="bars muted">No rows for current filters.</div>';
+      if (!rows.length) return '<div class="bars muted">Для текущих фильтров строк нет.</div>';
       const limit = options.limit || rows.length;
       const visible = rows.slice(0, limit);
-      const more = rows.length > visible.length ? `<span>Showing ${{visible.length}} of ${{rows.length}}. Refine filters to narrow the list.</span>` : '<span></span>';
-      return `<div class="table-meta"><span>${{rows.length}} rows</span>${{more}}</div><div class="table-wrap"><table><thead><tr>${{headers.map(h => `<th>${{esc(h)}}</th>`).join('')}}</tr></thead><tbody>${{visible.map(renderRow).join('')}}</tbody></table></div>`;
+      const more = rows.length > visible.length ? `<span>Показано ${{visible.length}} из ${{rows.length}}. Уточните фильтры.</span>` : '<span></span>';
+      return `<div class="table-meta"><span>Строк: ${{rows.length}}</span>${{more}}</div><div class="table-wrap"><table><thead><tr>${{headers.map(h => `<th>${{esc(h)}}</th>`).join('')}}</tr></thead><tbody>${{visible.map(renderRow).join('')}}</tbody></table></div>`;
     }}
 
     function renderReview() {{
       const rows = filtered(DATA.active_review);
-      const headers = ['ID','Score','Stage','Date','Channel','Company','Vacancy','Why / Questions'];
+      const headers = ['ID','Балл','Жизненный цикл','Дата','Канал','Работодатель','Вакансия','Причина или вопросы'];
       $('reviewTable').innerHTML = table(headers, rows, r => `
         <tr>
           ${{cell(headers[0], esc(r.id || ''), 'id-cell')}}
@@ -4171,7 +8046,7 @@ def render_dashboard(snapshot: dict[str, Any]) -> str:
 
     function renderRecent() {{
       const rows = filtered(DATA.recent);
-      const headers = ['Score','Stage','Date','Channel','Company','Vacancy','Note'];
+      const headers = ['Балл','Жизненный цикл','Дата','Канал','Работодатель','Вакансия','Примечание'];
       $('recentTable').innerHTML = table(headers, rows, r => `
         <tr>
           ${{cell(headers[0], esc(r.score || ''), 'score')}}
@@ -4187,7 +8062,7 @@ def render_dashboard(snapshot: dict[str, Any]) -> str:
 
     function renderFollowups() {{
       const rows = filteredFollowups(DATA.followups);
-      const headers = ['Date','Source','Score','Company','Vacancy','Status','Direct contact','Last outreach','Contact search','Note'];
+      const headers = ['Дата','Источник','Балл','Работодатель','Вакансия','Состояние','Прямой контакт','Последнее обращение','Поиск контакта','Примечание'];
       $('followupTable').innerHTML = table(headers, rows, r => `
         <tr>
           ${{cell(headers[0], esc(r.follow_up_date || ''))}}
@@ -4198,16 +8073,44 @@ def render_dashboard(snapshot: dict[str, Any]) -> str:
           ${{cell(headers[5], esc(r.status || ''))}}
           ${{cell(headers[6], esc([r.direct_contact, r.direct_channels].filter(Boolean).join(' · ')), 'detail-cell')}}
           ${{cell(headers[7], esc(r.last_outreach || ''), 'detail-cell')}}
-          ${{cell(headers[8], esc([r.contact_search_date, r.contact_search_status, r.contact_search_note].filter(Boolean).join(' · ')), 'detail-cell')}}
+          ${{cell(headers[8], esc([
+            r.contact_search_date,
+            CONTACT_SEARCH_STATUS_LABELS[r.contact_search_status] || r.contact_search_status,
+            r.contact_search_note,
+          ].filter(Boolean).join(' · ')), 'detail-cell')}}
           ${{cell(headers[9], detailWithInterviews(r.why_applied || r.risks || '', r), 'detail-cell')}}
         </tr>
       `);
     }}
 
+    function renderWip() {{
+      const queue = DATA.wip_queue || {{items: [], pagination: {{}}}};
+      const headers = ['ID','Корзина','Действие','Приоритет','Возраст','Срок','Просрочено','Сверх WIP','Работодатель','Вакансия','Причина'];
+      const body = table(headers, queue.items || [], item => `<tr>
+        ${{cell(headers[0], esc(item.vacancy_id || ''), 'id-cell')}}
+        ${{cell(headers[1], esc(item.bucket_label || ''))}}
+        ${{cell(headers[2], esc(ACTION_LABELS[item.action_state] || item.action_state || ''))}}
+        ${{cell(headers[3], esc(item.priority || 0), 'score')}}
+        ${{cell(headers[4], esc(`${{item.age_days || 0}} дн.`))}}
+        ${{cell(headers[5], esc(item.due_date || ''))}}
+        ${{cell(headers[6], esc(item.overdue ? `да, ${{item.overdue_days}} дн.` : 'нет'))}}
+        ${{cell(headers[7], esc(item.wip_overflow ? 'да' : 'нет'))}}
+        ${{cell(headers[8], esc(item.company || ''), 'company-cell')}}
+        ${{cell(headers[9], link(item.title, item.url), 'vacancy-cell')}}
+        ${{cell(headers[10], esc(item.priority_reason || ''), 'detail-cell')}}
+      </tr>`);
+      const p = queue.pagination || {{}};
+      $('wipTable').innerHTML = `<div class="note" style="padding: 8px 12px;">Страница ${{esc(p.page || 1)}} из ${{esc(p.total_pages || 1)}}; всего ${{esc(p.total_items || 0)}}, сверх лимита ${{esc(queue.overflow_total || 0)}}, просрочено ${{esc(queue.overdue_total || 0)}}.</div>` + body;
+    }}
+
     function renderFunnel() {{
+      const projection = DATA.vacancy_projection || {{}};
+      $('vacancyProjectionNote').textContent = projection.truncated
+        ? `В панели показана компактная операционная выборка ${{projection.included}} из ${{projection.total}} вакансий; полная история доступна через SQLite и CLI.`
+        : `В панели показаны все ${{projection.total || 0}} вакансий.`;
       const visibleStages = currentFunnelStages();
       const channels = currentFunnelChannels();
-      const headers = ['Channel', ...visibleStages.map(st => STAGE_LABELS[st] || st)];
+      const headers = ['Канал', ...visibleStages.map(st => STAGE_LABELS[st] || st)];
       $('funnelTable').innerHTML = table(headers, channels, ch => {{
         const stages = DATA.funnel_by_channel[ch] || {{}};
         return `<tr>${{cell(headers[0], esc(channelLabel(ch)))}}` +
@@ -4220,10 +8123,10 @@ def render_dashboard(snapshot: dict[str, Any]) -> str:
 
     function renderFunnelVisual(channels, visibleStages) {{
       if (!channels.length || !visibleStages.length) {{
-        const reason = !channels.length ? 'No channels selected.' : 'No stages selected.';
+        const reason = !channels.length ? 'Каналы не выбраны.' : 'Этапы не выбраны.';
         $('funnelVisual').innerHTML = `<div class="funnel-visual-head">
-          <div class="funnel-visual-title">Visual Funnel</div>
-          <div class="funnel-visual-sub">0 selected</div>
+          <div class="funnel-visual-title">Визуальная воронка</div>
+          <div class="funnel-visual-sub">Ничего не выбрано</div>
         </div><div class="bars muted">${{esc(reason)}}</div>`;
         return;
       }}
@@ -4241,7 +8144,7 @@ def render_dashboard(snapshot: dict[str, Any]) -> str:
           const title = `${{channelLabel(ch)}}: ${{channelValue}} ${{STAGE_LABELS[stage] || stage}}`;
           return `<span class="funnel-band-segment" title="${{esc(title)}}" style="width:${{segmentWidth}}%; background:${{channelColor(idx)}}"></span>`;
         }}).join('');
-        const meta = stage === 'seen' ? '100% of selected' : `${{rate}}% of Seen`;
+        const meta = stage === 'seen' ? '100% выбранных' : `${{rate}}% от всех выбранных`;
         return `<div class="funnel-stage-row">
           <div class="funnel-stage-label">
             <div class="funnel-stage-name">${{esc(STAGE_LABELS[stage] || stage)}}</div>
@@ -4253,8 +8156,8 @@ def render_dashboard(snapshot: dict[str, Any]) -> str:
         </div>`;
       }}).join('');
       $('funnelVisual').innerHTML = `<div class="funnel-visual-head">
-        <div class="funnel-visual-title">Visual Funnel</div>
-        <div class="funnel-visual-sub">${{esc(channels.length)}} channel(s), ${{esc(totalSeen)}} seen vacancies</div>
+        <div class="funnel-visual-title">Визуальная воронка</div>
+        <div class="funnel-visual-sub">Каналов: ${{esc(channels.length)}}, вакансий: ${{esc(totalSeen)}}</div>
       </div>
       <div class="funnel-chart">${{stageRows}}</div>
       <div class="funnel-legend">${{legend}}</div>`;
@@ -4267,7 +8170,7 @@ def render_dashboard(snapshot: dict[str, Any]) -> str:
         if (!rowMatchesSearch(row)) return false;
         return rowMatchesFunnelStage(row);
       }});
-      const headers = ['ID','Score','Stage','Date','Channel','Company','Vacancy','Note'];
+      const headers = ['ID','Балл','Жизненный цикл','Дата','Канал','Работодатель','Вакансия','Примечание'];
       const body = table(headers, rows, r => `
         <tr>
           ${{cell(headers[0], esc(r.id || ''), 'id-cell')}}
@@ -4280,7 +8183,7 @@ def render_dashboard(snapshot: dict[str, Any]) -> str:
           ${{cell(headers[7], detailWithInterviews(r.reason || r.open_questions || r.next_action || r.risks || r.latest_status || '', r), 'detail-cell')}}
         </tr>
       `, {{ limit: 120 }});
-      $('funnelVacancies').innerHTML = '<div class="funnel-vacancies-head">Filtered Vacancies</div>' + body;
+      $('funnelVacancies').innerHTML = '<div class="funnel-vacancies-head">Отфильтрованные вакансии</div>' + body;
     }}
 
     function renderTab() {{
@@ -4288,6 +8191,7 @@ def render_dashboard(snapshot: dict[str, Any]) -> str:
       $(`tab-${{state.tab}}`).classList.remove('hidden');
       document.querySelectorAll('.tabs button').forEach(btn => btn.classList.toggle('active', btn.dataset.tab === state.tab));
       renderReview();
+      renderWip();
       renderRecent();
       renderFollowups();
       renderFunnel();
@@ -4367,13 +8271,394 @@ def generate_dashboard(snapshot: dict[str, Any]) -> None:
     DASHBOARD_PATH.write_text(render_dashboard(snapshot), encoding="utf-8")
 
 
-def render_outputs(db_path: Path) -> dict[str, Any]:
+def projection_store_dir() -> Path:
+    return ROOT / ".jobctl" / "projections"
+
+
+@contextlib.contextmanager
+def staged_projection_paths(stage: Path) -> Iterator[None]:
+    global VIEWS_DIR, REPORTS_DIR, DASHBOARD_PATH
+    previous = (VIEWS_DIR, REPORTS_DIR, DASHBOARD_PATH)
+    VIEWS_DIR = stage / "views"
+    REPORTS_DIR = stage / "reports"
+    DASHBOARD_PATH = stage / "dashboard" / "index.html"
+    try:
+        yield
+    finally:
+        VIEWS_DIR, REPORTS_DIR, DASHBOARD_PATH = previous
+
+
+def fsync_directory(path: Path) -> None:
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+    except OSError:  # pragma: no cover - unsupported filesystem/platform.
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError:  # pragma: no cover - unsupported filesystem/platform.
+        pass
+    finally:
+        os.close(descriptor)
+
+
+def fsync_projection_tree(root: Path) -> tuple[int, int]:
+    file_count = 0
+    total_bytes = 0
+    directories: list[Path] = []
+    for current_root, _, filenames in os.walk(root):
+        directory = Path(current_root)
+        directories.append(directory)
+        for filename in filenames:
+            path = directory / filename
+            with path.open("rb") as handle:
+                os.fsync(handle.fileno())
+            stat = path.stat()
+            file_count += 1
+            total_bytes += stat.st_size
+    for directory in reversed(directories):
+        fsync_directory(directory)
+    return file_count, total_bytes
+
+
+def atomic_symlink(target: Path, link_path: Path, *, target_is_directory: bool) -> None:
+    link_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = link_path.with_name(f".{link_path.name}.link-{uuid.uuid4().hex}")
+    relative_target = os.path.relpath(target, link_path.parent)
+    os.symlink(relative_target, temporary, target_is_directory=target_is_directory)
+    try:
+        os.replace(temporary, link_path)
+    finally:
+        if temporary.is_symlink():
+            temporary.unlink()
+
+
+def symlink_resolves_to(path: Path, target: Path) -> bool:
+    if not path.is_symlink():
+        return False
+    try:
+        return path.resolve(strict=False) == target.resolve(strict=False)
+    except OSError:
+        return False
+
+
+def install_managed_projection_link(
+    path: Path,
+    target: Path,
+    *,
+    target_is_directory: bool,
+) -> None:
+    if symlink_resolves_to(path, target):
+        return
+    if path.is_symlink() or not path.exists():
+        atomic_symlink(target, path, target_is_directory=target_is_directory)
+        return
+
+    backup = path.with_name(f".{path.name}.pre-v8-{uuid.uuid4().hex}")
+    os.replace(path, backup)
+    try:
+        atomic_symlink(target, path, target_is_directory=target_is_directory)
+    except Exception:
+        if not path.exists() and not path.is_symlink() and backup.exists():
+            os.replace(backup, path)
+        raise
+    if backup.is_dir():
+        shutil.rmtree(backup)
+    elif backup.exists():
+        backup.unlink()
+
+
+def set_current_projection(store: Path, generation: Path) -> None:
+    atomic_symlink(
+        generation,
+        store / "current",
+        target_is_directory=True,
+    )
+    fsync_directory(store)
+
+
+def projection_links(store: Path) -> tuple[tuple[Path, Path, bool], ...]:
+    current = store / "current"
+    return (
+        (VIEWS_DIR, current / "views", True),
+        (REPORTS_DIR, current / "reports", True),
+        (DASHBOARD_PATH, current / "dashboard" / "index.html", False),
+    )
+
+
+def projection_links_managed(store: Path) -> bool:
+    return all(
+        symlink_resolves_to(path, target)
+        for path, target, _ in projection_links(store)
+    )
+
+
+def copy_legacy_projection(store: Path) -> Path | None:
+    sources = projection_links(store)
+    if not any(path.exists() and not path.is_symlink() for path, _, _ in sources):
+        return None
+    legacy = store / "generations" / f"legacy-{uuid.uuid4().hex}"
+    (legacy / "views").mkdir(parents=True, exist_ok=True)
+    (legacy / "reports").mkdir(parents=True, exist_ok=True)
+    (legacy / "dashboard").mkdir(parents=True, exist_ok=True)
+    if VIEWS_DIR.exists() and not VIEWS_DIR.is_symlink():
+        shutil.copytree(VIEWS_DIR, legacy / "views", dirs_exist_ok=True)
+    if REPORTS_DIR.exists() and not REPORTS_DIR.is_symlink():
+        shutil.copytree(REPORTS_DIR, legacy / "reports", dirs_exist_ok=True)
+    if DASHBOARD_PATH.exists() and not DASHBOARD_PATH.is_symlink():
+        shutil.copy2(DASHBOARD_PATH, legacy / "dashboard" / "index.html")
+    fsync_projection_tree(legacy)
+    fsync_directory(legacy.parent)
+    return legacy
+
+
+def ensure_projection_links(store: Path, new_generation: Path) -> None:
+    if projection_links_managed(store):
+        return
+    current = store / "current"
+    if not current.is_symlink():
+        legacy = copy_legacy_projection(store)
+        set_current_projection(store, legacy or new_generation)
+    for path, target, is_directory in projection_links(store):
+        install_managed_projection_link(
+            path,
+            target,
+            target_is_directory=is_directory,
+        )
+
+
+def clean_projection_generations(store: Path) -> None:
+    generations = store / "generations"
+    if not generations.is_dir():
+        return
+    current_target = ""
+    current = store / "current"
+    if current.is_symlink():
+        current_target = current.resolve(strict=False).name
+    candidates = sorted(
+        (path for path in generations.iterdir() if path.is_dir()),
+        key=lambda path: path.stat().st_mtime_ns,
+        reverse=True,
+    )
+    keep = {path.name for path in candidates[:PROJECTION_GENERATIONS_TO_KEEP]}
+    if current_target:
+        keep.add(current_target)
+    for path in candidates:
+        if path.name not in keep:
+            shutil.rmtree(path)
+
+
+def publish_projection_generation(stage: Path, generation_id: str) -> str:
+    store = projection_store_dir()
+    generations = store / "generations"
+    generations.mkdir(parents=True, exist_ok=True)
+    final = generations / generation_id
+    os.replace(stage, final)
+    fsync_directory(generations)
+    ensure_projection_links(store, final)
+    set_current_projection(store, final)
+    clean_projection_generations(store)
+    return generation_id
+
+
+def recover_published_finalizing_projection(
+    conn: sqlite3.Connection, *, run_id: str
+) -> str:
+    """Recover the narrow crash window after atomic publication but before SQLite ack."""
+
+    durable = get_durable_daily_run(conn, run_id)
+    if durable is None or durable["projection_revision_finalizing"] is None:
+        return ""
+    target_revision = int(durable["projection_revision_finalizing"])
+    state = projection_state_data(conn)
+    current_dirty_revision = int(state["dirty_revision"])
+    if not state["dirty"] or current_dirty_revision < target_revision:
+        return ""
+    store = projection_store_dir()
+    current = store / "current"
+    if not current.is_symlink():
+        return ""
+    try:
+        generation = current.resolve(strict=True)
+        generation.relative_to((store / "generations").resolve())
+        manifest_path = generation / "manifest.json"
+        dashboard_path = generation / "dashboard" / "index.html"
+        if not manifest_path.is_file() or not dashboard_path.is_file():
+            return ""
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if (
+            manifest.get("generation") != generation.name
+            or int(manifest.get("projection_revision", -1)) != target_revision
+            or int(manifest.get("schema_version", -1)) != SCHEMA_VERSION
+        ):
+            return ""
+        actual_file_count = sum(
+            1 for path in generation.rglob("*") if path.is_file()
+        )
+        if actual_file_count != int(manifest.get("file_count", -1)):
+            return ""
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return ""
+    mark_projections_rendered(
+        conn,
+        revision=current_dirty_revision,
+        generation=generation.name,
+    )
+    append_daily_run_transition(
+        conn,
+        run_id=run_id,
+        entity_type="run",
+        entity_key=run_id,
+        event_type="final_projection_recovered",
+        from_state="finalizing",
+        to_state="finalizing",
+        reason="complete_generation_was_published_before_process_interruption",
+        details={
+            "projection_revision": target_revision,
+            "acknowledged_revision": current_dirty_revision,
+            "generation": generation.name,
+        },
+    )
+    return generation.name
+
+
+def render_outputs(
+    db_path: Path,
+    *,
+    lock_timeout: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
+    writer_locked: bool = False,
+    allowed_run_lease: str = "",
+) -> dict[str, Any]:
+    writer_context = (
+        contextlib.nullcontext()
+        if writer_locked
+        else interprocess_lock(db_path, "writer", timeout=lock_timeout)
+    )
+    with writer_context:
+        with interprocess_lock(db_path, "render", timeout=lock_timeout):
+            with connect_db(db_path) as conn:
+                ensure_schema(conn)
+                if allowed_run_lease:
+                    require_daily_run_lease(
+                        conn, allowed_run_lease, heartbeat=False
+                    )
+                else:
+                    active_lease = active_daily_run_lease(conn)
+                    if active_lease is not None:
+                        raise RuntimeError(
+                            "Полный render запрещён во время активного ежедневного запуска: "
+                            f"run_id={active_lease['run_id']}, "
+                            f"owner={active_lease['owner']}, "
+                            f"expires_at={active_lease['expires_at']}. "
+                            "Завершите его через finalize-daily-run с точным `lease`."
+                        )
+                    open_run = durable_daily_run_row(conn, open_only=True)
+                    if open_run is not None:
+                        raise RuntimeError(
+                            "Полный render запрещён, пока долговечный ежедневный запуск не завершён: "
+                            f"run_id={open_run['run_id']}, status={open_run['status']}. "
+                            "Возобновите его через resume-daily-run и завершите через "
+                            "finalize-daily-run; приостановка не разрешает отдельный rebuild."
+                        )
+                before = conn.total_changes
+                ensure_active_policy(conn)
+                refresh_source_hit_labels(conn)
+                if conn.total_changes > before:
+                    mark_projections_dirty(conn)
+                conn.commit()
+                revision = int(projection_state_data(conn)["dirty_revision"])
+                snapshot = build_snapshot(conn, db_path)
+
+            store = projection_store_dir()
+            staging_root = store / "staging"
+            staging_root.mkdir(parents=True, exist_ok=True)
+            for stale in staging_root.iterdir():
+                if stale.is_dir():
+                    shutil.rmtree(stale)
+                else:
+                    stale.unlink()
+            generation_id = (
+                dt.datetime.now().strftime("%Y%m%dT%H%M%S")
+                + f"-r{revision}-{uuid.uuid4().hex[:12]}"
+            )
+            stage = staging_root / generation_id
+            stage.mkdir(parents=True)
+            try:
+                with staged_projection_paths(stage):
+                    generate_views(snapshot, db_path)
+                    generate_dashboard(snapshot)
+                manifest = {
+                    "schema_version": SCHEMA_VERSION,
+                    "projection_revision": revision,
+                    "generation": generation_id,
+                    "generated_at": snapshot["generated_at"],
+                    "database": db_label(db_path),
+                }
+                (stage / "manifest.json").write_text(
+                    json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                file_count, total_bytes = fsync_projection_tree(stage)
+                manifest.update({"file_count": file_count, "total_bytes": total_bytes})
+                (stage / "manifest.json").write_text(
+                    json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                fsync_projection_tree(stage)
+                delay = float(os.environ.get("JOBCTL_TEST_RENDER_DELAY_SECONDS", "0"))
+                if delay > 0:
+                    time.sleep(min(delay, 30.0))
+                if os.environ.get("JOBCTL_TEST_FAIL_RENDER_BEFORE_PUBLISH") == "1":
+                    raise RuntimeError("Синтетическое прерывание render до публикации.")
+                published_generation = publish_projection_generation(
+                    stage, generation_id
+                )
+                if os.environ.get("JOBCTL_TEST_FAIL_RENDER_AFTER_PUBLISH") == "1":
+                    raise RuntimeError(
+                        "Синтетическое прерывание render после атомарной публикации."
+                    )
+            except Exception:
+                if stage.exists():
+                    shutil.rmtree(stage)
+                raise
+
+            with connect_db(db_path) as conn:
+                ensure_schema(conn)
+                mark_projections_rendered(
+                    conn,
+                    revision=revision,
+                    generation=published_generation,
+                )
+                conn.commit()
+                snapshot["projection_state"] = projection_state_data(conn)
+            return snapshot
+
+
+def command_lock_timeout(args: argparse.Namespace) -> float:
+    return validate_lock_timeout(
+        float(getattr(args, "lock_timeout", DEFAULT_LOCK_TIMEOUT_SECONDS))
+    )
+
+
+def maybe_render_after_write(args: argparse.Namespace) -> dict[str, Any] | None:
+    if bool(getattr(args, "defer_render", False)):
+        return None
+    return render_outputs(
+        args.db,
+        lock_timeout=command_lock_timeout(args),
+        writer_locked=True,
+    )
+
+
+def read_projection_state(db_path: Path) -> dict[str, Any]:
     with connect_db(db_path) as conn:
         ensure_schema(conn)
-        snapshot = build_snapshot(conn, db_path)
-    generate_views(snapshot, db_path)
-    generate_dashboard(snapshot)
-    return snapshot
+        return projection_state_data(conn)
+
+
+def projection_write_note(args: argparse.Namespace) -> str:
+    if bool(getattr(args, "defer_render", False)):
+        return "Запись SQLite сохранена; render отложен, проекции имеют состояние dirty."
+    return f"Обновлён файл {display_path(DASHBOARD_PATH, ROOT)}."
 
 
 def db_label(path: Path) -> str:
@@ -4382,23 +8667,36 @@ def db_label(path: Path) -> str:
 
 def print_render_summary(action: str, db_path: Path, snapshot: dict[str, Any]) -> None:
     print(action)
-    print(f"  database: {db_label(db_path)}")
-    print(f"  dashboard: {display_path(DASHBOARD_PATH, ROOT)}")
-    print(f"  vacancies: {snapshot['kpis']['vacancies']}")
-    print(f"  open items: {snapshot['kpis']['active_review']}")
-    print(f"  needs input: {snapshot['kpis']['needs_user']}")
-    print(f"  follow-ups: {snapshot['kpis']['followups']}")
-    print(f"  direct contacts: {snapshot['kpis']['direct_contacts']}")
-    print(f"  applied: {snapshot['kpis']['applied']}")
-    print(f"  import issues: {snapshot['kpis']['import_issues']}")
+    print(f"  база данных: {db_label(db_path)}")
+    print(f"  панель: {display_path(DASHBOARD_PATH, ROOT)}")
+    print(f"  вакансии: {snapshot['kpis']['vacancies']}")
+    print(f"  открытые действия: {snapshot['kpis']['active_review']}")
+    print(f"  нужны данные: {snapshot['kpis']['needs_user']}")
+    print(f"  повторные обращения: {snapshot['kpis']['followups']}")
+    print(f"  прямые контакты: {snapshot['kpis']['direct_contacts']}")
+    print(f"  подтверждённые отклики: {snapshot['kpis']['applied']}")
+    print(f"  проблемы импорта: {snapshot['kpis']['import_issues']}")
 
 
 def rebuild(args: argparse.Namespace) -> None:
-    snapshot = render_outputs(args.db)
+    snapshot = render_outputs(
+        args.db,
+        lock_timeout=command_lock_timeout(args),
+        writer_locked=bool(getattr(args, "writer_locked", False)),
+    )
     if args.json:
-        print(json.dumps({"kpis": snapshot["kpis"]}, ensure_ascii=False, indent=2))
+        print(
+            json.dumps(
+                {
+                    "kpis": snapshot["kpis"],
+                    "projection_state": snapshot["projection_state"],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
     else:
-        print_render_summary("Regenerated job-search views from SQLite", args.db, snapshot)
+        print_render_summary("Проекции поиска работы пересобраны из SQLite.", args.db, snapshot)
 
 
 def file_signature(paths: list[Path]) -> tuple[tuple[str, int, int], ...]:
@@ -4413,7 +8711,7 @@ def file_signature(paths: list[Path]) -> tuple[tuple[str, int, int], ...]:
 
 
 def watch(args: argparse.Namespace) -> None:
-    print("Watching SQLite database. Press Ctrl-C to stop.")
+    print("Наблюдение за базой SQLite запущено. Для остановки нажмите Ctrl-C.")
     rebuild(argparse.Namespace(db=args.db, json=False))
     previous = file_signature([args.db])
     try:
@@ -4421,11 +8719,13 @@ def watch(args: argparse.Namespace) -> None:
             time.sleep(args.interval)
             current = file_signature([args.db])
             if current != previous:
-                print(f"\nChange detected at {now_iso()}")
+                print(f"\nИзменение обнаружено: {now_iso()}")
                 rebuild(argparse.Namespace(db=args.db, json=False))
-                previous = current
+                # Rebuild advances projection_state in SQLite. Track the
+                # post-render signature so watch does not trigger itself.
+                previous = file_signature([args.db])
     except KeyboardInterrupt:
-        print("\nStopped watcher.")
+        print("\nНаблюдение остановлено.")
 
 
 def print_stats(args: argparse.Namespace) -> None:
@@ -4435,54 +8735,1518 @@ def print_stats(args: argparse.Namespace) -> None:
     print(json.dumps(snapshot["kpis"], ensure_ascii=False, indent=2))
 
 
+def projection_status_command(args: argparse.Namespace) -> None:
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        state = projection_state_data(conn)
+        active = conn.execute(
+            """
+            SELECT * FROM daily_run_leases
+            WHERE status = 'active' AND expires_at > ?
+            ORDER BY acquired_at DESC LIMIT 1
+            """,
+            (now_iso(),),
+        ).fetchone()
+    store = projection_store_dir()
+    state["managed_outputs"] = projection_links_managed(store)
+    state["manifest"] = display_path(
+        store / "current" / "manifest.json", ROOT
+    )
+    state["active_daily_run"] = (
+        {
+            key: active[key]
+            for key in (
+                "run_id",
+                "owner",
+                "status",
+                "acquired_at",
+                "heartbeat_at",
+                "expires_at",
+            )
+        }
+        if active is not None
+        else None
+    )
+    if args.json:
+        print(json.dumps(state, ensure_ascii=False, indent=2))
+        return
+    freshness = "dirty" if state["dirty"] else "fresh"
+    print(
+        f"Проекции: {freshness}; ревизия "
+        f"{state['rendered_revision']}/{state['dirty_revision']}; "
+        f"поколение={state['published_generation'] or 'нет'}."
+    )
+    if active is not None:
+        print(
+            f"  ежедневный запуск: {active['run_id']} · владелец={active['owner']} · "
+            f"истекает={active['expires_at']}"
+        )
+
+
+def begin_daily_run_command(args: argparse.Namespace) -> None:
+    run_id = clean_cell(args.run_id)
+    if not DAILY_RUN_ID_RE.fullmatch(run_id):
+        raise ValueError(
+            "--run-id должен содержать 1–128 латинских букв, цифр, точек, "
+            "двоеточий, дефисов или подчёркиваний и начинаться с буквы или цифры."
+        )
+    lease_seconds = int(args.lease_seconds)
+    if lease_seconds < 60 or lease_seconds > MAX_DAILY_RUN_LEASE_SECONDS:
+        raise ValueError("--lease-seconds должен быть от 60 до 86400.")
+    owner = clean_cell(args.owner) or f"{socket.gethostname()}:{os.getpid()}"
+    supplied_token = clean_cell(getattr(args, "run_lease", ""))
+    timezone = clean_cell(getattr(args, "timezone", "")) or SETTINGS.project.timezone
+    try:
+        zone = ZoneInfo(timezone)
+    except Exception as exc:
+        raise ValueError("--timezone должен содержать имя часового пояса IANA.") from exc
+    run_date = clean_cell(getattr(args, "run_date", "")) or dt.datetime.now(zone).date().isoformat()
+    parse_iso_date(run_date, label="run_date")
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        active = active_daily_run_lease(conn)
+        durable = get_durable_daily_run(conn, run_id)
+        open_run = get_durable_daily_run(conn, None, open_only=True)
+        if durable is not None and durable["status"] == "completed":
+            state = projection_state_data(conn)
+            result = {
+                "run_id": run_id,
+                "run_lease": "",
+                "created": False,
+                "resumed": False,
+                "already_completed": True,
+                "projection_state": state,
+                "write_flags": [],
+            }
+            print(json.dumps(result, ensure_ascii=False, indent=2)) if args.json else print(
+                f"Ежедневный запуск {run_id} уже завершён; новый `lease` не создан."
+            )
+            return
+        if open_run is not None and str(open_run["run_id"]) != run_id:
+            raise RuntimeError(
+                "Нельзя начать второй ежедневный запуск: уже открыт долговечный запуск "
+                f"{open_run['run_id']}. Проверьте daily-run-status и возобновите его."
+            )
+        if active is not None:
+            if supplied_token and supplied_token == str(active["token"]) and run_id == str(
+                active["run_id"]
+            ):
+                active = require_daily_run_lease(
+                    conn, supplied_token, heartbeat=True
+                )
+                conn.commit()
+                token = supplied_token
+                created = False
+                resumed = False
+                if durable is None:
+                    projection = projection_state_data(conn)
+                    create_durable_daily_run(
+                        conn,
+                        SETTINGS,
+                        run_id=run_id,
+                        run_date=run_date,
+                        timezone=timezone,
+                        projection_revision_start=int(projection["dirty_revision"]),
+                        lease_token=token,
+                    )
+                    commit_projection_write(conn)
+                    created = True
+            else:
+                raise RuntimeError(
+                    "Нельзя начать второй ежедневный запуск: "
+                    f"run_id={active['run_id']}, owner={active['owner']}, "
+                    f"expires_at={active['expires_at']}. Возобновите его с точным "
+                    "--run-lease или дождитесь истечения."
+                )
+        else:
+            token = uuid.uuid4().hex
+            now = dt.datetime.now().replace(microsecond=0)
+            expires = now + dt.timedelta(seconds=lease_seconds)
+            conn.execute(
+                """
+                INSERT INTO daily_run_leases (
+                    token, run_id, owner, status, lease_seconds, acquired_at,
+                    heartbeat_at, expires_at
+                ) VALUES (?, ?, ?, 'active', ?, ?, ?, ?)
+                """,
+                (
+                    token,
+                    run_id,
+                    owner,
+                    lease_seconds,
+                    now.isoformat(),
+                    now.isoformat(),
+                    expires.isoformat(),
+                ),
+            )
+            if durable is None:
+                projection = projection_state_data(conn)
+                if projection["dirty"]:
+                    raise RuntimeError(
+                        "Проекции имеют состояние dirty до нового ежедневного запуска. "
+                        "Сначала выполните возобновляемый rebuild, затем повторите "
+                        "begin-daily-run."
+                    )
+                create_durable_daily_run(
+                    conn,
+                    SETTINGS,
+                    run_id=run_id,
+                    run_date=run_date,
+                    timezone=timezone,
+                    projection_revision_start=int(projection["dirty_revision"]),
+                    lease_token=token,
+                )
+                created = True
+                resumed = False
+            else:
+                bind_daily_run_lease(
+                    conn,
+                    run_id=run_id,
+                    lease_token=token,
+                    event_type="resumed",
+                    owner=owner,
+                    expires_at=expires.isoformat(),
+                )
+                refresh_durable_daily_run_snapshot(conn, run_id)
+                created = False
+                resumed = True
+            commit_projection_write(conn)
+            active = conn.execute(
+                "SELECT * FROM daily_run_leases WHERE token = ?", (token,)
+            ).fetchone()
+    result = {
+        "run_id": run_id,
+        "run_lease": token,
+        "owner": active["owner"],
+        "expires_at": active["expires_at"],
+        "created": created,
+        "resumed": resumed,
+        "run_date": run_date if durable is None else durable["run_date"],
+        "timezone": timezone if durable is None else durable["timezone"],
+        "write_flags": ["--defer-render", f"--run-lease={token}"],
+    }
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print(
+            f"Ежедневный запуск {run_id} сохранён и защищён `lease` до {active['expires_at']}. "
+            f"Передавайте --defer-render --run-lease={token} каждой команде записи."
+        )
+
+
+def resume_daily_run_command(args: argparse.Namespace) -> None:
+    run_id = clean_cell(args.run_id)
+    owner = clean_cell(args.owner) or f"{socket.gethostname()}:{os.getpid()}"
+    lease_seconds = int(args.lease_seconds)
+    if lease_seconds < 60 or lease_seconds > MAX_DAILY_RUN_LEASE_SECONDS:
+        raise ValueError("--lease-seconds должен быть от 60 до 86400.")
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        run = get_durable_daily_run(conn, run_id or None, open_only=True)
+        if run is None:
+            raise RuntimeError("Незавершённый долговечный ежедневный запуск не найден.")
+        run_id = str(run["run_id"])
+        active = active_daily_run_lease(conn)
+        supplied = clean_cell(getattr(args, "run_lease", ""))
+        if active is not None:
+            if str(active["run_id"]) != run_id or supplied != str(active["token"]):
+                raise RuntimeError(
+                    "У ежедневного запуска уже есть активный `lease`. Для идемпотентного "
+                    "возобновления "
+                    "передайте его точный --run-lease или дождитесь истечения."
+                )
+            active = require_daily_run_lease(conn, supplied, heartbeat=True)
+            conn.commit()
+            token = supplied
+            resumed = False
+        else:
+            token = uuid.uuid4().hex
+            now = dt.datetime.now().replace(microsecond=0)
+            expires = now + dt.timedelta(seconds=lease_seconds)
+            conn.execute(
+                """
+                INSERT INTO daily_run_leases (
+                    token, run_id, owner, status, lease_seconds, acquired_at,
+                    heartbeat_at, expires_at
+                ) VALUES (?, ?, ?, 'active', ?, ?, ?, ?)
+                """,
+                (
+                    token,
+                    run_id,
+                    owner,
+                    lease_seconds,
+                    now.isoformat(),
+                    now.isoformat(),
+                    expires.isoformat(),
+                ),
+            )
+            bind_daily_run_lease(
+                conn,
+                run_id=run_id,
+                lease_token=token,
+                event_type="resumed",
+                owner=owner,
+                expires_at=expires.isoformat(),
+            )
+            refresh_durable_daily_run_snapshot(conn, run_id)
+            commit_projection_write(conn)
+            active = conn.execute(
+                "SELECT * FROM daily_run_leases WHERE token = ?", (token,)
+            ).fetchone()
+            resumed = True
+    result = {
+        "run_id": run_id,
+        "run_lease": token,
+        "resumed": resumed,
+        "owner": active["owner"],
+        "expires_at": active["expires_at"],
+        "write_flags": ["--defer-render", f"--run-lease={token}"],
+    }
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print(
+            f"Ежедневный запуск {run_id} возобновлён до {active['expires_at']}; "
+            f"используйте --defer-render --run-lease={token}."
+        )
+
+
+def pause_daily_run_command(args: argparse.Namespace) -> None:
+    token = clean_cell(getattr(args, "run_lease", ""))
+    reason = clean_cell(args.reason)
+    if not token:
+        raise ValueError("Для pause-daily-run требуется точный --run-lease.")
+    if not reason:
+        raise ValueError("Для pause-daily-run требуется --reason.")
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        active = require_daily_run_lease(conn, token, heartbeat=False)
+        if active is None:
+            raise RuntimeError("Активный daily-run lease не найден.")
+        if args.run_id and clean_cell(args.run_id) != str(active["run_id"]):
+            raise RuntimeError("--run-id не совпадает с активным lease.")
+        run_id = str(active["run_id"])
+        release_daily_run_lease(
+            conn, run_id=run_id, lease_token=token, reason=reason
+        )
+        released_at = now_iso()
+        conn.execute(
+            """
+            UPDATE daily_run_leases
+            SET status = 'released', released_at = ?, release_reason = ?
+            WHERE token = ? AND status = 'active'
+            """,
+            (released_at, reason, token),
+        )
+        commit_projection_write(conn)
+        state = projection_state_data(conn)
+    result = {
+        "run_id": run_id,
+        "paused": True,
+        "released_at": released_at,
+        "projection_state": state,
+        "resume_command": (
+            "python3 scripts/jobctl.py resume-daily-run --run-id "
+            f"{shlex.quote(run_id)} --json"
+        ),
+    }
+    print(json.dumps(result, ensure_ascii=False, indent=2)) if args.json else print(
+        f"Ежедневный запуск {run_id} приостановлен; `lease` освобождён, SQLite сохранена."
+    )
+
+
+_DAILY_RUN_STATUS_LABELS = {
+    "running": "выполняется",
+    "paused": "приостановлен",
+    "finalizing": "завершается",
+    "completed": "завершён",
+    "blocked": "заблокирован",
+}
+
+_SAFE_ACTION_LABELS = {
+    "start": "начать работу",
+    "reconcile_without_resend": "сверить состояние без повторной отправки",
+    "continue_from_checkpoint": "продолжить с контрольной точки",
+    "retry_after_blocker": "повторить после устранения блокировки",
+    "resolve_blocker": "устранить блокировку",
+    "reverify": "повторно проверить доказательство",
+    "reconcile_inbound_after_outbound": "повторно сверить входящие после внешнего действия",
+    "continue_authorized_work": "продолжить разрешённое действие",
+    "review_draft": "проверить черновик",
+    "finalize": "завершить ежедневный запуск",
+    "refresh_plan": "обновить зафиксированный план",
+    "build_hh_acquisition_plan": "построить план получения HH",
+    "resolve_hh_capture_blocker": "устранить блокировку снимка HH",
+    "verify_count_drift": "проверить расхождение счётчика повторным снимком",
+    "repeat_unstable_capture": "повторить неустойчивый снимок страницы",
+    "fetch_bounded_new_changed_details": "получить ограниченные подробности новых и изменённых вакансий",
+    "fetch_details": "получить ограниченные подробности вакансий",
+    "finalize_hh_stream": "завершить поток HH",
+    "finalize_stream": "завершить поток HH",
+    "continue_full_scan_after_fallback": "продолжить полный обход после безопасного отката",
+    "continue_from_page": "продолжить со следующей проверенной страницы",
+    "continue_stable_page_capture": "снять следующую устойчивую страницу",
+    "capture_stable_page": "снять устойчивую страницу",
+    "stream_complete": "поток завершён",
+}
+
+
+def _safe_action_label(action: str) -> str:
+    return _SAFE_ACTION_LABELS.get(action, action)
+
+
+def daily_run_status_command(args: argparse.Namespace) -> None:
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        status = durable_daily_run_status(
+            conn,
+            SETTINGS,
+            run_id=clean_cell(args.run_id) or None,
+            projection_state=projection_state_data(conn),
+            verbose=bool(args.verbose),
+            history_limit=int(args.history_limit),
+        )
+    result = status or {"open_run": None, "message": "Незавершённый долговечный ежедневный запуск не найден."}
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    if status is None:
+        print(result["message"])
+        return
+    counts = status["counts"]
+    status_label = _DAILY_RUN_STATUS_LABELS.get(str(status["status"]), status["status"])
+    print(
+        f"Ежедневный запуск {status['run_id']}: {status_label}; "
+        f"готово {counts['completed']}/{counts['total_required']}; "
+        f"заблокировано={counts['blocked']}; требует проверки={counts['needs_verification']}."
+    )
+    projection = status["projection_state"]
+    print(
+        f"  проекции: {'требуют публикации' if projection['dirty'] else 'актуальны'} "
+        f"{projection['rendered_revision']}/{projection['dirty_revision']}"
+    )
+    if status["configuration_drift"]:
+        print("  конфигурация изменилась: требуется аудируемый refresh-daily-run-plan")
+    for item in status["next_safe_work"][:5]:
+        suffix = f"/{item['item_key']}" if item["item_key"] else ""
+        print(f"  дальше: {_safe_action_label(str(item['action']))} · {item['step_key']}{suffix}")
+    if status["resume_command"]:
+        print(f"  возобновление: {status['resume_command']}")
+
+
+def _require_exact_durable_lease(
+    conn: sqlite3.Connection, args: argparse.Namespace
+) -> tuple[str, sqlite3.Row]:
+    token = clean_cell(getattr(args, "run_lease", ""))
+    if not token:
+        raise ValueError("Для изменения ежедневного запуска требуется точный --run-lease.")
+    lease = require_daily_run_lease(conn, token, heartbeat=True)
+    if lease is None:
+        raise RuntimeError("Активный daily-run lease не найден.")
+    run_id = clean_cell(getattr(args, "run_id", "")) or str(lease["run_id"])
+    if run_id != str(lease["run_id"]):
+        raise RuntimeError("--run-id не совпадает с активным lease.")
+    run = get_durable_daily_run(conn, run_id)
+    if run is None or run["status"] == "completed":
+        raise RuntimeError("Незавершённый долговечный ежедневный запуск не найден.")
+    return run_id, run
+
+
+def _daily_run_mutation_result(
+    args: argparse.Namespace, result: dict[str, Any]
+) -> None:
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print(result["message"])
+
+
+def start_daily_run_work_command(args: argparse.Namespace) -> None:
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        run_id, _ = _require_exact_durable_lease(conn, args)
+        changed = start_daily_run_work(
+            conn,
+            run_id=run_id,
+            step_key=args.step_key,
+            item_key=args.item_key,
+        )
+        revision = commit_projection_write(conn) if changed else projection_state_data(conn)["dirty_revision"]
+    _daily_run_mutation_result(
+        args,
+        {
+            "run_id": run_id,
+            "changed": changed,
+            "projection_revision": revision,
+            "message": "Работа запущена." if changed else "Состояние работы уже актуально.",
+        },
+    )
+
+
+def _load_daily_run_manifest(args: argparse.Namespace) -> dict[str, Any]:
+    path = args.manifest if args.manifest.is_absolute() else ROOT / args.manifest
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("Манифест должен быть объектом JSON.")
+    return payload
+
+
+def checkpoint_daily_run_work_command(args: argparse.Namespace) -> None:
+    manifest = _load_daily_run_manifest(args)
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        run_id, _ = _require_exact_durable_lease(conn, args)
+        changed = checkpoint_daily_run_work(
+            conn,
+            SETTINGS,
+            run_id=run_id,
+            step_key=args.step_key,
+            item_key=args.item_key,
+            manifest=manifest,
+        )
+        revision = commit_projection_write(conn) if changed else projection_state_data(conn)["dirty_revision"]
+    _daily_run_mutation_result(
+        args,
+        {
+            "run_id": run_id,
+            "changed": changed,
+            "projection_revision": revision,
+            "message": "Проверенная контрольная точка сохранена." if changed else "Идентичная контрольная точка уже сохранена.",
+        },
+    )
+
+
+def complete_daily_run_work_command(args: argparse.Namespace) -> None:
+    manifest = _load_daily_run_manifest(args)
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        run_id, _ = _require_exact_durable_lease(conn, args)
+        changed = complete_daily_run_work(
+            conn,
+            SETTINGS,
+            run_id=run_id,
+            step_key=args.step_key,
+            item_key=args.item_key,
+            manifest=manifest,
+        )
+        revision = commit_projection_write(conn) if changed else projection_state_data(conn)["dirty_revision"]
+    _daily_run_mutation_result(
+        args,
+        {
+            "run_id": run_id,
+            "changed": changed,
+            "projection_revision": revision,
+            "message": "Работа завершена по проверенному манифесту." if changed else "Идентичное завершение уже сохранено.",
+        },
+    )
+
+
+def block_daily_run_work_command(args: argparse.Namespace) -> None:
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        run_id, _ = _require_exact_durable_lease(conn, args)
+        changed = block_daily_run_work(
+            conn,
+            run_id=run_id,
+            step_key=args.step_key,
+            item_key=args.item_key,
+            code=args.code,
+            reason=args.reason,
+            retryable=bool(args.retryable),
+        )
+        revision = commit_projection_write(conn) if changed else projection_state_data(conn)["dirty_revision"]
+    _daily_run_mutation_result(
+        args,
+        {
+            "run_id": run_id,
+            "changed": changed,
+            "projection_revision": revision,
+            "message": "Точная блокировка сохранена." if changed else "Идентичная блокировка уже сохранена.",
+        },
+    )
+
+
+def uncertain_daily_run_work_command(args: argparse.Namespace) -> None:
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        run_id, _ = _require_exact_durable_lease(conn, args)
+        changed = mark_daily_run_work_uncertain(
+            conn,
+            run_id=run_id,
+            step_key=args.step_key,
+            item_key=args.item_key,
+            reason=args.reason,
+        )
+        revision = commit_projection_write(conn) if changed else projection_state_data(conn)["dirty_revision"]
+    _daily_run_mutation_result(
+        args,
+        {
+            "run_id": run_id,
+            "changed": changed,
+            "projection_revision": revision,
+            "next_safe_action": "reconcile_without_resend",
+            "message": "Работа требует проверки; автоматическая повторная отправка запрещена.",
+        },
+    )
+
+
+def invalidate_daily_run_work_command(args: argparse.Namespace) -> None:
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        run_id, _ = _require_exact_durable_lease(conn, args)
+        downstream = invalidate_daily_run_work(
+            conn,
+            run_id=run_id,
+            step_key=args.step_key,
+            item_key=args.item_key,
+            reason=args.reason,
+            reopen=not args.leave_invalidated,
+        )
+        revision = commit_projection_write(conn)
+    _daily_run_mutation_result(
+        args,
+        {
+            "run_id": run_id,
+            "projection_revision": revision,
+            "downstream_invalidated": downstream,
+            "message": "Работа и зависимые завершения аудируемо переоткрыты.",
+        },
+    )
+
+
+def cancel_due_followup_obligation_command(args: argparse.Namespace) -> None:
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        run_id, _ = _require_exact_durable_lease(conn, args)
+        result = cancel_due_followup_obligation_work(
+            conn,
+            SETTINGS,
+            run_id=run_id,
+            item_key=clean_cell(args.item_key),
+            reason=args.reason,
+        )
+        result["projection_revision"] = (
+            commit_projection_write(conn)
+            if result["changed"]
+            else projection_state_data(conn)["dirty_revision"]
+        )
+    result["message"] = (
+        "Точная обязанность повторного обращения отменена пользователем; "
+        "даты очищены без изменения жизненного цикла."
+        if result["changed"]
+        else "Идентичная пользовательская отмена уже сохранена."
+    )
+    _daily_run_mutation_result(args, result)
+
+
+def resolve_due_followup_from_reverified_inbound_command(
+    args: argparse.Namespace,
+) -> None:
+    manifest = _load_workspace_json(
+        args.manifest, label="Манифест повторной проверки входящего"
+    )
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        run_id, _ = _require_exact_durable_lease(conn, args)
+        result = resolve_due_followup_from_reverified_inbound_work(
+            conn,
+            SETTINGS,
+            run_id=run_id,
+            item_key=clean_cell(args.item_key),
+            interaction_id=int(args.interaction_id),
+            observed_at=args.observed_at,
+            channel=clean_cell(args.channel),
+            conversation_target=clean_cell(args.conversation_target),
+            remote_evidence_reference=clean_cell(args.remote_evidence_reference),
+            manifest=manifest,
+        )
+        result["projection_revision"] = (
+            commit_projection_write(conn)
+            if result["changed"]
+            else projection_state_data(conn)["dirty_revision"]
+        )
+    result["message"] = (
+        "Frozen follow-up разрешён свежей повторной проверкой исходного "
+        "человеческого входящего; исходная дата взаимодействия сохранена."
+        if result["changed"]
+        else "Идентичное evidence-backed разрешение уже сохранено."
+    )
+    _daily_run_mutation_result(args, result)
+
+
+def refresh_daily_run_plan_command(args: argparse.Namespace) -> None:
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        run_id, _ = _require_exact_durable_lease(conn, args)
+        reclassification = None
+        if bool(args.reclassify_legacy_external_actions):
+            reclassification = reclassify_legacy_external_action_work(
+                conn, run_id=run_id, reason=args.reason
+            )
+        result = refresh_durable_daily_run_plan(
+            conn, SETTINGS, run_id=run_id, reason=args.reason
+        )
+        if reclassification is not None:
+            result["legacy_external_action_reclassification"] = reclassification
+        result["projection_revision"] = commit_projection_write(conn)
+    result["run_id"] = run_id
+    result["message"] = "Снимок плана обновлён; прежние обязательные элементы не удалены молча."
+    _daily_run_mutation_result(args, result)
+
+
+def finalize_daily_run_command(args: argparse.Namespace) -> None:
+    token = clean_cell(getattr(args, "run_lease", ""))
+    if not token:
+        raise ValueError("Для finalize-daily-run требуется точный --run-lease.")
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        existing = conn.execute(
+            "SELECT * FROM daily_run_leases WHERE token = ?", (token,)
+        ).fetchone()
+        durable = (
+            get_durable_daily_run(conn, str(existing["run_id"]))
+            if existing is not None
+            else None
+        )
+        if existing is not None and existing["status"] == "finalized":
+            state = projection_state_data(conn)
+            result = {
+                "run_id": existing["run_id"],
+                "run_lease": token,
+                "already_finalized": True,
+                "projection_state": state,
+            }
+            print(json.dumps(result, ensure_ascii=False, indent=2)) if args.json else print(
+                f"Ежедневный запуск {existing['run_id']} уже финализирован; повторный render не выполнен."
+            )
+            return
+        if durable is not None and durable["status"] == "completed":
+            state = projection_state_data(conn)
+            result = {
+                "run_id": durable["run_id"],
+                "run_lease": token,
+                "already_finalized": True,
+                "projection_state": state,
+            }
+            print(json.dumps(result, ensure_ascii=False, indent=2)) if args.json else print(
+                f"Ежедневный запуск {durable['run_id']} уже завершён; повторный render не выполнен."
+            )
+            return
+        active = require_daily_run_lease(conn, token, heartbeat=True)
+        if active is None:
+            raise RuntimeError("Активный ежедневный запуск для finalize не найден.")
+        run_id = str(active["run_id"])
+        durable = get_durable_daily_run(conn, run_id)
+        if durable is None:
+            raise RuntimeError(
+                "У `lease` нет долговечного плана выполнения. Возобновите запуск через begin-daily-run."
+            )
+        if durable["status"] == "completed":
+            state = projection_state_data(conn)
+            result = {
+                "run_id": run_id,
+                "run_lease": token,
+                "already_finalized": True,
+                "projection_state": state,
+            }
+            print(json.dumps(result, ensure_ascii=False, indent=2)) if args.json else print(
+                f"Ежедневный запуск {run_id} уже завершён; повторный render не выполнен."
+            )
+            return
+        projection = projection_state_data(conn)
+        render_required = not final_render_already_published(
+            conn, run_id=run_id, projection_state=projection
+        )
+        readiness_changes_before = conn.total_changes
+        readiness = daily_run_closeout_readiness(
+            conn, SETTINGS, run_id=run_id, mutate_dynamic=True
+        )
+        readiness_mutated = conn.total_changes > readiness_changes_before
+        if not readiness["ready"]:
+            current_run = get_durable_daily_run(conn, run_id)
+            if current_run is not None and current_run["status"] == "finalizing":
+                blocker_states = {
+                    str(row[0])
+                    for row in conn.execute(
+                        """
+                        SELECT state FROM daily_run_work_items
+                        WHERE run_id = ? AND required = 1
+                        UNION ALL
+                        SELECT state FROM daily_run_steps step
+                        WHERE run_id = ? AND required = 1
+                          AND NOT EXISTS (
+                              SELECT 1 FROM daily_run_work_items item
+                              WHERE item.run_id = step.run_id
+                                AND item.step_key = step.step_key
+                          )
+                        """,
+                        (run_id, run_id),
+                    ).fetchall()
+                }
+                reopened_status = (
+                    "needs_verification"
+                    if "needs_verification" in blocker_states
+                    else "blocked"
+                    if "blocked" in blocker_states
+                    else "running"
+                )
+                conn.execute(
+                    """
+                    UPDATE daily_runs SET status = ?, projection_revision_finalizing = NULL,
+                        updated_at = ? WHERE run_id = ?
+                    """,
+                    (reopened_status, now_iso(), run_id),
+                )
+                append_daily_run_transition(
+                    conn,
+                    run_id=run_id,
+                    entity_type="run",
+                    entity_key=run_id,
+                    event_type="finalization_reopened",
+                    from_state="finalizing",
+                    to_state=reopened_status,
+                    reason="closeout_precondition_changed",
+                    details={"issues": readiness["issues"][:20]},
+                )
+                readiness_mutated = True
+            if readiness_mutated:
+                commit_projection_write(conn)
+            else:
+                conn.commit()
+            preview = readiness["issues"][:20]
+            extra = len(readiness["issues"]) - len(preview)
+            suffix = f"; ещё ошибок: {extra}" if extra > 0 else ""
+            raise RuntimeError(
+                "Ежедневный запуск не готов к закрытию: " + "; ".join(preview) + suffix
+            )
+        durable = get_durable_daily_run(conn, run_id)
+        assert durable is not None
+        recovered_generation = ""
+        if durable["status"] == "finalizing" and readiness_mutated:
+            next_revision = int(projection_state_data(conn)["dirty_revision"]) + 1
+            conn.execute(
+                """
+                UPDATE daily_runs SET projection_revision_finalizing = ?, updated_at = ?
+                WHERE run_id = ?
+                """,
+                (next_revision, now_iso(), run_id),
+            )
+            append_daily_run_transition(
+                conn,
+                run_id=run_id,
+                entity_type="run",
+                entity_key=run_id,
+                event_type="finalization_revision_advanced",
+                from_state="finalizing",
+                to_state="finalizing",
+                reason="durable_work_changed_during_finalization",
+                details={"projection_revision_finalizing": next_revision},
+            )
+            committed_revision = commit_projection_write(conn)
+            if committed_revision != next_revision:
+                raise RuntimeError("Не удалось обновить ревизию finalizing после долговечного изменения.")
+            render_required = True
+            durable = get_durable_daily_run(conn, run_id)
+            assert durable is not None
+        elif durable["status"] == "finalizing" and render_required:
+            recovered_generation = recover_published_finalizing_projection(
+                conn, run_id=run_id
+            )
+            if recovered_generation:
+                conn.commit()
+                render_required = False
+        if durable["status"] != "finalizing":
+            next_revision = int(projection_state_data(conn)["dirty_revision"]) + 1
+            enter_daily_run_finalizing(
+                conn, run_id=run_id, dirty_revision=next_revision
+            )
+            committed_revision = commit_projection_write(conn)
+            if committed_revision != next_revision:
+                raise RuntimeError("Не удалось зафиксировать детерминированную ревизию finalizing.")
+            render_required = True
+        else:
+            conn.commit()
+
+    snapshot: dict[str, Any] | None = None
+    if render_required:
+        snapshot = render_outputs(
+            args.db,
+            lock_timeout=command_lock_timeout(args),
+            writer_locked=True,
+            allowed_run_lease=token,
+        )
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        # The outer writer lock has been held continuously since the lease was
+        # validated and heartbeated.  A long render may pass expires_at, but no
+        # competing process can expire or replace this lease before this
+        # successful publication is recorded.
+        active = conn.execute(
+            "SELECT * FROM daily_run_leases WHERE token = ? AND status = 'active'",
+            (token,),
+        ).fetchone()
+        if active is None:
+            raise RuntimeError("`Lease` ежедневного запуска исчез до фиксации finalize.")
+        released_at = now_iso()
+        state = projection_state_data(conn)
+        if state["dirty"]:
+            raise RuntimeError("Финальная атомарная проекция не опубликована.")
+        mark_daily_run_completed(
+            conn,
+            run_id=str(active["run_id"]),
+            lease_token=token,
+            projection_revision=int(state["rendered_revision"]),
+        )
+        conn.execute(
+            """
+            UPDATE daily_run_leases
+            SET status = 'finalized', released_at = ?,
+                release_reason = 'successful_final_render'
+            WHERE token = ? AND status = 'active'
+            """,
+            (released_at, token),
+        )
+        conn.commit()
+        state = projection_state_data(conn)
+        status = durable_daily_run_status(
+            conn,
+            SETTINGS,
+            run_id=str(active["run_id"]),
+            projection_state=state,
+            verbose=False,
+        )
+    result = {
+        "run_id": active["run_id"],
+        "run_lease": token,
+        "finalized_at": released_at,
+        "already_finalized": False,
+        "render_performed": render_required,
+        "recovered_generation": recovered_generation,
+        "kpis": snapshot["kpis"] if snapshot is not None else {},
+        "closeout_counts": status["counts"] if status else {},
+        "projection_state": state,
+    }
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        if snapshot is not None:
+            print_render_summary(
+                f"Ежедневный запуск {active['run_id']} финализирован одним полным render.",
+                args.db,
+                snapshot,
+            )
+        else:
+            print(
+                f"Ежедневный запуск {active['run_id']} завершён по уже опубликованной ревизии finalizing; "
+                "повторный render не выполнен."
+            )
+
+
+def _workspace_json_path(path: Path, *, label: str) -> Path:
+    candidate = path if path.is_absolute() else ROOT / path
+    resolved = candidate.resolve()
+    try:
+        resolved.relative_to(ROOT.resolve())
+    except ValueError as exc:
+        raise ValueError(f"{label} должен находиться внутри выбранной рабочей области.") from exc
+    if not resolved.is_file():
+        raise FileNotFoundError(f"{label} не найден: {resolved}")
+    return resolved
+
+
+def _load_workspace_json(path: Path, *, label: str) -> Any:
+    resolved = _workspace_json_path(path, label=label)
+    return json.loads(resolved.read_text(encoding="utf-8"))
+
+
+def hh_browser_adapter_command(args: argparse.Namespace) -> None:
+    path = CODE_ROOT / "scripts" / "hh_browser_adapter.js"
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    result = {
+        "adapter_version": _hh_acquisition_api().ADAPTER_VERSION,
+        "path": str(path),
+        "sha256": digest,
+        "read_only": True,
+        "execution_contract": "returned_adapter_object_v1",
+        "requires_global_installation": False,
+        "normal_browser": "authenticated_codex_in_app_browser",
+        "invocation": (
+            "Evaluate the exact source as one expression, retain the returned "
+            "adapter object locally, then call captureListPage, "
+            "capturePersonalRecommendations, or captureVacancyDetail."
+        ),
+        "capture_contracts": [
+            _hh_acquisition_api().PAGE_CAPTURE_KIND,
+            _hh_acquisition_api().DETAIL_CAPTURE_KIND,
+        ],
+    }
+    if args.print_source:
+        print(path.read_text(encoding="utf-8"))
+    elif args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print(f"DOM-адаптер HH только для чтения {_hh_acquisition_api().ADAPTER_VERSION}: {path}")
+        print(f"  SHA-256: {digest}")
+        print("  Выполнение: expression возвращает adapter object; globalThis не изменяется.")
+
+
+def validate_hh_capture_command(args: argparse.Namespace) -> None:
+    payload = _load_workspace_json(args.capture, label="JSON-снимок")
+    api = _hh_acquisition_api()
+    if args.detail:
+        normalized = api.validate_detail_capture(payload)
+        result: dict[str, Any] = {
+            "ok": True,
+            "capture_contract": normalized["capture_contract"],
+            "adapter_version": normalized["adapter_version"],
+            "external_id": normalized["external_id"],
+            "capture_hash": normalized["capture_hash"],
+            "field_names": sorted(normalized["fields"]),
+        }
+    else:
+        normalized = api.validate_page_capture(payload, SETTINGS)
+        result = {
+            "ok": True,
+            "capture_contract": normalized["capture_contract"],
+            "adapter_version": normalized["adapter_version"],
+            "source_kind": normalized["source_kind"],
+            "page_index": normalized["page_index"],
+            "stable": normalized["stable"],
+            "capture_hash": normalized["capture_hash"],
+            "canonical_id_set_hash": normalized["canonical_id_set_hash"],
+            "raw_card_count": normalized["raw_card_count"],
+            "canonical_unique_count": normalized["canonical_unique_count"],
+            "requires_count_drift_recapture": normalized[
+                "requires_count_drift_recapture"
+            ],
+            "warnings": normalized["warnings"],
+            "blockers": normalized["blockers"],
+        }
+    if args.verbose:
+        result["normalized_capture"] = normalized
+    print(json.dumps(result, ensure_ascii=False, indent=2)) if args.json else print(
+        "Снимок DOM прошёл структурную проверку."
+    )
+
+
+def plan_hh_acquisition_command(args: argparse.Namespace) -> None:
+    if bool(args.query_json) == bool(args.query_fingerprint):
+        raise ValueError("Укажите ровно одно: --query-json или --query-fingerprint.")
+    api = _hh_acquisition_api()
+    query_fingerprint = clean_cell(args.query_fingerprint).lower()
+    if args.query_json:
+        query_payload = _load_workspace_json(args.query_json, label="JSON-план запроса")
+        query_fingerprint = api.query_fingerprint_from_payload(query_payload)
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        run_id, _ = _require_exact_durable_lease(conn, args)
+        before = conn.total_changes
+        result = api.build_acquisition_plan(
+            conn,
+            SETTINGS,
+            run_id=run_id,
+            stream_key=args.stream_key,
+            source_kind=args.source_kind,
+            query_fingerprint=query_fingerprint,
+        )
+        changed = conn.total_changes > before
+        revision = (
+            commit_projection_write(conn)
+            if changed
+            else projection_state_data(conn)["dirty_revision"]
+        )
+    result["projection_revision"] = revision
+    result["message"] = (
+        f"План сбора HH сохранён: режим={result['acquisition_mode']}, "
+        f"следующая страница={result['next_page']}."
+    )
+    _daily_run_mutation_result(args, result)
+
+
+def _p2_checkpoint_or_block(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    stream_key: str,
+    result: Mapping[str, Any],
+) -> dict[str, Any]:
+    api = _hh_acquisition_api()
+    stream = conn.execute(
+        "SELECT source_kind FROM hh_stream_runs WHERE run_id = ? AND source = 'hh' AND stream_key = ?",
+        (run_id, stream_key),
+    ).fetchone()
+    if stream is None:
+        raise RuntimeError("Состояние потока P2 не найдено после записи снимка DOM.")
+    target = api.p1_target(
+        conn,
+        run_id=run_id,
+        stream_key=stream_key,
+        source_kind=str(stream["source_kind"]),
+    )
+    changed = False
+    if not bool(result.get("idempotent")):
+        manifest = api.build_p1_checkpoint_manifest(
+            conn,
+            SETTINGS,
+            run_id=run_id,
+            stream_key=stream_key,
+        )
+        changed = checkpoint_daily_run_work(
+            conn,
+            SETTINGS,
+            run_id=run_id,
+            step_key=target["step_key"],
+            item_key=target["item_key"],
+            manifest=manifest,
+        )
+    current = conn.execute(
+        "SELECT state, blocker_code, blocker_reason FROM hh_stream_runs WHERE run_id = ? AND source = 'hh' AND stream_key = ?",
+        (run_id, stream_key),
+    ).fetchone()
+    if current is not None and current["state"] == "blocked":
+        changed = block_daily_run_work(
+            conn,
+            run_id=run_id,
+            step_key=target["step_key"],
+            item_key=target["item_key"],
+            code=str(current["blocker_code"] or "hh_capture_blocked"),
+            reason=str(current["blocker_reason"] or "Снимок HH заблокирован."),
+            retryable=True,
+        ) or changed
+    return {"target": target, "changed": changed}
+
+
+def record_hh_page_command(args: argparse.Namespace) -> None:
+    payload = _load_workspace_json(args.capture, label="JSON-снимок")
+    failure: str | None = None
+    result: dict[str, Any]
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        run_id, _ = _require_exact_durable_lease(conn, args)
+        try:
+            result = _hh_acquisition_api().record_page_capture(
+                conn,
+                SETTINGS,
+                run_id=run_id,
+                stream_key=args.stream_key,
+                payload=payload,
+            )
+            integration = _p2_checkpoint_or_block(
+                conn,
+                run_id=run_id,
+                stream_key=args.stream_key,
+                result=result,
+            )
+            if args.verbose:
+                result["complete_reconciliation"] = [
+                    dict(row)
+                    for row in conn.execute(
+                        """
+                        SELECT page_index, ordinal, external_id, vacancy_id,
+                               base_classification, classification
+                        FROM hh_page_items
+                        WHERE run_id = ? AND source = 'hh' AND stream_key = ?
+                        ORDER BY page_index, ordinal
+                        """,
+                        (run_id, args.stream_key),
+                    ).fetchall()
+                ]
+        except (ValueError, RuntimeError) as exc:
+            failure = str(exc)
+            target = _hh_acquisition_api().record_validation_failure(
+                conn,
+                run_id=run_id,
+                stream_key=args.stream_key,
+                code="capture_validation_failed",
+                reason=failure,
+            )
+            block_daily_run_work(
+                conn,
+                run_id=run_id,
+                step_key=target["step_key"],
+                item_key=target["item_key"],
+                code="capture_validation_failed",
+                reason=failure,
+                retryable=True,
+            )
+            result = {
+                "run_id": run_id,
+                "stream_key": args.stream_key,
+                "ok": False,
+                "blocker": {"code": "capture_validation_failed", "reason": failure},
+            }
+            integration = {"target": target, "changed": True}
+        revision = (
+            commit_projection_write(conn)
+            if not bool(result.get("idempotent")) or bool(integration.get("changed"))
+            else projection_state_data(conn)["dirty_revision"]
+        )
+    result["p1_integration"] = integration
+    result["projection_revision"] = revision
+    result["message"] = (
+        "Снимок страницы HH записан; идентификаторы сверены программно."
+        if failure is None
+        else "Снимок HH заблокирован из-за проверяемой ошибки."
+    )
+    _daily_run_mutation_result(args, result)
+    if failure is not None:
+        raise RuntimeError(failure)
+
+
+def record_hh_detail_command(args: argparse.Namespace) -> None:
+    payload = _load_workspace_json(args.capture, label="JSON-снимок вакансии")
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        run_id, _ = _require_exact_durable_lease(conn, args)
+        result = _hh_acquisition_api().record_detail_capture(
+            conn,
+            SETTINGS,
+            run_id=run_id,
+            stream_key=args.stream_key,
+            payload=payload,
+        )
+        integration = _p2_checkpoint_or_block(
+            conn,
+            run_id=run_id,
+            stream_key=args.stream_key,
+            result=result,
+        )
+        revision = (
+            commit_projection_write(conn)
+            if not bool(result.get("idempotent")) or bool(integration.get("changed"))
+            else projection_state_data(conn)["dirty_revision"]
+        )
+    result["p1_integration"] = integration
+    result["projection_revision"] = revision
+    result["message"] = "Снимок вакансии сохранён как доказательство из видимой страницы."
+    _daily_run_mutation_result(args, result)
+
+
+def _finalize_hh_acquisition(args: argparse.Namespace, *, personal: bool) -> None:
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        run_id, _ = _require_exact_durable_lease(conn, args)
+        stream = conn.execute(
+            "SELECT source_kind FROM hh_stream_runs WHERE run_id = ? AND source = 'hh' AND stream_key = ?",
+            (run_id, args.stream_key),
+        ).fetchone()
+        if stream is None:
+            raise ValueError("Поток сбора HH не найден.")
+        expected = "personal_recommendations" if personal else "ordinary_search"
+        if str(stream["source_kind"]) != expected:
+            raise ValueError("Команда завершения не соответствует виду источника потока.")
+        result = _hh_acquisition_api().finalize_stream(
+            conn,
+            SETTINGS,
+            run_id=run_id,
+            stream_key=args.stream_key,
+        )
+        target = _hh_acquisition_api().p1_target(
+            conn,
+            run_id=run_id,
+            stream_key=args.stream_key,
+            source_kind=expected,
+        )
+        if result.get("audit_failure"):
+            changed = block_daily_run_work(
+                conn,
+                run_id=run_id,
+                step_key=target["step_key"],
+                item_key=target["item_key"],
+                code=result["blocker"]["code"],
+                reason=result["blocker"]["reason"],
+                retryable=True,
+            )
+        else:
+            changed = complete_daily_run_work(
+                conn,
+                SETTINGS,
+                run_id=run_id,
+                step_key=target["step_key"],
+                item_key=target["item_key"],
+                manifest=result["manifest"],
+            )
+        revision = (
+            commit_projection_write(conn)
+            if not bool(result.get("idempotent")) or bool(changed)
+            else projection_state_data(conn)["dirty_revision"]
+        )
+    result.pop("manifest", None)
+    result["p1_integration"] = {"target": target, "changed": changed}
+    result["projection_revision"] = revision
+    result["message"] = (
+        "Персональные рекомендации завершены по отдельному манифесту v2."
+        if personal and not result.get("audit_failure")
+        else "Поток HH завершён по манифесту v2."
+        if not result.get("audit_failure")
+        else "Расхождение полного аудита заблокировало инкрементальную контрольную точку."
+    )
+    _daily_run_mutation_result(args, result)
+    if result.get("audit_failure"):
+        raise RuntimeError(result["blocker"]["reason"])
+
+
+def finalize_hh_stream_command(args: argparse.Namespace) -> None:
+    _finalize_hh_acquisition(args, personal=False)
+
+
+def finalize_hh_personal_command(args: argparse.Namespace) -> None:
+    _finalize_hh_acquisition(args, personal=True)
+
+
+def next_hh_work_command(args: argparse.Namespace) -> None:
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        result = _hh_acquisition_api().next_acquisition_work(
+            conn,
+            SETTINGS,
+            run_id=args.run_id,
+            stream_key=clean_cell(args.stream_key) or None,
+        )
+    print(json.dumps(result, ensure_ascii=False, indent=2)) if args.json else print(
+        "\n".join(
+            f"{item['stream_key']}: "
+            f"{_safe_action_label(str(item['next_safe_action']['action']))}"
+            for item in result["work"]
+        )
+        or "Активная работа по сбору HH не найдена."
+    )
+
+
+def inspect_hh_checkpoint_command(args: argparse.Namespace) -> None:
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        result = _hh_acquisition_api().inspect_checkpoint_state(
+            conn,
+            stream_key=clean_cell(args.stream_key) or None,
+            run_id=clean_cell(args.run_id) or None,
+            history_limit=args.history_limit,
+        )
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print(
+            f"Контрольные точки HH: {len(result['checkpoints'])}; "
+            f"запуски: {len(result['runs'])}; события: {len(result['events'])}."
+        )
+
+
+def invalidate_hh_zero_evidence_plan_command(args: argparse.Namespace) -> None:
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        run_id, _ = _require_exact_durable_lease(conn, args)
+        result = _hh_acquisition_api().invalidate_zero_evidence_plan(
+            conn,
+            SETTINGS,
+            run_id=run_id,
+            stream_key=args.stream_key,
+            reason=args.reason,
+        )
+        revision = (
+            commit_projection_write(conn)
+            if bool(result.get("changed"))
+            else projection_state_data(conn)["dirty_revision"]
+        )
+    result["projection_revision"] = revision
+    result["message"] = (
+        "Пустой план HH аудируемо инвалидирован; повторите plan-hh-acquisition "
+        "с прежними source-kind и query fingerprint."
+        if result["replan_required"]
+        else "Recovery пустого плана HH уже завершён; текущий план актуален."
+    )
+    _daily_run_mutation_result(args, result)
+
+
+def invalidate_hh_checkpoint_command(args: argparse.Namespace) -> None:
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        run_id, _ = _require_exact_durable_lease(conn, args)
+        result = _hh_acquisition_api().invalidate_checkpoint(
+            conn,
+            run_id=run_id,
+            stream_key=args.stream_key,
+            reason=args.reason,
+        )
+        revision = commit_projection_write(conn)
+    result["projection_revision"] = revision
+    result["message"] = (
+        "Небезопасная контрольная точка HH явно инвалидирована; режим delta запрещён."
+    )
+    _daily_run_mutation_result(args, result)
+
+
 def migrate_schema(args: argparse.Namespace) -> None:
     """Explicitly migrate an existing database with a recoverable backup."""
 
     if not args.db.exists():
-        raise FileNotFoundError(f"Database not found: {args.db}")
+        raise FileNotFoundError(f"База данных не найдена: {args.db}")
     with sqlite3.connect(args.db) as probe:
         current_version = int(probe.execute("PRAGMA user_version").fetchone()[0])
-    if current_version not in {1, 2, 3, SCHEMA_VERSION}:
+    if current_version not in set(range(1, SCHEMA_VERSION + 1)):
         raise RuntimeError(
-            f"Unsupported migration path: {current_version} -> {SCHEMA_VERSION}"
+            f"Неподдерживаемый путь переноса: {current_version} → {SCHEMA_VERSION}."
         )
+
+    # A current-schema migration is still a mutation/repair operation.  Do not
+    # let it run beside a live daily session; older schemas cannot have a v8
+    # lease yet and are guarded by the process-wide writer lock in main().
+    if current_version == SCHEMA_VERSION:
+        with connect_db(args.db) as lease_conn:
+            ensure_schema(lease_conn)
+            active_lease = active_daily_run_lease(lease_conn)
+            lease_conn.commit()
+            if active_lease is not None:
+                raise RuntimeError(
+                    "migrate-schema недоступен во время активного ежедневного запуска: "
+                    f"run_id={active_lease['run_id']}, owner={active_lease['owner']}, "
+                    f"expires_at={active_lease['expires_at']}. Сначала выполните "
+                    "finalize-daily-run или дождитесь истечения lease."
+                )
 
     backup_path: Path | None = None
     if current_version < SCHEMA_VERSION and not args.no_backup:
-        stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         backup_path = args.db.with_name(f"{args.db.name}.bak-schema-v{current_version}-{stamp}")
         with sqlite3.connect(args.db) as source_conn, sqlite3.connect(backup_path) as backup_conn:
             source_conn.backup(backup_conn)
 
     with connect_db(args.db) as conn:
+        preserved_tables: tuple[str, ...] = (
+            "vacancies",
+            "source_hits",
+            "applications",
+            "stage_events",
+            "employer_interactions",
+            "employer_interaction_invalidations",
+            "employer_accounts",
+            "source_checkpoints",
+        )
+        if current_version in {8, 9}:
+            preserved_tables += (
+                "lifecycle_events",
+                "action_events",
+                "followup_rounds",
+                "outreach_messages",
+                "search_runs",
+                "search_coverage",
+                "external_actions",
+                "daily_run_leases",
+                "projection_state",
+                "daily_runs",
+                "daily_run_plan_revisions",
+                "daily_run_steps",
+                "daily_run_step_dependencies",
+                "daily_run_work_items",
+                "daily_run_manifests",
+                "daily_run_transitions",
+            )
+        present_before = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        row_counts_before = {
+            table: int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+            for table in preserved_tables
+            if table in present_before
+        }
         ensure_auxiliary_schema(conn)
         backfilled_aliases = backfill_canonical_external_aliases(conn)
         backfilled_source_streams = backfill_canonical_source_streams(conn)
+        refreshed_source_labels = refresh_source_hit_labels(conn)
+        v6_backfill = (
+            backfill_v6_evidence(conn)
+            if current_version < 6
+            else {
+                "lifecycle_applications": 0,
+                "lifecycle_rejections": 0,
+                "action_events": 0,
+            }
+        )
         if current_version < SCHEMA_VERSION:
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        conn.commit()
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO migration_log (
+                    from_version, to_version, applied_at, backup_path,
+                    row_counts_json, notes
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    current_version,
+                    SCHEMA_VERSION,
+                    now_iso(),
+                    db_label(backup_path) if backup_path else "",
+                    json.dumps(row_counts_before, ensure_ascii=False, sort_keys=True),
+                    (
+                        "Добавлен безопасный инкрементальный контур HH P2 схемы v10; "
+                        "доказательства P0/P1 и опубликованные поколения проекций сохранены "
+                        "без переписывания."
+                        if current_version == 9
+                        else "Добавлены долговечная оркестрация P1 и безопасный контур HH P2; "
+                        "доказательства и опубликованные поколения проекций сохранены "
+                        "без переписывания."
+                        if current_version == 8
+                        else "Консервативный перенос: неизвестные исторические поля не заполнялись; "
+                        "добавлены эффективные состояния, управление проекциями и "
+                        "долговечная оркестрация без автоматических исправлений доказательств."
+                    ),
+                ),
+            )
+        commit_projection_write(conn)
+        quick_check = str(conn.execute("PRAGMA quick_check").fetchone()[0])
+        foreign_key_issues = len(conn.execute("PRAGMA foreign_key_check").fetchall())
+        row_counts_after = {
+            table: int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+            for table in row_counts_before
+        }
+        if quick_check != "ok" or foreign_key_issues:
+            raise RuntimeError(
+                f"После переноса нарушена целостность: quick_check={quick_check}, "
+                f"foreign_key_issues={foreign_key_issues}"
+            )
+        if row_counts_after != row_counts_before:
+            raise RuntimeError(
+                "Перенос изменил число строк, которые должны были сохраниться: "
+                f"до={row_counts_before}, после={row_counts_after}"
+            )
 
-    snapshot = render_outputs(args.db)
+    snapshot = maybe_render_after_write(args)
+    projection = (
+        snapshot["projection_state"]
+        if snapshot is not None
+        else read_projection_state(args.db)
+    )
     result = {
         "from_version": current_version,
         "to_version": SCHEMA_VERSION,
         "backup": db_label(backup_path) if backup_path else "",
         "backfilled_aliases": backfilled_aliases,
         "backfilled_source_streams": backfilled_source_streams,
+        "refreshed_source_labels": refreshed_source_labels,
+        "v6_backfill": v6_backfill,
+        "row_counts_before": row_counts_before,
+        "row_counts_after": row_counts_after,
+        "quick_check": quick_check,
+        "foreign_key_issues": foreign_key_issues,
         "already_current": current_version == SCHEMA_VERSION,
-        "kpis": snapshot["kpis"],
+        "kpis": snapshot["kpis"] if snapshot is not None else None,
+        "render_deferred": snapshot is None,
+        "projection_state": projection,
     }
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
         if current_version == SCHEMA_VERSION:
-            print(f"Database schema is already at version {SCHEMA_VERSION}")
+            print(f"Схема базы уже имеет версию {SCHEMA_VERSION}.")
         else:
-            print(f"Migrated database schema {current_version} -> {SCHEMA_VERSION}")
+            print(f"Схема базы обновлена: {current_version} → {SCHEMA_VERSION}.")
         if backup_path:
-            print(f"  backup: {db_label(backup_path)}")
-        print(f"  canonical aliases backfilled: {backfilled_aliases}")
-        print(f"  canonical source streams backfilled: {backfilled_source_streams}")
+            print(f"  резервная копия: {db_label(backup_path)}")
+        print(f"  восстановлено канонических псевдонимов: {backfilled_aliases}")
+        print(f"  обновлено меток источников: {refreshed_source_labels}")
+        print(f"  перенос доказательств v6: {v6_backfill}")
 
 
 def build_coverage_plan_command(args: argparse.Namespace) -> None:
@@ -4499,7 +10263,7 @@ def build_coverage_plan_command(args: argparse.Namespace) -> None:
         output_path = args.output if args.output.is_absolute() else ROOT / args.output
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(rendered, encoding="utf-8")
-        print(f"Built coverage plan: {display_path(output_path.resolve(), ROOT)}")
+        print(f"План покрытия создан: {display_path(output_path.resolve(), ROOT)}")
     else:
         print(rendered, end="")
 
@@ -4585,15 +10349,218 @@ def persist_coverage_result(
 
 def check_coverage(args: argparse.Namespace) -> None:
     manifest_path = args.file if args.file.is_absolute() else ROOT / args.file
-    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest_bytes = manifest_path.read_bytes()
+    payload = json.loads(manifest_bytes.decode("utf-8"))
+    manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+    manifest_observed_at = dt.datetime.fromtimestamp(
+        manifest_path.stat().st_mtime, tz=dt.timezone.utc
+    ).replace(microsecond=0).isoformat()
     result = validate_coverage_manifest(payload, REQUIRED_SEARCH_STREAMS)
     if result.get("run_date") and result.get("source"):
         with connect_db(args.db) as conn:
             ensure_schema(conn)
-            run_id = persist_coverage_result(conn, result, origin_for(manifest_path))
-            conn.commit()
-        result["search_run_id"] = run_id
-        render_outputs(args.db)
+            manifest_file = origin_for(manifest_path)
+            run_id = persist_coverage_result(conn, result, manifest_file)
+            result["search_run_id"] = run_id
+            active = active_daily_run_lease(conn)
+            if (
+                active is not None
+                and get_durable_daily_run(conn, str(active["run_id"])) is not None
+            ):
+                result["daily_run_integration"] = integrate_coverage_result(
+                    conn,
+                    SETTINGS,
+                    run_id=str(active["run_id"]),
+                    source="hh",
+                    result=result,
+                    manifest_file=manifest_file,
+                    manifest_sha256=manifest_sha256,
+                    observed_at=manifest_observed_at,
+                    source_run_id=run_id,
+                )
+            commit_projection_write(conn)
+        maybe_render_after_write(args)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    if not result["ok"]:
+        raise SystemExit(1)
+
+
+def load_source_checkpoints(
+    conn: sqlite3.Connection, source: str
+) -> dict[str, dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT source, stream_key, cursor_value, cursor_date, initialized_at,
+               last_completed_run_date, last_manifest_file, updated_at
+        FROM source_checkpoints
+        WHERE source = ?
+        ORDER BY stream_key COLLATE NOCASE
+        """,
+        (source,),
+    ).fetchall()
+    return {str(row["stream_key"]): dict(row) for row in rows}
+
+
+def load_telegram_vacancy_evidence(
+    conn: sqlite3.Connection,
+) -> dict[str, dict[str, Any]]:
+    evidence: dict[str, dict[str, Any]] = {}
+    rows = conn.execute(
+        """
+        SELECT a.external_id, a.url, a.vacancy_id, v.score, sh.source_stream
+        FROM vacancy_external_aliases a
+        JOIN vacancies v ON v.id = a.vacancy_id
+        LEFT JOIN source_hits sh ON sh.vacancy_id = a.vacancy_id
+        WHERE a.channel = 'telegram'
+        ORDER BY a.external_id, sh.id
+        """
+    ).fetchall()
+    for row in rows:
+        external_id = str(row["external_id"])
+        item = evidence.setdefault(
+            external_id,
+            {
+                "vacancy_id": int(row["vacancy_id"]),
+                "url": row["url"] or "",
+                "score": row["score"],
+                "source_streams": set(),
+            },
+        )
+        if row["source_stream"]:
+            item["source_streams"].add(str(row["source_stream"]))
+    return evidence
+
+
+def persist_source_checkpoints(
+    conn: sqlite3.Connection,
+    result: dict[str, Any],
+    manifest_file: str,
+) -> None:
+    if not result["ok"]:
+        raise ValueError("Контрольные точки источника можно сдвигать только после полного покрытия.")
+    now = now_iso()
+    for stream in result["streams"]:
+        checkpoint = stream.get("checkpoint") or {}
+        conn.execute(
+            """
+            INSERT INTO source_checkpoints (
+                source, stream_key, cursor_value, cursor_date, initialized_at,
+                last_completed_run_date, last_manifest_file, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(source, stream_key) DO UPDATE SET
+                cursor_value = excluded.cursor_value,
+                cursor_date = excluded.cursor_date,
+                last_completed_run_date = excluded.last_completed_run_date,
+                last_manifest_file = excluded.last_manifest_file,
+                updated_at = excluded.updated_at
+            """,
+            (
+                result["source"],
+                stream["key"],
+                clean_cell(str(checkpoint.get("cursor_value") or "")),
+                clean_cell(str(checkpoint.get("cursor_date") or "")),
+                now,
+                result["run_date"],
+                manifest_file,
+                now,
+                now,
+            ),
+        )
+
+
+def build_telegram_plan_command(args: argparse.Namespace) -> None:
+    if not TELEGRAM_ENABLED:
+        raise RuntimeError(
+            "Поиск в Telegram выключен; сначала включите раздел [telegram] в локальных настройках."
+        )
+    run_date = args.run_date or dt.date.today().isoformat()
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        checkpoints = load_source_checkpoints(conn, "telegram")
+    plan = build_telegram_plan(
+        run_date,
+        TELEGRAM_CHANNELS,
+        initial_lookback_days=TELEGRAM_INITIAL_LOOKBACK_DAYS,
+        checkpoints=checkpoints,
+    )
+    output_path = args.output or ROOT / "tmp" / f"telegram_coverage_{run_date}.json"
+    if not output_path.is_absolute():
+        output_path = ROOT / output_path
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        json.dumps(plan, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "output": display_path(output_path.resolve(), ROOT),
+                    "plan": plan,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    else:
+        backfills = sum(
+            stream["query"]["mode"] == "backfill" for stream in plan["streams"]
+        )
+        print(f"План покрытия Telegram создан: {display_path(output_path.resolve(), ROOT)}")
+        print(
+            f"  каналов: {len(plan['streams'])}; первичных загрузок: {backfills}; "
+            f"добавочных проходов: {len(plan['streams']) - backfills}"
+        )
+
+
+def check_telegram_coverage(args: argparse.Namespace) -> None:
+    if not TELEGRAM_ENABLED:
+        raise RuntimeError(
+            "Поиск в Telegram выключен; сначала включите раздел [telegram] в локальных настройках."
+        )
+    manifest_path = args.file if args.file.is_absolute() else ROOT / args.file
+    manifest_bytes = manifest_path.read_bytes()
+    payload = json.loads(manifest_bytes.decode("utf-8"))
+    manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+    manifest_observed_at = dt.datetime.fromtimestamp(
+        manifest_path.stat().st_mtime, tz=dt.timezone.utc
+    ).replace(microsecond=0).isoformat()
+    manifest_file = origin_for(manifest_path)
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        checkpoints = load_source_checkpoints(conn, "telegram")
+        vacancy_evidence = load_telegram_vacancy_evidence(conn)
+        result = validate_telegram_manifest(
+            payload,
+            TELEGRAM_CHANNELS,
+            initial_lookback_days=TELEGRAM_INITIAL_LOOKBACK_DAYS,
+            checkpoints=checkpoints,
+            vacancy_evidence=vacancy_evidence,
+        )
+        if result.get("run_date") and result.get("source"):
+            run_id = persist_coverage_result(conn, result, manifest_file)
+            result["search_run_id"] = run_id
+            if result["ok"]:
+                persist_source_checkpoints(conn, result, manifest_file)
+            active = active_daily_run_lease(conn)
+            if (
+                active is not None
+                and get_durable_daily_run(conn, str(active["run_id"])) is not None
+            ):
+                result["daily_run_integration"] = integrate_coverage_result(
+                    conn,
+                    SETTINGS,
+                    run_id=str(active["run_id"]),
+                    source="telegram",
+                    result=result,
+                    manifest_file=manifest_file,
+                    manifest_sha256=manifest_sha256,
+                    observed_at=manifest_observed_at,
+                    source_run_id=run_id,
+                )
+            commit_projection_write(conn)
+    if result.get("search_run_id"):
+        maybe_render_after_write(args)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     if not result["ok"]:
         raise SystemExit(1)
@@ -4616,7 +10583,7 @@ def migrate_stages(args: argparse.Namespace) -> None:
         stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
         backup_path = args.db.with_name(f"{args.db.name}.bak-{stamp}")
         shutil.copy2(args.db, backup_path)
-        print(f"Backup: {db_label(backup_path)}")
+        print(f"Резервная копия: {db_label(backup_path)}")
 
     with connect_db(args.db) as conn:
         ensure_schema(conn)
@@ -4653,26 +10620,42 @@ def migrate_stages(args: argparse.Namespace) -> None:
             (now_iso(),),
         ).rowcount
 
-        conn.commit()
+        commit_projection_write(conn)
 
-    snapshot = render_outputs(args.db)
-    print("Migrated stages to compact funnel model")
-    print(f"  changed stage values: {changed}")
-    print(f"  follow-up application rows: {followup_applications}")
-    print(f"  follow-up vacancies: {followup_vacancies}")
-    print(f"  kpis: {snapshot['kpis']}")
+    snapshot = maybe_render_after_write(args)
+    print("Старые этапы перенесены в совместимую компактную воронку.")
+    print(f"  изменённые значения: {changed}")
+    print(f"  строки повторных обращений: {followup_applications}")
+    print(f"  вакансии с повторным обращением: {followup_vacancies}")
+    if snapshot is None:
+        print("  render отложен; проекции помечены dirty")
+    else:
+        print(f"  показатели: {snapshot['kpis']}")
 
 
 def ingest_json(args: argparse.Namespace) -> None:
     payload = json.loads(args.file.read_text(encoding="utf-8"))
     items = payload_items(payload)
     if not items:
-        raise SystemExit("Expected a JSON array or an object with vacancies/items/jobs/data array")
+        raise SystemExit("Ожидался массив JSON либо объект с массивом vacancies, items, jobs или data.")
     origin_file = origin_for(args.file)
     with connect_db(args.db) as conn:
         ensure_schema(conn)
-        count = 0
+        stats = {"ingested": 0, "quarantined": 0}
         for line_no, item in enumerate(items, start=1):
+            if not isinstance(item, dict):
+                store_quarantine_record(
+                    conn,
+                    item=item,
+                    origin_file=origin_file,
+                    line_no=line_no,
+                    source_name=args.channel or "unknown",
+                    source_stream=args.source or "unknown",
+                    classification="malformed",
+                    evidence_note="Элемент JSON не является объектом вакансии.",
+                )
+                stats["quarantined"] += 1
+                continue
             if ingest_item(
                 conn,
                 item,
@@ -4680,23 +10663,46 @@ def ingest_json(args: argparse.Namespace) -> None:
                 default_source=args.source or "",
                 origin_file=origin_file,
                 line_no=line_no,
+                ingestion_stats=stats,
             ):
-                count += 1
-        conn.commit()
-    snapshot = render_outputs(args.db)
-    print(
-        f"Ingested {count} vacancy rows into SQLite and regenerated "
-        f"{display_path(DASHBOARD_PATH, ROOT)}"
-    )
+                pass
+        commit_projection_write(conn)
+    snapshot = maybe_render_after_write(args)
     if args.json:
-        print(json.dumps({"ingested": count, "kpis": snapshot["kpis"]}, ensure_ascii=False, indent=2))
+        print(
+            json.dumps(
+                {
+                    "ingested": stats["ingested"],
+                    "quarantined": stats["quarantined"],
+                    "kpis": snapshot["kpis"] if snapshot is not None else None,
+                    "render_deferred": snapshot is None,
+                    "projection_state": (
+                        snapshot["projection_state"]
+                        if snapshot is not None
+                        else read_projection_state(args.db)
+                    ),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    else:
+        print(
+            f"В SQLite добавлено вакансий: {stats['ingested']}; "
+            f"помещено в карантин: {stats['quarantined']}. "
+            + (
+                "Render отложен; запись SQLite сохранена, проекции имеют состояние dirty."
+                if snapshot is None
+                else f"Обновлён файл {display_path(DASHBOARD_PATH, ROOT)}."
+            )
+        )
 
 
 def ingest_gmail_json(args: argparse.Namespace) -> None:
     payload = json.loads(args.file.read_text(encoding="utf-8"))
     items = payload_items(payload)
     if not items:
-        raise SystemExit("Expected a JSON array or an object with a vacancies array")
+        raise SystemExit("Ожидался массив JSON либо объект с массивом vacancies.")
     origin_file = origin_for(args.file)
     provider_defaults = {
         "hh": {
@@ -4715,8 +10721,21 @@ def ingest_gmail_json(args: argparse.Namespace) -> None:
     defaults = provider_defaults[args.provider]
     with connect_db(args.db) as conn:
         ensure_schema(conn)
-        count = 0
+        stats = {"ingested": 0, "quarantined": 0}
         for line_no, item in enumerate(items, start=1):
+            if not isinstance(item, dict):
+                store_quarantine_record(
+                    conn,
+                    item=item,
+                    origin_file=origin_file,
+                    line_no=line_no,
+                    source_name=defaults["channel"],
+                    source_stream=defaults["source"],
+                    classification="malformed",
+                    evidence_note="Элемент почтового импорта не является объектом вакансии.",
+                )
+                stats["quarantined"] += 1
+                continue
             item = dict(item)
             item.setdefault("channel", defaults["channel"])
             item.setdefault("source", defaults["source"])
@@ -4729,31 +10748,40 @@ def ingest_gmail_json(args: argparse.Namespace) -> None:
                 default_source=defaults["source"],
                 origin_file=origin_file,
                 line_no=line_no,
+                ingestion_stats=stats,
             ):
-                count += 1
-        conn.commit()
-    snapshot = render_outputs(args.db)
-    print(
-        f"Ingested {count} {defaults['label']} rows and regenerated "
-        f"{display_path(DASHBOARD_PATH, ROOT)}"
-    )
+                pass
+        commit_projection_write(conn)
+    snapshot = maybe_render_after_write(args)
     if args.json:
         print(
             json.dumps(
                 {
-                    "ingested": count,
+                    "ingested": stats["ingested"],
+                    "quarantined": stats["quarantined"],
                     "provider": args.provider,
-                    "kpis": snapshot["kpis"],
+                    "kpis": snapshot["kpis"] if snapshot is not None else None,
+                    "render_deferred": snapshot is None,
+                    "projection_state": (
+                        snapshot["projection_state"]
+                        if snapshot is not None
+                        else read_projection_state(args.db)
+                    ),
                 },
                 ensure_ascii=False,
                 indent=2,
             )
         )
+    else:
+        print(
+            f"Из почтового источника добавлено вакансий: {stats['ingested']}; "
+            f"в карантине: {stats['quarantined']}."
+        )
 
 
 def update_vacancy(args: argparse.Namespace) -> None:
     if args.id is None and not args.url and not args.external_id:
-        raise SystemExit("Use --id, --url, or --external-id to identify the vacancy")
+        raise SystemExit("Укажите вакансию через --id, --url или --external-id.")
     status = args.status or args.stage or "UPDATED"
     stage = args.stage or detect_stage(status)
     date = args.date or dt.date.today().isoformat()
@@ -4762,7 +10790,7 @@ def update_vacancy(args: argparse.Namespace) -> None:
         ensure_schema(conn)
         row = resolve_vacancy_row(conn, args, required=False)
         if not row and not (args.title or norm_url):
-            raise SystemExit("Vacancy not found. Provide --title/--company with --url to create it.")
+            raise SystemExit("Вакансия не найдена. Для создания укажите --title или --company вместе с --url.")
 
         if row:
             vacancy_id = int(row["id"])
@@ -4885,16 +10913,51 @@ def update_vacancy(args: argparse.Namespace) -> None:
             "cli:update-vacancy",
             0,
         )
-        conn.commit()
-    render_outputs(args.db)
+        action_state, action_bucket, action_due, action_priority = action_from_legacy_row(
+            {
+                "latest_stage": stage,
+                "latest_status": status,
+                "next_action": args.next_action or "",
+                "open_questions": args.open_questions or "",
+                "follow_up_date": args.follow_up_date or "",
+                "score": args.score,
+            }  # type: ignore[arg-type]
+        )
+        append_action_event(
+            conn,
+            vacancy_id=vacancy_id,
+            action_state=action_state,
+            bucket=action_bucket,
+            event_at=date,
+            due_date=action_due,
+            priority=action_priority,
+            reason=args.next_action or args.open_questions or args.reason or "",
+            evidence_note=args.note,
+            source="cli:update-vacancy",
+        )
+        if stage in {"rejected", "offer"} and clean_cell(args.note):
+            append_lifecycle_event(
+                conn,
+                vacancy_id=vacancy_id,
+                event_type="rejected" if stage == "rejected" else "offer_received",
+                event_at=date,
+                evidence_at=now_iso(),
+                evidence_note=args.note,
+                evidence_source="manual_update",
+                origin="cli:update-vacancy",
+                history_complete=True,
+                authorization_status="not_applicable",
+            )
+        commit_projection_write(conn)
+    maybe_render_after_write(args)
     sync_note = (
-        f"; synced application {synced_application_id}"
+        f"; синхронизирована совместимая запись отклика №{synced_application_id}"
         if synced_application_id is not None
         else ""
     )
     print(
-        f"Updated vacancy {vacancy_id}{sync_note} and regenerated "
-        f"{display_path(DASHBOARD_PATH, ROOT)}"
+        f"Вакансия №{vacancy_id} обновлена{sync_note}. "
+        + projection_write_note(args)
     )
 
 
@@ -4921,8 +10984,8 @@ def resolve_external_id_vacancy_row(
     ).fetchall()
     if len(rows) > 1:
         raise SystemExit(
-            f"External ID {external_id!r} is ambiguous across channels; "
-            "use --id or --url"
+            f"Внешний идентификатор {external_id!r} неоднозначен для разных каналов; "
+            "используйте --id или --url."
         )
     return rows[0] if rows else None
 
@@ -4949,7 +11012,7 @@ def resolve_alias_url_vacancy_row(
         (norm_url,),
     ).fetchall()
     if len(rows) > 1:
-        raise SystemExit(f"Vacancy URL {norm_url!r} is ambiguous; use --id")
+        raise SystemExit(f"Адрес вакансии {norm_url!r} неоднозначен; используйте --id.")
     return rows[0] if rows else None
 
 
@@ -4960,40 +11023,42 @@ def resolve_vacancy_row(
     required: bool = True,
 ) -> sqlite3.Row | None:
     if args.id is None and not args.url and not args.external_id:
-        raise SystemExit("Use --id, --url, or --external-id to identify the vacancy")
+        raise SystemExit("Укажите вакансию через --id, --url или --external-id.")
 
     row = None
     if args.id is not None:
         row = conn.execute("SELECT * FROM vacancies WHERE id = ?", (args.id,)).fetchone()
         if not row:
-            raise SystemExit(f"Vacancy id {args.id} not found")
+            raise SystemExit(f"Вакансия №{args.id} не найдена.")
     if not row and args.external_id:
         row = resolve_external_id_vacancy_row(conn, args.external_id)
     if not row and args.url:
         row = resolve_alias_url_vacancy_row(conn, args.url)
     if not row and required:
-        raise SystemExit("Vacancy not found")
+        raise SystemExit("Вакансия не найдена.")
     return row
 
 
 def validate_optional_external_url(value: str, *, label: str) -> str:
     normalized = normalize_url(value)
     if normalized and not safe_external_url(normalized):
-        raise SystemExit(f"{label} must use http or https")
+        raise SystemExit(f"Адрес {label} должен использовать http или https.")
     return normalized
 
 
 def record_employer_interaction(args: argparse.Namespace) -> None:
     evidence_note = clean_cell(args.evidence_note)
     if args.direction == "inbound" and not evidence_note:
-        raise SystemExit("Inbound employer interactions require --evidence-note")
+        raise SystemExit("Для входящего взаимодействия с работодателем требуется --evidence-note.")
+    if args.direction == "outbound" and not evidence_note:
+        raise SystemExit("Исходящее взаимодействие требует --evidence-note.")
     is_human = args.humanity == "human"
     if args.event_type == "automated_ack" and is_human:
-        raise SystemExit("automated_ack must use --humanity automated")
+        raise SystemExit("Для automated_ack укажите --humanity automated.")
     if args.event_type == "human_reply" and not is_human:
-        raise SystemExit("human_reply must use --humanity human")
+        raise SystemExit("Для human_reply укажите --humanity human.")
     if args.actor_type == "system" and is_human:
-        raise SystemExit("actor type system cannot be marked human")
+        raise SystemExit("Действующее лицо типа system нельзя пометить как human.")
     parsed_at = parse_iso_datetime(args.at or now_iso(), label="--at")
     event_at = parsed_at.isoformat()
     evidence_url = validate_optional_external_url(
@@ -5005,6 +11070,27 @@ def record_employer_interaction(args: argparse.Namespace) -> None:
         ensure_schema(conn)
         vacancy = resolve_vacancy_row(conn, args)
         vacancy_id = int(vacancy["id"])
+        external_action_id: int | None = None
+        if args.direction == "outbound":
+            if not clean_cell(args.external_action_key):
+                raise SystemExit(
+                    "Исходящее взаимодействие требует --external-action-key."
+                )
+            confirmed_action = conn.execute(
+                """
+                SELECT id FROM external_actions
+                WHERE vacancy_id = ? AND action_key = ?
+                  AND action_type IN ('message', 'follow_up')
+                  AND state = 'visibly_confirmed'
+                ORDER BY event_at DESC, id DESC LIMIT 1
+                """,
+                (vacancy_id, clean_cell(args.external_action_key)),
+            ).fetchone()
+            if not confirmed_action:
+                raise SystemExit(
+                    "Нет видимо подтверждённого внешнего действия для исходящего взаимодействия."
+                )
+            external_action_id = int(confirmed_action["id"])
         if external_reference:
             dedupe_material = {
                 "vacancy_id": vacancy_id,
@@ -5034,8 +11120,9 @@ def record_employer_interaction(args: argparse.Namespace) -> None:
                 vacancy_id, event_at, direction, event_type, channel,
                 actor_type, is_human, evidence_note, evidence_url,
                 external_reference, dedupe_key, created_at
+                , external_action_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 vacancy_id,
@@ -5050,6 +11137,7 @@ def record_employer_interaction(args: argparse.Namespace) -> None:
                 external_reference,
                 dedupe_key,
                 now_iso(),
+                external_action_id,
             ),
         )
         created = conn.total_changes > before
@@ -5058,8 +11146,8 @@ def record_employer_interaction(args: argparse.Namespace) -> None:
             (dedupe_key,),
         ).fetchone()
         interaction_id = int(row["id"])
-        conn.commit()
-    render_outputs(args.db)
+        commit_projection_write(conn)
+    maybe_render_after_write(args)
     result = {
         "interaction_id": interaction_id,
         "vacancy_id": vacancy_id,
@@ -5069,8 +11157,118 @@ def record_employer_interaction(args: argparse.Namespace) -> None:
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
-        state = "Recorded" if created else "Kept existing duplicate"
-        print(f"{state} employer interaction {interaction_id} for vacancy {vacancy_id}")
+        state = "Записано" if created else "Сохранён существующий повтор"
+        print(f"{state}: взаимодействие №{interaction_id}, вакансия №{vacancy_id}.")
+
+
+def invalidate_employer_interaction(args: argparse.Namespace) -> None:
+    reason = clean_cell(args.reason)
+    evidence_note = clean_cell(args.evidence_note)
+    source = clean_cell(args.source)
+    operator_context = clean_cell(args.operator_context) or source
+    if not reason:
+        raise SystemExit("Для исправления требуется непустой --reason.")
+    if not evidence_note:
+        raise SystemExit("Для исправления требуется непустой --evidence-note.")
+    if not source or not operator_context:
+        raise SystemExit("Для исправления требуются источник и контекст оператора.")
+    corrected_at = parse_iso_datetime(
+        args.corrected_at or now_iso(), label="--corrected-at"
+    ).isoformat()
+
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        interaction = conn.execute(
+            "SELECT id, vacancy_id FROM employer_interactions WHERE id = ?",
+            (args.interaction_id,),
+        ).fetchone()
+        if not interaction:
+            raise SystemExit(f"Взаимодействие №{args.interaction_id} не найдено.")
+        vacancy_id = int(interaction["vacancy_id"])
+
+        if args.vacancy_id is not None or args.vacancy_url or args.vacancy_external_id:
+            expected_vacancy = resolve_vacancy_row(
+                conn,
+                argparse.Namespace(
+                    id=args.vacancy_id,
+                    url=args.vacancy_url,
+                    external_id=args.vacancy_external_id,
+                ),
+            )
+            if int(expected_vacancy["id"]) != vacancy_id:
+                raise SystemExit(
+                    "Указанное взаимодействие относится к другой вакансии; исправление отменено."
+                )
+
+        dedupe_key = dedupe_hash(
+            {
+                "correction_type": "invalidate_employer_interaction",
+                "interaction_id": int(args.interaction_id),
+            }
+        )
+        existing = conn.execute(
+            """
+            SELECT * FROM employer_interaction_invalidations
+            WHERE interaction_id = ?
+            """,
+            (args.interaction_id,),
+        ).fetchone()
+        created = False
+        if existing:
+            existing_context = (
+                clean_cell(existing["reason"]),
+                clean_cell(existing["evidence_note"]),
+                clean_cell(existing["source"]),
+                clean_cell(existing["operator_context"]),
+            )
+            requested_context = (reason, evidence_note, source, operator_context)
+            if existing_context != requested_context:
+                raise SystemExit(
+                    "Взаимодействие уже исправлено с другими метаданными; "
+                    "неоднозначное повторное исправление отклонено."
+                )
+            invalidation_id = int(existing["id"])
+            corrected_at = str(existing["corrected_at"])
+            dedupe_key = str(existing["dedupe_key"])
+        else:
+            cursor = conn.execute(
+                """
+                INSERT INTO employer_interaction_invalidations (
+                    interaction_id, vacancy_id, corrected_at, reason,
+                    evidence_note, source, operator_context, dedupe_key, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(args.interaction_id),
+                    vacancy_id,
+                    corrected_at,
+                    reason,
+                    evidence_note,
+                    source,
+                    operator_context,
+                    dedupe_key,
+                    now_iso(),
+                ),
+            )
+            invalidation_id = int(cursor.lastrowid)
+            created = True
+        commit_projection_write(conn)
+
+    maybe_render_after_write(args)
+    result = {
+        "invalidation_id": invalidation_id,
+        "interaction_id": int(args.interaction_id),
+        "vacancy_id": vacancy_id,
+        "corrected_at": corrected_at,
+        "dedupe_key": dedupe_key,
+        "created": created,
+        "effective": False,
+    }
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        state = "Исправление записано" if created else "Исправление уже существовало"
+        print(f"{state}: взаимодействие №{args.interaction_id} исключено из проекций.")
 
 
 def conversion_report_command(args: argparse.Namespace) -> None:
@@ -5084,12 +11282,692 @@ def conversion_report_command(args: argparse.Namespace) -> None:
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return
     overall = report["overall"]
-    print(f"Application conversion as of {report['as_of']}")
-    print(f"  unique applications: {overall['applications_unique']}")
-    print(f"  matured 14d: {overall['matured_applications_14d']}")
-    print(f"  human replies: {overall['human_replies'] if overall['human_replies'] is not None else 'n/a'}")
-    print(f"  matured 30d: {overall['matured_applications_30d']}")
-    print(f"  interview_1: {overall['interview_1_ever']}")
+    print(f"Конверсия откликов на {report['as_of']}")
+    print(f"  подтверждённых откликов: {overall['applications_unique']}")
+    print(f"  созрело за 14 дней: {overall['matured_applications_14d']}")
+    print(
+        "  ответов людей: "
+        + (str(overall["human_replies"]) if overall["human_replies"] is not None else "н/д")
+    )
+    print(f"  созрело за 30 дней: {overall['matured_applications_30d']}")
+    print(
+        "  завершённых первых интервью: "
+        + (str(overall["interview_1_ever"]) if overall["interview_1_ever"] is not None else "н/д")
+    )
+
+
+def ratio_display(metric: dict[str, Any]) -> str:
+    if not metric.get("available") or metric.get("numerator") is None:
+        return "н/д"
+    percent_value = metric.get("percent")
+    suffix = "н/д" if percent_value is None else f"{float(percent_value):.1f}%"
+    return f"{metric['numerator']}/{metric['denominator']} ({suffix})"
+
+
+def outcome_scorecard_command(args: argparse.Namespace) -> None:
+    as_of = parse_iso_date(args.as_of or dt.date.today().isoformat(), label="--as-of")
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        scorecard, _ = build_outcome_scorecard_data(conn, as_of)
+    if args.json:
+        print(json.dumps(scorecard, ensure_ascii=False, indent=2))
+        return
+    overall = scorecard["overall"]
+    print(f"Карта исходов на {scorecard['as_of']}")
+    print(f"  подтверждённых откликов: {overall['confirmed_applications']}")
+    print(
+        "  ответы людей за 14 дней: "
+        + ratio_display(overall["human_reply_rate_14d"])
+    )
+    print(
+        "  завершённые первые интервью за 30 дней: "
+        + ratio_display(overall["completed_first_interview_rate_30d"])
+    )
+    print(f"  приглашений на интервью: {overall['interview_invitations'] if overall['interview_invitations'] is not None else 'н/д'}")
+    print(f"  назначенных интервью: {overall['scheduled_interviews'] if overall['scheduled_interviews'] is not None else 'н/д'}")
+    print(f"  предложений: {overall['offers'] if overall['offers'] is not None else 'н/д'}")
+    print(f"  полнота полей: {ratio_display(overall['field_completeness'])}")
+    if scorecard["small_sample_warning"]:
+        print(f"  предупреждение: {scorecard['small_sample_warning']}")
+
+
+def wip_queue_command(args: argparse.Namespace) -> None:
+    as_of = parse_iso_date(args.as_of or dt.date.today().isoformat(), label="--as-of")
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        queue = build_wip_queue_data(
+            conn,
+            as_of=as_of,
+            page=args.page,
+            page_size=args.page_size,
+            bucket_filter=args.bucket,
+        )
+    if args.json:
+        print(json.dumps(queue, ensure_ascii=False, indent=2))
+        return
+    pagination = queue["pagination"]
+    print(
+        f"Очередь WIP на {queue['as_of']}: страница {pagination['page']} из "
+        f"{pagination['total_pages']}, записей {pagination['total_items']}."
+    )
+    print(
+        f"  активный WIP: {queue['active_wip_total']}; "
+        f"сверх лимита: {queue['overflow_total']}; "
+        f"просрочено: {queue['overdue_total']}"
+    )
+    for item in queue["items"]:
+        overdue = (
+            f"просрочено на {item['overdue_days']} дн."
+            if item["overdue"]
+            else f"срок {item['due_date']}"
+        )
+        print(
+            f"  #{item['vacancy_id']} · {item['bucket_label']} · {overdue} · "
+            f"{item['company']} — {item['title']}"
+        )
+
+
+def metadata_from_cli(args: argparse.Namespace) -> dict[str, Any]:
+    item: dict[str, Any] = {}
+    for key in (
+        "campaign_id",
+        "role_family",
+        "confidence",
+        "master_resume_id",
+        "planned_resume_id",
+        "actual_resume_id",
+        "message_variant",
+        "human_path_status",
+    ):
+        value = getattr(args, key, None)
+        if value not in (None, ""):
+            item[key] = value
+    hard_gates = getattr(args, "hard_gates_json", "")
+    if hard_gates:
+        item["hard_gates"] = json.loads(hard_gates)
+    questions = getattr(args, "unresolved_questions_json", "")
+    if questions:
+        item["unresolved_questions"] = json.loads(questions)
+    return extract_decision_metadata(item)
+
+
+def record_lifecycle_event_command(args: argparse.Namespace) -> None:
+    if args.event_type == "application_confirmed":
+        raise SystemExit(
+            "Подтверждённый отклик фиксируется только командой record-external-action "
+            "со статусом visibly_confirmed."
+        )
+    metadata = metadata_from_cli(args)
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        vacancy = resolve_vacancy_row(conn, args)
+        vacancy_id = int(vacancy["id"])
+        event_id, created = append_lifecycle_event(
+            conn,
+            vacancy_id=vacancy_id,
+            event_type=args.event_type,
+            event_at=args.at or now_iso(),
+            evidence_at=args.evidence_at or now_iso(),
+            evidence_note=args.evidence_note,
+            evidence_source=args.source,
+            origin="cli:record-lifecycle-event",
+            evidence_url=args.evidence_url,
+            external_reference=args.external_reference,
+            round_no=args.round_no,
+            scheduled_at=args.scheduled_at,
+            metadata=metadata,
+            history_complete=True,
+            authorization_status="not_applicable",
+        )
+        commit_projection_write(conn)
+    maybe_render_after_write(args)
+    result = {
+        "lifecycle_event_id": event_id,
+        "vacancy_id": vacancy_id,
+        "event_type": args.event_type,
+        "created": created,
+    }
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print(
+            f"Событие жизненного цикла №{event_id} "
+            + ("добавлено." if created else "уже существовало; повтор не создан.")
+        )
+
+
+def set_current_action_command(args: argparse.Namespace) -> None:
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        vacancy = resolve_vacancy_row(conn, args)
+        vacancy_id = int(vacancy["id"])
+        event_id, created = append_action_event(
+            conn,
+            vacancy_id=vacancy_id,
+            action_state=args.action_state,
+            bucket=args.bucket,
+            event_at=args.at or now_iso(),
+            due_date=args.due_date,
+            priority=args.priority,
+            reason=args.priority_reason,
+            evidence_note=args.evidence_note,
+            source=args.source,
+        )
+        commit_projection_write(conn)
+    maybe_render_after_write(args)
+    result = {
+        "action_event_id": event_id,
+        "vacancy_id": vacancy_id,
+        "created": created,
+    }
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print(
+            f"Текущее действие для вакансии №{vacancy_id} "
+            + ("обновлено." if created else "не изменилось.")
+        )
+
+
+def record_external_action_command(args: argparse.Namespace) -> None:
+    metadata = metadata_from_cli(args)
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        active = active_daily_run_lease(conn)
+        if (
+            active is not None
+            and get_durable_daily_run(conn, str(active["run_id"])) is not None
+        ):
+            metadata = {
+                **metadata,
+                "daily_run_id": str(active["run_id"]),
+                "daily_run_scope_contract": "daily_run_external_action_scope_v1",
+            }
+        vacancy_id: int | None = None
+        if args.id is not None or args.url or args.external_id:
+            vacancy = resolve_vacancy_row(conn, args)
+            vacancy_id = int(vacancy["id"])
+        if args.action_type in {"application", "message", "follow_up"} and vacancy_id is None:
+            raise SystemExit("Для этого внешнего действия требуется точная вакансия.")
+        application_source_hit_id = args.application_source_hit_id
+        if application_source_hit_id is not None:
+            hit = conn.execute(
+                "SELECT vacancy_id FROM source_hits WHERE id = ?",
+                (application_source_hit_id,),
+            ).fetchone()
+            if not hit or int(hit["vacancy_id"]) != vacancy_id:
+                raise SystemExit("Указанный источник отклика не относится к этой вакансии.")
+        external_action_id, created = append_external_action(
+            conn,
+            vacancy_id=vacancy_id,
+            action_key=args.action_key,
+            action_type=args.action_type,
+            state=args.state,
+            event_at=args.at or now_iso(),
+            authorization_note=args.authorization_note,
+            evidence_note=args.evidence_note,
+            evidence_url=args.evidence_url,
+            source=args.source,
+            external_reference=args.external_reference,
+            metadata=metadata,
+        )
+        lifecycle_event_id: int | None = None
+        lifecycle_created = False
+        if args.action_type == "application" and args.state == "visibly_confirmed":
+            lifecycle_event_id, lifecycle_created = append_lifecycle_event(
+                conn,
+                vacancy_id=int(vacancy_id),
+                event_type="application_confirmed",
+                event_at=args.at or now_iso(),
+                evidence_at=args.evidence_at or now_iso(),
+                evidence_note=args.evidence_note,
+                evidence_source=args.source,
+                origin="cli:record-external-action",
+                evidence_url=args.evidence_url,
+                external_reference=args.external_reference,
+                external_action_id=external_action_id,
+                application_source_hit_id=application_source_hit_id,
+                metadata=metadata,
+                history_complete=True,
+                authorization_status="explicit",
+            )
+            lifecycle_row = conn.execute(
+                "SELECT event_at FROM lifecycle_events WHERE id = ?",
+                (lifecycle_event_id,),
+            ).fetchone()
+            application_date = parse_iso_datetime(
+                lifecycle_row["event_at"], label="event_at"
+            ).date().isoformat()
+            insert_application_once(
+                conn,
+                vacancy_id=int(vacancy_id),
+                applied_date=application_date,
+                status="APPLIED_VISIBLY_CONFIRMED",
+                stage="applied",
+                score=None,
+                resume_version=metadata.get("actual_resume_id") or "",
+                cover_letter=metadata.get("message_variant") or "",
+                why_applied="",
+                risks="",
+                follow_up_date="",
+                origin_file="cli:record-external-action",
+                line_no=0,
+            )
+            application = conn.execute(
+                """
+                SELECT id FROM applications
+                WHERE vacancy_id = ? AND applied_date = ?
+                  AND origin_file = 'cli:record-external-action'
+                ORDER BY id DESC LIMIT 1
+                """,
+                (vacancy_id, application_date),
+            ).fetchone()
+            if application:
+                conn.execute(
+                    """
+                    UPDATE applications SET lifecycle_event_id = ?,
+                        application_source_hit_id = ?, campaign_id = ?,
+                        role_family = ?, actual_resume_version = ?, message_variant = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        lifecycle_event_id,
+                        application_source_hit_id,
+                        metadata.get("campaign_id"),
+                        metadata.get("role_family"),
+                        metadata.get("actual_resume_id"),
+                        metadata.get("message_variant"),
+                        int(application["id"]),
+                    ),
+                )
+            upsert_decision_metadata(
+                conn,
+                vacancy_id=int(vacancy_id),
+                metadata=metadata,
+                application_source_hit_id=application_source_hit_id,
+            )
+            append_action_event(
+                conn,
+                vacancy_id=int(vacancy_id),
+                action_state="waiting",
+                bucket="backlog",
+                event_at=args.at or now_iso(),
+                priority=20,
+                reason="Ждать подтверждённого ответа работодателя.",
+                evidence_note=args.evidence_note,
+                source="cli:record-external-action",
+            )
+        if (
+            created
+            and active is not None
+            and get_durable_daily_run(conn, str(active["run_id"])) is not None
+        ):
+            note_external_action_event(
+                conn,
+                SETTINGS,
+                run_id=str(active["run_id"]),
+                action_key=args.action_key,
+            )
+        commit_projection_write(conn)
+    maybe_render_after_write(args)
+    result = {
+        "external_action_id": external_action_id,
+        "vacancy_id": vacancy_id,
+        "state": args.state,
+        "created": created,
+        "lifecycle_event_id": lifecycle_event_id,
+        "lifecycle_created": lifecycle_created,
+    }
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print(
+            f"Состояние внешнего действия №{external_action_id}: {args.state}; "
+            + ("новая запись." if created else "идемпотентный повтор.")
+        )
+
+
+def quarantine_report_data(
+    conn: sqlite3.Connection,
+    *,
+    page: int,
+    page_size: int,
+    status: str,
+    classification: str,
+) -> dict[str, Any]:
+    if page < 1 or page_size < 1 or page_size > 500:
+        raise ValueError("Номер страницы должен быть не меньше 1, а размер страницы — от 1 до 500.")
+    clauses: list[str] = []
+    params: list[Any] = []
+    if status:
+        if status not in QUARANTINE_STATUSES:
+            raise ValueError("Неподдерживаемое состояние записи карантина.")
+        clauses.append("status = ?")
+        params.append(status)
+    if classification:
+        if classification not in QUARANTINE_CLASSIFICATIONS:
+            raise ValueError("Неподдерживаемая классификация записи карантина.")
+        clauses.append("classification = ?")
+        params.append(classification)
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    total = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM quarantine_records" + where, params
+        ).fetchone()[0]
+    )
+    pages = max((total + page_size - 1) // page_size, 1)
+    offset = (page - 1) * page_size
+    rows = conn.execute(
+        """
+        SELECT id, origin_file, line_no, source_name, source_stream,
+               classification, status, evidence_note, retry_context_json,
+               retry_count, reprocessed_vacancy_id, created_at, updated_at
+        FROM quarantine_records
+        """
+        + where
+        + " ORDER BY id LIMIT ? OFFSET ?",
+        [*params, page_size, offset],
+    ).fetchall()
+    counts = {
+        str(row["classification"]): int(row["n"])
+        for row in conn.execute(
+            """
+            SELECT classification, COUNT(*) AS n
+            FROM quarantine_records
+            WHERE status = 'pending'
+            GROUP BY classification ORDER BY classification
+            """
+        ).fetchall()
+    }
+    return {
+        "items": rows_to_dicts(rows),
+        "pending_by_classification": counts,
+        "pagination": {
+            "page": page,
+            "page_size": page_size,
+            "total_items": total,
+            "total_pages": pages,
+            "has_previous": page > 1,
+            "has_next": page < pages,
+        },
+    }
+
+
+def quarantine_report_command(args: argparse.Namespace) -> None:
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        report = quarantine_report_data(
+            conn,
+            page=args.page,
+            page_size=args.page_size,
+            status=args.status,
+            classification=args.classification,
+        )
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return
+    pagination = report["pagination"]
+    print(
+        f"Карантин импорта: страница {pagination['page']} из "
+        f"{pagination['total_pages']}, записей {pagination['total_items']}."
+    )
+    for item in report["items"]:
+        print(
+            f"  №{item['id']} · {item['classification']} · {item['status']} · "
+            f"{item['origin_file']}:{item['line_no']} · {item['evidence_note'] or ''}"
+        )
+
+
+def reprocess_quarantine_command(args: argparse.Namespace) -> None:
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        record = conn.execute(
+            "SELECT * FROM quarantine_records WHERE id = ?", (args.quarantine_id,)
+        ).fetchone()
+        if not record:
+            raise SystemExit("Запись карантина не найдена.")
+        if record["status"] == "reprocessed":
+            result = {
+                "quarantine_id": args.quarantine_id,
+                "status": "reprocessed",
+                "vacancy_id": record["reprocessed_vacancy_id"],
+                "created": False,
+            }
+            if args.json:
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            else:
+                print("Запись уже была успешно обработана повторно.")
+            return
+        if args.replacement_json:
+            replacement_payload = json.loads(
+                args.replacement_json.read_text(encoding="utf-8")
+            )
+            replacement_items = payload_items(replacement_payload)
+            if len(replacement_items) != 1 or not isinstance(replacement_items[0], dict):
+                raise SystemExit("Файл замены должен содержать ровно один объект вакансии.")
+            item = replacement_items[0]
+        else:
+            raw = json.loads(record["raw_payload_json"])
+            if not isinstance(raw, dict):
+                raise SystemExit("Для некорректного элемента требуется --replacement-json.")
+            item = raw
+        stats = {"ingested": 0, "quarantined": 0}
+        vacancy_id = ingest_item(
+            conn,
+            item,
+            default_channel=clean_cell(record["source_name"]),
+            default_source=clean_cell(record["source_stream"]),
+            origin_file=f"cli:reprocess-quarantine:{args.quarantine_id}",
+            line_no=1,
+            ingestion_stats=stats,
+        )
+        if vacancy_id:
+            conn.execute(
+                """
+                UPDATE quarantine_records
+                SET status = 'reprocessed', retry_count = retry_count + 1,
+                    reprocessed_vacancy_id = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (vacancy_id, now_iso(), args.quarantine_id),
+            )
+            status = "reprocessed"
+        else:
+            conn.execute(
+                """
+                UPDATE quarantine_records
+                SET retry_count = retry_count + 1, updated_at = ?
+                WHERE id = ?
+                """,
+                (now_iso(), args.quarantine_id),
+            )
+            status = "pending"
+        commit_projection_write(conn)
+    maybe_render_after_write(args)
+    result = {
+        "quarantine_id": args.quarantine_id,
+        "status": status,
+        "vacancy_id": vacancy_id,
+        "created": bool(vacancy_id),
+        "re_quarantined": stats["quarantined"],
+    }
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print(
+            "Повторная обработка завершена: "
+            + (f"создана вакансия №{vacancy_id}." if vacancy_id else "запись осталась в карантине.")
+        )
+
+
+def legacy_classification_dry_run_command(args: argparse.Namespace) -> None:
+    if not args.dry_run:
+        raise SystemExit(
+            "Классификация исторических строк доступна только как явный --dry-run; "
+            "автоматическое массовое изменение запрещено."
+        )
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        candidates: list[dict[str, Any]] = []
+        for row in conn.execute("SELECT * FROM vacancies ORDER BY id").fetchall():
+            item = {
+                "title": row["title"],
+                "company": row["company"],
+                "url": row["url"],
+                "status": row["latest_status"],
+                "description": row["reason"],
+            }
+            classification, details = classify_ingestion_record(
+                item, channel=clean_cell(row["channel"])
+            )
+            if classification:
+                candidates.append(
+                    {
+                        "vacancy_id": int(row["id"]),
+                        "classification": classification,
+                        "details": details,
+                    }
+                )
+    sample = candidates[: args.limit]
+    result = {
+        "dry_run": True,
+        "selection_rule": "все исторические вакансии, не прошедшие текущую проверку обязательных полей источника",
+        "candidate_count": len(candidates),
+        "sample": sample,
+        "mutation_performed": False,
+    }
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print(
+            f"Пробная классификация: кандидатов {len(candidates)}; "
+            "изменения в базе не выполнялись."
+        )
+
+
+def build_false_negative_audit_data(
+    conn: sqlite3.Connection,
+    *,
+    as_of: dt.date,
+    sample_size: int,
+    seed: str,
+) -> dict[str, Any]:
+    if sample_size < 1:
+        raise ValueError("Размер выборки должен быть положительным числом.")
+    if not clean_cell(seed):
+        raise ValueError("Ключ воспроизводимости не должен быть пустым.")
+    active = conn.execute(
+        "SELECT version, effective_date FROM policy_versions WHERE is_active = 1"
+    ).fetchall()
+    if len(active) != 1:
+        raise RuntimeError("Должна быть активна ровно одна версия политики отбора.")
+    policy_version = str(active[0]["version"])
+    rows = conn.execute(
+        """
+        SELECT current.*, v.company, v.title
+        FROM screening_decisions current
+        JOIN vacancies v ON v.id = current.vacancy_id
+        WHERE current.policy_version = ?
+          AND current.decision IN ('rejected', 'low_priority')
+          AND current.evaluated_at <= ?
+          AND current.id = (
+              SELECT candidate.id FROM screening_decisions candidate
+              WHERE candidate.vacancy_id = current.vacancy_id
+                AND candidate.policy_version = current.policy_version
+              ORDER BY candidate.evaluated_at DESC, candidate.id DESC LIMIT 1
+          )
+        """,
+        (policy_version, as_of.isoformat() + "T23:59:59"),
+    ).fetchall()
+    ordered = sorted(
+        rows,
+        key=lambda row: (
+            hashlib.sha256(
+                f"{seed}:{int(row['vacancy_id'])}:{policy_version}".encode("utf-8")
+            ).hexdigest(),
+            int(row["vacancy_id"]),
+        ),
+    )
+    selected = ordered[:sample_size]
+    rule_counts: Counter[str] = Counter()
+    sample: list[dict[str, Any]] = []
+    for row in selected:
+        rules = json.loads(row["rule_results_json"] or "[]")
+        matched_rules = [
+            clean_cell(str(rule.get("rule_key") or ""))
+            for rule in rules
+            if isinstance(rule, dict) and rule.get("result") == "matched"
+        ]
+        if not matched_rules:
+            matched_rules = ["unknown_structured_rule"]
+        rule_counts.update(matched_rules)
+        later_positive = conn.execute(
+            """
+            SELECT 1 FROM lifecycle_events
+            WHERE vacancy_id = ? AND event_at >= ?
+              AND event_type IN (
+                  'application_confirmed', 'interview_invited',
+                  'interview_scheduled', 'interview_completed', 'offer_received'
+              )
+            LIMIT 1
+            """,
+            (int(row["vacancy_id"]), row["evaluated_at"]),
+        ).fetchone()
+        sample.append(
+            {
+                "vacancy_id": int(row["vacancy_id"]),
+                "decision": row["decision"],
+                "score": row["score"],
+                "company": row["company"] or "",
+                "title": row["title"] or "",
+                "matched_rules": matched_rules,
+                "later_positive_evidence": bool(later_positive),
+            }
+        )
+    high_volume_threshold = max(2, (len(selected) + 4) // 5) if selected else 2
+    rule_summary = [
+        {
+            "rule_key": key,
+            "count": count,
+            "sample_size": len(selected),
+            "requires_review": count >= high_volume_threshold,
+        }
+        for key, count in sorted(rule_counts.items(), key=lambda pair: (-pair[1], pair[0]))
+    ]
+    return {
+        "as_of": as_of.isoformat(),
+        "policy_version": policy_version,
+        "policy_effective_date": active[0]["effective_date"],
+        "seed": seed,
+        "population_size": len(rows),
+        "sample_size": len(selected),
+        "sample": sample,
+        "rule_counts": rule_summary,
+        "high_volume_threshold": high_volume_threshold,
+        "methodology": "Детерминированная SHA-256 выборка отклонённых и низкоприоритетных вакансий по активной версии политики.",
+    }
+
+
+def false_negative_audit_command(args: argparse.Namespace) -> None:
+    as_of = parse_iso_date(args.as_of or dt.date.today().isoformat(), label="--as-of")
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        report = build_false_negative_audit_data(
+            conn,
+            as_of=as_of,
+            sample_size=args.sample_size,
+            seed=args.seed,
+        )
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return
+    print(
+        f"Аудит пропущенных возможностей: политика {report['policy_version']}, "
+        f"выборка {report['sample_size']}/{report['population_size']}."
+    )
+    for rule in report["rule_counts"]:
+        marker = "требует проверки" if rule["requires_review"] else "наблюдение"
+        print(f"  {rule['rule_key']}: {rule['count']}/{rule['sample_size']} · {marker}")
 
 
 def resolve_employer_account(
@@ -5103,30 +11981,52 @@ def resolve_employer_account(
             "SELECT * FROM employer_accounts WHERE id = ?", (account_id,)
         ).fetchone()
         if not row:
-            raise SystemExit(f"Employer account id {account_id} not found")
+            raise SystemExit(f"Аккаунт работодателя №{account_id} не найден.")
         return row
     normalized = normalized_account_name(account_name)
     if not normalized:
-        raise SystemExit("Use --account-id or --account-name")
+        raise SystemExit("Укажите --account-id или --account-name.")
     row = conn.execute(
         "SELECT * FROM employer_accounts WHERE normalized_name = ?", (normalized,)
     ).fetchone()
     if not row:
-        raise SystemExit(f"Employer account {account_name!r} not found by exact normalized name")
+        raise SystemExit(f"Аккаунт работодателя {account_name!r} не найден по точному нормализованному имени.")
     return row
 
 
 def upsert_employer_account(args: argparse.Namespace) -> None:
     canonical_name = clean_cell(args.canonical_name)
     if not canonical_name:
-        raise SystemExit("--canonical-name is required")
+        raise SystemExit("Требуется --canonical-name.")
     normalized_name = normalized_account_name(canonical_name)
     website = validate_optional_external_url(args.website or "", label="--website")
     careers_url = validate_optional_external_url(
         args.careers_url or "", label="--careers-url"
     )
-    if args.last_checked_date:
-        parse_iso_date(args.last_checked_date, label="--last-checked-date")
+    for value, label in (
+        (args.last_checked_date, "--last-checked-date"),
+        (args.next_review_date, "--next-review-date"),
+        (args.website_checked_date, "--website-checked-date"),
+        (args.careers_checked_date, "--careers-checked-date"),
+    ):
+        if value:
+            parse_iso_date(value, label=label)
+    if args.portfolio_limit is not None and args.portfolio_limit < 1:
+        raise SystemExit("--portfolio-limit должен быть положительным числом.")
+    if args.review_cadence_days is not None and args.review_cadence_days < 1:
+        raise SystemExit("--review-cadence-days должен быть положительным числом.")
+    target_campaigns = [
+        configured_value(value, DECISION_CAMPAIGN_IDS, label="target_campaigns")
+        for value in (args.target_campaigns or "").split(",")
+        if value.strip()
+    ]
+    target_role_families = [
+        configured_value(value, DECISION_ROLE_FAMILIES, label="target_role_families")
+        for value in (args.target_role_families or "").split(",")
+        if value.strip()
+    ]
+    if args.human_path_status and args.human_path_status not in HUMAN_PATH_STATUSES:
+        raise SystemExit("Неподдерживаемый статус пути к человеку.")
     now = now_iso()
     with connect_db(args.db) as conn:
         ensure_schema(conn)
@@ -5136,13 +12036,13 @@ def upsert_employer_account(args: argparse.Namespace) -> None:
                 "SELECT * FROM employer_accounts WHERE id = ?", (args.account_id,)
             ).fetchone()
             if not row:
-                raise SystemExit(f"Employer account id {args.account_id} not found")
+                raise SystemExit(f"Аккаунт работодателя №{args.account_id} не найден.")
             conflict = conn.execute(
                 "SELECT id FROM employer_accounts WHERE normalized_name = ? AND id != ?",
                 (normalized_name, args.account_id),
             ).fetchone()
             if conflict:
-                raise SystemExit("Another employer account already has that exact normalized name")
+                raise SystemExit("Другой аккаунт работодателя уже имеет такое нормализованное имя.")
         else:
             row = conn.execute(
                 "SELECT * FROM employer_accounts WHERE normalized_name = ?",
@@ -5155,9 +12055,13 @@ def upsert_employer_account(args: argparse.Namespace) -> None:
                 INSERT INTO employer_accounts (
                     canonical_name, normalized_name, website, careers_url,
                     country_market, priority, status, last_checked_date,
-                    notes, created_at, updated_at
+                    notes, portfolio_limit, review_cadence_days, next_review_date,
+                    website_checked_date, careers_checked_date,
+                    target_campaigns_json, target_role_families_json,
+                    owner_evidence, sponsor_evidence, governance_evidence,
+                    human_path_status, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     canonical_name,
@@ -5169,6 +12073,17 @@ def upsert_employer_account(args: argparse.Namespace) -> None:
                     clean_cell(args.account_status or ""),
                     clean_cell(args.last_checked_date or ""),
                     clean_cell(args.notes or ""),
+                    args.portfolio_limit or ACCOUNT_ACTIVE_PORTFOLIO_LIMIT,
+                    args.review_cadence_days,
+                    clean_cell(args.next_review_date or ""),
+                    clean_cell(args.website_checked_date or ""),
+                    clean_cell(args.careers_checked_date or ""),
+                    json.dumps(target_campaigns, ensure_ascii=False),
+                    json.dumps(target_role_families, ensure_ascii=False),
+                    clean_cell(args.owner_evidence or ""),
+                    clean_cell(args.sponsor_evidence or ""),
+                    clean_cell(args.governance_evidence or ""),
+                    clean_cell(args.human_path_status or "unknown"),
                     now,
                     now,
                 ),
@@ -5185,7 +12100,12 @@ def upsert_employer_account(args: argparse.Namespace) -> None:
                 UPDATE employer_accounts
                 SET canonical_name = ?, normalized_name = ?, website = ?,
                     careers_url = ?, country_market = ?, priority = ?, status = ?,
-                    last_checked_date = ?, notes = ?, updated_at = ?
+                    last_checked_date = ?, notes = ?, portfolio_limit = ?,
+                    review_cadence_days = ?, next_review_date = ?,
+                    website_checked_date = ?, careers_checked_date = ?,
+                    target_campaigns_json = ?, target_role_families_json = ?,
+                    owner_evidence = ?, sponsor_evidence = ?,
+                    governance_evidence = ?, human_path_status = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (
@@ -5198,23 +12118,45 @@ def upsert_employer_account(args: argparse.Namespace) -> None:
                     selected("status", args.account_status),
                     selected("last_checked_date", args.last_checked_date),
                     selected("notes", args.notes),
+                    args.portfolio_limit
+                    if args.portfolio_limit is not None
+                    else row["portfolio_limit"],
+                    args.review_cadence_days
+                    if args.review_cadence_days is not None
+                    else row["review_cadence_days"],
+                    selected("next_review_date", args.next_review_date),
+                    selected("website_checked_date", args.website_checked_date),
+                    selected("careers_checked_date", args.careers_checked_date),
+                    json.dumps(target_campaigns, ensure_ascii=False)
+                    if args.target_campaigns is not None
+                    else row["target_campaigns_json"],
+                    json.dumps(target_role_families, ensure_ascii=False)
+                    if args.target_role_families is not None
+                    else row["target_role_families_json"],
+                    selected("owner_evidence", args.owner_evidence),
+                    selected("sponsor_evidence", args.sponsor_evidence),
+                    selected("governance_evidence", args.governance_evidence),
+                    selected("human_path_status", args.human_path_status),
                     now,
                     account_id,
                 ),
             )
-        conn.commit()
-    render_outputs(args.db)
+        commit_projection_write(conn)
+    maybe_render_after_write(args)
     result = {"account_id": account_id, "created": created, "canonical_name": canonical_name}
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
-        print(f"{'Created' if created else 'Updated'} employer account {account_id}: {canonical_name}")
+        print(
+            f"Аккаунт работодателя №{account_id} "
+            f"{'создан' if created else 'обновлён'}: {canonical_name}."
+        )
 
 
 def record_employer_signal(args: argparse.Namespace) -> None:
     evidence_note = clean_cell(args.evidence_note)
     if not evidence_note:
-        raise SystemExit("--evidence-note is required")
+        raise SystemExit("Требуется --evidence-note.")
     observed_date = args.observed_date or dt.date.today().isoformat()
     parse_iso_date(observed_date, label="--observed-date")
     evidence_url = validate_optional_external_url(
@@ -5255,13 +12197,16 @@ def record_employer_signal(args: argparse.Namespace) -> None:
             (account_id, args.signal_type, observed_date, evidence_url, evidence_note),
         ).fetchone()
         signal_id = int(signal["id"])
-        conn.commit()
-    render_outputs(args.db)
+        commit_projection_write(conn)
+    maybe_render_after_write(args)
     result = {"signal_id": signal_id, "account_id": account_id, "created": created}
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
-        print(f"{'Recorded' if created else 'Kept existing'} employer signal {signal_id}")
+        print(
+            f"Сигнал работодателя №{signal_id} "
+            f"{'записан' if created else 'уже существовал'}."
+        )
 
 
 def link_vacancy_account(args: argparse.Namespace) -> None:
@@ -5279,8 +12224,8 @@ def link_vacancy_account(args: argparse.Namespace) -> None:
         ).fetchone()
         if existing and int(existing["account_id"]) != account_id:
             raise SystemExit(
-                f"Vacancy {vacancy_id} is already linked to account {existing['account_id']}; "
-                "unlink/relink requires an explicit future workflow"
+                f"Вакансия №{vacancy_id} уже связана с аккаунтом №{existing['account_id']}; "
+                "смена связи требует отдельного явного процесса."
             )
         created = existing is None
         if created:
@@ -5295,13 +12240,16 @@ def link_vacancy_account(args: argparse.Namespace) -> None:
                 """,
                 (vacancy_id, account_id, clean_cell(args.evidence_note), now, now),
             )
-        conn.commit()
-    render_outputs(args.db)
+        commit_projection_write(conn)
+    maybe_render_after_write(args)
     result = {"vacancy_id": vacancy_id, "account_id": account_id, "created": created}
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
-        print(f"{'Linked' if created else 'Kept link for'} vacancy {vacancy_id} to account {account_id}")
+        print(
+            f"Связь вакансии №{vacancy_id} с аккаунтом №{account_id} "
+            f"{'создана' if created else 'сохранена без изменений'}."
+        )
 
 
 def record_vacancy_factor(args: argparse.Namespace) -> None:
@@ -5324,26 +12272,29 @@ def record_vacancy_factor(args: argparse.Namespace) -> None:
             factor=factor,
             default_date=observed_date,
         )
-        conn.commit()
-    render_outputs(args.db)
+        commit_projection_write(conn)
+    maybe_render_after_write(args)
     result = {"vacancy_id": vacancy_id, "factor_key": args.factor_key, "created": created}
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
-        print(f"{'Recorded' if created else 'Kept existing'} factor {args.factor_key} for vacancy {vacancy_id}")
+        print(
+            f"Фактор {args.factor_key} для вакансии №{vacancy_id} "
+            f"{'записан' if created else 'уже существовал'}."
+        )
 
 
 def upsert_employer_contact(args: argparse.Namespace) -> None:
     channel = normalize_outreach_channel(args.contact_channel)
     if channel not in DIRECT_OUTREACH_CHANNELS:
         allowed = ", ".join(DIRECT_OUTREACH_CHANNELS)
-        raise SystemExit(f"Contact channel must be one of: {allowed}")
+        raise SystemExit(f"Канал контакта должен иметь одно из значений: {allowed}.")
     if args.relationship not in CONTACT_RELATIONSHIPS:
-        raise SystemExit("Unsupported contact relationship")
+        raise SystemExit("Неподдерживаемый тип связи с контактом.")
     if args.confidence not in CONTACT_CONFIDENCE:
-        raise SystemExit("Unsupported contact confidence")
+        raise SystemExit("Неподдерживаемый уровень уверенности в контакте.")
     if not clean_cell(args.evidence_url) and not clean_cell(args.evidence_note):
-        raise SystemExit("Use --evidence-url or --evidence-note to prove the contact identity")
+        raise SystemExit("Для подтверждения личности контакта укажите --evidence-url или --evidence-note.")
 
     verified_date = args.verified_date or dt.date.today().isoformat()
     now = now_iso()
@@ -5395,13 +12346,13 @@ def upsert_employer_contact(args: argparse.Namespace) -> None:
             """,
             (vacancy_id, channel, clean_cell(args.contact_address)),
         ).fetchone()
-        conn.commit()
+        commit_projection_write(conn)
 
-    render_outputs(args.db)
+    maybe_render_after_write(args)
     print(
-        f"Stored employer contact {contact['id']} for vacancy {vacancy_id} "
-        f"({channel}, {args.confidence}) and regenerated "
-        f"{display_path(DASHBOARD_PATH, ROOT)}"
+        f"Контакт работодателя №{contact['id']} сохранён для вакансии №{vacancy_id} "
+        f"({channel}, {args.confidence}). "
+        + projection_write_note(args)
     )
 
 
@@ -5409,9 +12360,9 @@ def record_contact_search(args: argparse.Namespace) -> None:
     channels_checked = unique_outreach_channels(args.channels_checked.split(","))
     if not channels_checked:
         allowed = ", ".join(DIRECT_OUTREACH_CHANNELS)
-        raise SystemExit(f"--channels-checked must include one of: {allowed}")
+        raise SystemExit(f"В --channels-checked требуется хотя бы одно из значений: {allowed}.")
     if args.search_status not in CONTACT_SEARCH_STATUSES:
-        raise SystemExit("Unsupported contact search status")
+        raise SystemExit("Неподдерживаемое состояние поиска контакта.")
 
     search_date = args.date or dt.date.today().isoformat()
     with connect_db(args.db) as conn:
@@ -5444,36 +12395,36 @@ def record_contact_search(args: argparse.Namespace) -> None:
             "cli:record-contact-search",
             0,
         )
-        conn.commit()
+        commit_projection_write(conn)
 
-    render_outputs(args.db)
+    maybe_render_after_write(args)
     print(
-        f"Recorded contact search {cur.lastrowid} for vacancy {vacancy_id} "
-        f"and regenerated {display_path(DASHBOARD_PATH, ROOT)}"
+        f"Поиск контакта №{cur.lastrowid} записан для вакансии №{vacancy_id}. "
+        + projection_write_note(args)
     )
 
 
 def load_outreach_payload(path: Path) -> dict[str, Any]:
     candidate = path if path.is_absolute() else ROOT / path
     if not candidate.exists():
-        raise FileNotFoundError(f"Outreach JSON not found: {candidate}")
+        raise FileNotFoundError(f"JSON-файл с данными обращения не найден: {candidate}")
     payload = json.loads(candidate.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
-        raise ValueError("Outreach JSON must be an object")
+        raise ValueError("JSON с данными обращения должен быть объектом.")
     if not isinstance(payload.get("contact_search"), dict):
-        raise ValueError("Outreach JSON must contain a contact_search object")
+        raise ValueError("JSON с данными обращения должен содержать объект contact_search.")
     if not isinstance(payload.get("touchpoints"), list) or not payload["touchpoints"]:
-        raise ValueError("Outreach JSON must contain a non-empty touchpoints array")
+        raise ValueError("JSON с данными обращения должен содержать непустой массив touchpoints.")
     return payload
 
 
 def record_followup(args: argparse.Namespace) -> None:
     if args.id is None and not args.url and not args.external_id:
-        raise SystemExit("Use --id, --url, or --external-id to identify the vacancy")
+        raise SystemExit("Укажите вакансию через --id, --url или --external-id.")
     if not args.outreach_json:
         raise SystemExit(
-            "--outreach-json is required so contact research, channels, exact messages, "
-            "and visible delivery evidence are stored"
+            "Требуется --outreach-json, чтобы сохранить поиск контактов, каналы, "
+            "точные сообщения и видимые доказательства доставки."
         )
 
     payload = load_outreach_payload(args.outreach_json)
@@ -5481,21 +12432,21 @@ def record_followup(args: argparse.Namespace) -> None:
     search_status = clean_cell(str(contact_search.get("status") or "")).lower()
     if search_status not in CONTACT_SEARCH_STATUSES:
         allowed = ", ".join(sorted(CONTACT_SEARCH_STATUSES))
-        raise SystemExit(f"contact_search.status must be one of: {allowed}")
+        raise SystemExit(f"Поле contact_search.status должно иметь одно из значений: {allowed}.")
     raw_checked = contact_search.get("channels_checked") or []
     if not isinstance(raw_checked, list):
-        raise SystemExit("contact_search.channels_checked must be an array")
+        raise SystemExit("Поле contact_search.channels_checked должно быть массивом.")
     channels_checked = unique_outreach_channels(
         [str(value) for value in raw_checked], FOLLOW_UP_CHANNELS
     )
     if not channels_checked:
         raise SystemExit(
-            "contact_search.channels_checked must include at least one configured "
-            "outreach channel"
+            "Поле contact_search.channels_checked должно содержать хотя бы один "
+            "настроенный канал обращения."
         )
     research_note = clean_cell(str(contact_search.get("note") or ""))
     if not research_note:
-        raise SystemExit("contact_search.note is required")
+        raise SystemExit("Требуется поле contact_search.note.")
 
     event_date = args.date or dt.date.today().isoformat()
     with connect_db(args.db) as conn:
@@ -5506,8 +12457,8 @@ def record_followup(args: argparse.Namespace) -> None:
         current_stage = canonical_stage(row["latest_stage"])
         if current_stage not in {"applied", "follow_up"}:
             raise SystemExit(
-                f"Vacancy {vacancy_id} is in stage {current_stage}; "
-                "record-followup is allowed only for applied/follow_up"
+                f"Вакансия №{vacancy_id} находится на этапе {current_stage}; "
+                "команда record-followup допустима только для applied или follow_up."
             )
         events = conn.execute(
             """
@@ -5532,11 +12483,11 @@ def record_followup(args: argparse.Namespace) -> None:
         )
         if previous_number >= FOLLOW_UP_LIMIT:
             raise SystemExit(
-                f"Vacancy {vacancy_id} already reached the {FOLLOW_UP_LIMIT}-follow-up limit"
+                f"Вакансия №{vacancy_id} уже достигла лимита повторных обращений: {FOLLOW_UP_LIMIT}."
             )
         if any(date == event_date and number > 0 for date, number in numbered_events):
             raise SystemExit(
-                f"Vacancy {vacancy_id} already has a follow-up recorded on {event_date}"
+                f"Для вакансии №{vacancy_id} уже записано повторное обращение на {event_date}."
             )
         duplicate_round_date = conn.execute(
             "SELECT 1 FROM followup_rounds WHERE vacancy_id = ? AND sent_date = ? LIMIT 1",
@@ -5544,7 +12495,7 @@ def record_followup(args: argparse.Namespace) -> None:
         ).fetchone()
         if duplicate_round_date:
             raise SystemExit(
-                f"Vacancy {vacancy_id} already has a structured follow-up round on {event_date}"
+                f"Для вакансии №{vacancy_id} уже записан структурированный раунд повторного обращения на {event_date}."
             )
 
         prepared_touchpoints: list[dict[str, Any]] = []
@@ -5553,28 +12504,55 @@ def record_followup(args: argparse.Namespace) -> None:
         sent_direct_count = 0
         for index, raw_touchpoint in enumerate(payload["touchpoints"], start=1):
             if not isinstance(raw_touchpoint, dict):
-                raise SystemExit(f"touchpoints[{index}] must be an object")
+                raise SystemExit(f"Элемент touchpoints[{index}] должен быть объектом.")
             channel = normalize_outreach_channel(str(raw_touchpoint.get("channel") or ""))
             if channel not in FOLLOW_UP_CHANNELS:
                 allowed = ", ".join(FOLLOW_UP_CHANNELS)
-                raise SystemExit(f"touchpoints[{index}].channel must be one of: {allowed}")
+                raise SystemExit(f"Поле touchpoints[{index}].channel должно иметь одно из значений: {allowed}.")
             if channel in seen_channels:
-                raise SystemExit(f"Only one touchpoint per channel is allowed in a follow-up round: {channel}")
+                raise SystemExit(f"В одном раунде допускается только одна точка контакта для канала {channel}.")
             seen_channels.add(channel)
 
             delivery_status = clean_cell(
                 str(raw_touchpoint.get("delivery_status") or "sent")
             ).lower()
             if delivery_status not in OUTREACH_DELIVERY_STATUSES:
-                raise SystemExit(f"Unsupported delivery status: {delivery_status}")
+                raise SystemExit(f"Неподдерживаемое состояние доставки: {delivery_status}.")
             message_text = str(
                 raw_touchpoint.get("message_text") or raw_touchpoint.get("message") or ""
             ).strip()
             evidence_note = clean_cell(str(raw_touchpoint.get("evidence_note") or ""))
             if delivery_status == "sent" and (not message_text or not evidence_note):
                 raise SystemExit(
-                    f"Sent touchpoint {channel} requires exact message_text and evidence_note"
+                    f"Для отправленной точки контакта {channel} требуются точные message_text и evidence_note."
                 )
+
+            external_action_id: int | None = None
+            if delivery_status == "sent":
+                external_action_key = clean_cell(
+                    str(raw_touchpoint.get("external_action_key") or "")
+                )
+                if not external_action_key:
+                    raise SystemExit(
+                        f"Отправленная точка контакта {channel} требует "
+                        "external_action_key с отдельным разрешением и видимым подтверждением."
+                    )
+                external_action = conn.execute(
+                    """
+                    SELECT id FROM external_actions
+                    WHERE vacancy_id = ? AND action_key = ?
+                      AND action_type IN ('message', 'follow_up')
+                      AND state = 'visibly_confirmed'
+                    ORDER BY event_at DESC, id DESC LIMIT 1
+                    """,
+                    (vacancy_id, external_action_key),
+                ).fetchone()
+                if not external_action:
+                    raise SystemExit(
+                        f"Нет явно разрешённого и видимо подтверждённого внешнего "
+                        f"действия {external_action_key!r} для вакансии №{vacancy_id}."
+                    )
+                external_action_id = int(external_action["id"])
 
             contact_id: int | None = None
             recipient_name = clean_cell(str(raw_touchpoint.get("recipient_name") or ""))
@@ -5584,24 +12562,24 @@ def record_followup(args: argparse.Namespace) -> None:
                     contact_id = int(raw_touchpoint.get("contact_id"))
                 except (TypeError, ValueError):
                     raise SystemExit(
-                        f"Direct touchpoint {channel} requires contact_id from upsert-contact"
+                        f"Для прямой точки контакта {channel} требуется contact_id из upsert-contact."
                     )
                 contact = conn.execute(
                     "SELECT * FROM employer_contacts WHERE id = ?",
                     (contact_id,),
                 ).fetchone()
                 if not contact or int(contact["vacancy_id"]) != vacancy_id:
-                    raise SystemExit(f"Contact {contact_id} does not belong to vacancy {vacancy_id}")
+                    raise SystemExit(f"Контакт №{contact_id} не относится к вакансии №{vacancy_id}.")
                 if not int(contact["is_active"]):
-                    raise SystemExit(f"Contact {contact_id} is inactive")
+                    raise SystemExit(f"Контакт №{contact_id} неактивен.")
                 if contact["channel"] != channel:
                     raise SystemExit(
-                        f"Contact {contact_id} is stored for {contact['channel']}, not {channel}"
+                        f"Контакт №{contact_id} сохранён для канала {contact['channel']}, а не {channel}."
                     )
                 if delivery_status == "sent" and contact["confidence"] not in DIRECT_SEND_CONFIDENCE:
                     raise SystemExit(
-                        f"Contact {contact_id} confidence is {contact['confidence']}; "
-                        "automatic send requires confirmed or strong"
+                        f"У контакта №{contact_id} уровень уверенности {contact['confidence']}; "
+                        "для отправки требуется confirmed или strong."
                     )
                 recipient_name = contact["person_name"]
                 recipient_address = contact["contact_address"]
@@ -5611,7 +12589,7 @@ def record_followup(args: argparse.Namespace) -> None:
                 primary_label = CHANNEL_LABELS.get(
                     PRIMARY_OUTREACH_CHANNEL, PRIMARY_OUTREACH_CHANNEL.title()
                 )
-                recipient_name = recipient_name or f"{primary_label} vacancy thread"
+                recipient_name = recipient_name or f"Обсуждение вакансии в {primary_label}"
                 recipient_address = recipient_address or row["url"] or row["external_id"]
 
             if delivery_status == "sent":
@@ -5626,19 +12604,20 @@ def record_followup(args: argparse.Namespace) -> None:
                     "delivery_status": delivery_status,
                     "evidence_note": evidence_note,
                     "sent_at": clean_cell(str(raw_touchpoint.get("sent_at") or event_date)),
+                    "external_action_id": external_action_id,
                 }
             )
 
         if not sent_channels:
-            raise SystemExit("A follow-up round must contain at least one sent touchpoint")
+            raise SystemExit("Раунд повторного обращения должен содержать хотя бы одну отправленную точку контакта.")
         if sent_direct_count > MAX_DIRECT_MESSAGES_PER_ROUND:
-            preferred = ", then ".join(
+            preferred = ", затем ".join(
                 CHANNEL_LABELS.get(channel, channel.title())
                 for channel in DIRECT_OUTREACH_CHANNELS
             )
             raise SystemExit(
-                f"Use at most {MAX_DIRECT_MESSAGES_PER_ROUND} sent direct channel(s) "
-                f"per follow-up round; configured order: {preferred}"
+                f"В одном раунде допускается не более {MAX_DIRECT_MESSAGES_PER_ROUND} "
+                f"отправленных прямых каналов; настроенный порядок: {preferred}."
             )
 
         follow_up_number = previous_number + 1
@@ -5705,9 +12684,10 @@ def record_followup(args: argparse.Namespace) -> None:
                 INSERT INTO outreach_messages (
                     followup_round_id, vacancy_id, contact_id, channel,
                     recipient_name, recipient_address, message_text,
-                    delivery_status, evidence_note, sent_at, created_at
+                    delivery_status, evidence_note, sent_at, external_action_id,
+                    created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     followup_round_id,
@@ -5720,6 +12700,7 @@ def record_followup(args: argparse.Namespace) -> None:
                     touchpoint["delivery_status"],
                     touchpoint["evidence_note"],
                     touchpoint["sent_at"],
+                    touchpoint["external_action_id"],
                     now,
                 ),
             )
@@ -5768,22 +12749,36 @@ def record_followup(args: argparse.Namespace) -> None:
             "cli:record-followup",
             0,
         )
-        conn.commit()
+        commit_projection_write(conn)
 
-    render_outputs(args.db)
+    maybe_render_after_write(args)
     print(
-        f"Recorded follow-up round {follow_up_number} for vacancy {vacancy_id} "
-        f"via {', '.join(sent_channels)}; contact search {contact_search_cur.lastrowid}; "
-        f"regenerated {display_path(DASHBOARD_PATH, ROOT)}"
+        f"Раунд повторного обращения №{follow_up_number} записан для вакансии №{vacancy_id} "
+        f"через {', '.join(sent_channels)}; поиск контакта №{contact_search_cur.lastrowid}. "
+        + projection_write_note(args)
     )
 
 
 def attach_interview_summary(args: argparse.Namespace) -> None:
     if args.id is None and not args.url and not args.external_id:
-        raise SystemExit("Use --id, --url, or --external-id to identify the vacancy")
+        raise SystemExit("Укажите вакансию через --id, --url или --external-id.")
 
     file_path = project_relative_file_path(args.file)
     date = args.date or dt.date.today().isoformat()
+    completion_note = clean_cell(args.completion_evidence_note or args.note)
+    if args.confirms_completion:
+        content = (ROOT / file_path).read_text(encoding="utf-8")
+        meaningful_lines = [line.strip() for line in content.splitlines() if line.strip()]
+        meaningful_chars = len(re.sub(r"\s+", "", content))
+        if meaningful_chars < 80 or len(meaningful_lines) < 3:
+            raise SystemExit(
+                "Резюме интервью не соответствует правилу завершения: требуется "
+                "не менее 80 непробельных знаков и трёх содержательных строк."
+            )
+        if not completion_note:
+            raise SystemExit(
+                "Для подтверждения завершения требуется --completion-evidence-note."
+            )
 
     with connect_db(args.db) as conn:
         ensure_schema(conn)
@@ -5802,23 +12797,24 @@ def attach_interview_summary(args: argparse.Namespace) -> None:
             ).fetchone()
             interview_no = int(max_row["max_no"] or 0) + 1
         if interview_no < 1:
-            raise SystemExit("--interview-no must be a positive integer")
+            raise SystemExit("Параметр --interview-no должен быть положительным целым числом.")
 
         stage = args.stage or f"interview_{interview_no}"
-        title = args.title or f"Interview {interview_no}"
+        title = args.title or f"Интервью {interview_no}"
         now = now_iso()
         conn.execute(
             """
             INSERT INTO interview_summaries (
                 vacancy_id, interview_no, stage, summary_date, title, file_path,
-                note, created_at, updated_at
+                note, confirms_completion, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(vacancy_id, interview_no, file_path) DO UPDATE SET
                 stage = excluded.stage,
                 summary_date = excluded.summary_date,
                 title = excluded.title,
                 note = excluded.note,
+                confirms_completion = excluded.confirms_completion,
                 updated_at = excluded.updated_at
             """,
             (
@@ -5829,6 +12825,7 @@ def attach_interview_summary(args: argparse.Namespace) -> None:
                 title,
                 file_path,
                 args.note or "",
+                1 if args.confirms_completion else 0,
                 now,
                 now,
             ),
@@ -5840,13 +12837,41 @@ def attach_interview_summary(args: argparse.Namespace) -> None:
             """,
             (vacancy_id, interview_no, file_path),
         ).fetchone()
-        conn.commit()
+        completion_lifecycle_event_id: int | None = None
+        if args.confirms_completion:
+            completion_lifecycle_event_id, _ = append_lifecycle_event(
+                conn,
+                vacancy_id=vacancy_id,
+                event_type="interview_completed",
+                event_at=date,
+                evidence_at=now,
+                evidence_note=completion_note,
+                evidence_source="interview_summary",
+                origin="cli:attach-interview-summary",
+                external_reference=f"interview-summary:{file_path}:{interview_no}",
+                round_no=interview_no,
+                history_complete=True,
+                authorization_status="not_applicable",
+            )
+            conn.execute(
+                """
+                UPDATE interview_summaries
+                SET completion_lifecycle_event_id = ?
+                WHERE id = ?
+                """,
+                (completion_lifecycle_event_id, int(summary_row["id"])),
+            )
+        commit_projection_write(conn)
 
-    render_outputs(args.db)
+    maybe_render_after_write(args)
+    completion_text = (
+        f" Завершение подтверждено событием №{completion_lifecycle_event_id}."
+        if args.confirms_completion
+        else " Завершение интервью не заявлено."
+    )
     print(
-        "Attached interview summary "
-        f"{summary_row['id']} to vacancy {vacancy_id} "
-        f"({stage}, {file_path}) and regenerated {display_path(DASHBOARD_PATH, ROOT)}"
+        f"Резюме интервью №{summary_row['id']} связано с вакансией №{vacancy_id}."
+        f"{completion_text} " + projection_write_note(args)
     )
 
 
@@ -5857,7 +12882,19 @@ def initialize_workspace(args: argparse.Namespace) -> None:
     kept: list[str] = []
     settings_template = CODE_ROOT / "config" / "settings.example.toml"
     if not settings_template.exists():
-        raise FileNotFoundError(f"Missing settings template: {settings_template}")
+        raise FileNotFoundError(f"Не найден шаблон настроек: {settings_template}")
+
+    if DB_PATH.exists():
+        with connect_db(DB_PATH) as lease_conn:
+            ensure_schema(lease_conn)
+            active_lease = active_daily_run_lease(lease_conn)
+            lease_conn.commit()
+            if active_lease is not None:
+                raise RuntimeError(
+                    "init недоступен во время активного ежедневного запуска: "
+                    f"run_id={active_lease['run_id']}, owner={active_lease['owner']}, "
+                    f"expires_at={active_lease['expires_at']}."
+                )
 
     if SETTINGS.config_path.exists():
         kept.append(display_path(SETTINGS.config_path, ROOT))
@@ -5888,7 +12925,7 @@ def initialize_workspace(args: argparse.Namespace) -> None:
             kept.append(display_path(target, ROOT))
             continue
         if not source.exists():
-            raise FileNotFoundError(f"Missing workspace template: {source}")
+            raise FileNotFoundError(f"Не найден шаблон рабочей области: {source}")
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, target)
         created.append(display_path(target, ROOT))
@@ -5905,7 +12942,18 @@ def initialize_workspace(args: argparse.Namespace) -> None:
         directory.mkdir(parents=True, exist_ok=True)
 
     database_existed = DB_PATH.exists()
-    snapshot = render_outputs(DB_PATH)
+    if bool(getattr(args, "defer_render", False)):
+        with connect_db(DB_PATH) as conn:
+            ensure_schema(conn)
+            commit_projection_write(conn)
+            snapshot = build_snapshot(conn, DB_PATH)
+            snapshot["projection_state"] = projection_state_data(conn)
+    else:
+        snapshot = render_outputs(
+            DB_PATH,
+            lock_timeout=command_lock_timeout(args),
+            writer_locked=True,
+        )
     (created if not database_existed else kept).append(display_path(DB_PATH, ROOT))
 
     result = {
@@ -5913,16 +12961,21 @@ def initialize_workspace(args: argparse.Namespace) -> None:
         "created": created,
         "kept": kept,
         "kpis": snapshot["kpis"],
+        "render_deferred": bool(getattr(args, "defer_render", False)),
+        "projection_state": snapshot["projection_state"],
     }
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
-    print(f"Initialized workspace: {ROOT}")
+    print(f"Рабочая область подготовлена: {ROOT}")
     if created:
-        print("  created: " + ", ".join(created))
+        print("  создано: " + ", ".join(created))
     if kept:
-        print("  kept existing: " + ", ".join(kept))
-    print(f"  dashboard: {display_path(DASHBOARD_PATH, ROOT)}")
+        print("  сохранено без изменений: " + ", ".join(kept))
+    if bool(getattr(args, "defer_render", False)):
+        print("  запись SQLite сохранена; первичный render отложен, проекции имеют состояние dirty")
+    else:
+        print(f"  панель: {display_path(DASHBOARD_PATH, ROOT)}")
 
 
 def doctor(args: argparse.Namespace) -> None:
@@ -5940,7 +12993,7 @@ def doctor(args: argparse.Namespace) -> None:
         SETTINGS.config_loaded,
         display_path(SETTINGS.config_path, ROOT)
         if SETTINGS.config_loaded
-        else "local settings are absent; built-in safe defaults are active",
+        else "Локальные настройки отсутствуют; действуют безопасные встроенные значения.",
     )
     add("workspace", ROOT.exists() and ROOT.is_dir(), str(ROOT))
     add(
@@ -5953,7 +13006,7 @@ def doctor(args: argparse.Namespace) -> None:
         add(
             f"profile:{display_path(profile_path, ROOT)}",
             profile_path.is_file(),
-            "present" if profile_path.is_file() else "missing",
+            "файл доступен" if profile_path.is_file() else "файл отсутствует",
         )
 
     if DB_PATH.exists():
@@ -5966,6 +13019,12 @@ def doctor(args: argparse.Namespace) -> None:
                 missing_indexes = missing_schema_indexes(conn)
                 alias_schema_issues = vacancy_external_alias_schema_issues(conn)
                 v4_contract_issues = schema_v4_issues(conn)
+                v5_contract_issues = schema_v5_issues(conn)
+                v6_contract_issues = schema_v6_issues(conn)
+                v7_contract_issues = schema_v7_issues(conn)
+                v8_contract_issues = schema_v8_issues(conn)
+                v9_contract_issues = schema_v9_issues(conn)
+                v10_contract_issues = schema_v10_contract_issues(conn)
                 foreign_key_issues = len(conn.execute("PRAGMA foreign_key_check").fetchall())
                 missing_canonical_streams = (
                     int(
@@ -6013,64 +13072,119 @@ def doctor(args: argparse.Namespace) -> None:
                     if "vacancy_external_aliases" not in missing_tables
                     else -1
                 )
-            add("database_integrity", quick_check == "ok", quick_check)
+            add(
+                "database_integrity",
+                quick_check == "ok",
+                "Быстрая проверка SQLite пройдена."
+                if quick_check == "ok"
+                else f"Результат быстрой проверки SQLite: {quick_check}",
+            )
             add(
                 "database_schema",
                 schema_version == SCHEMA_VERSION and not missing_tables,
                 (
-                    f"database={schema_version}, supported={SCHEMA_VERSION}, "
-                    f"missing_tables={','.join(missing_tables) or 'none'}"
+                    f"версия базы: {schema_version}; поддерживаемая версия: "
+                    f"{SCHEMA_VERSION}; отсутствующие таблицы: "
+                    f"{','.join(missing_tables) or 'нет'}"
                 ),
             )
             add(
                 "database_indexes",
                 not missing_indexes,
-                f"missing={','.join(missing_indexes) or 'none'}",
+                f"Отсутствующие индексы: {','.join(missing_indexes) or 'нет'}.",
             )
             add(
                 "database_external_alias_schema",
                 not alias_schema_issues,
-                "; ".join(alias_schema_issues) or "valid",
+                "; ".join(alias_schema_issues) or "Схема корректна.",
             )
             add(
                 "database_schema_v4_contract",
                 not v4_contract_issues,
-                "; ".join(v4_contract_issues) or "valid",
+                "; ".join(v4_contract_issues) or "Контракт v4 соблюдён.",
+            )
+            add(
+                "database_schema_v5_contract",
+                not v5_contract_issues,
+                "; ".join(v5_contract_issues) or "Контракт v5 соблюдён.",
+            )
+            add(
+                "database_schema_v6_contract",
+                not v6_contract_issues,
+                "; ".join(v6_contract_issues) or "Контракт v6 соблюдён.",
+            )
+            add(
+                "database_schema_v7_contract",
+                not v7_contract_issues,
+                "; ".join(v7_contract_issues) or "Контракт v7 соблюдён.",
+            )
+            add(
+                "database_schema_v8_contract",
+                not v8_contract_issues,
+                "; ".join(v8_contract_issues) or "Контракт v8 соблюдён.",
+            )
+            add(
+                "database_schema_v9_contract",
+                not v9_contract_issues,
+                "; ".join(v9_contract_issues) or "Контракт v9 соблюдён.",
+            )
+            add(
+                "database_schema_v10_contract",
+                not v10_contract_issues,
+                "; ".join(v10_contract_issues) or "Контракт v10 соблюдён.",
             )
             add(
                 "database_canonical_source_streams",
                 missing_canonical_streams == 0,
-                f"missing={missing_canonical_streams}",
+                f"Записей без канонического потока: {missing_canonical_streams}.",
             )
             add(
                 "database_canonical_aliases",
                 canonical_aliases_missing == 0 and ambiguous_aliases == 0,
                 (
-                    f"missing_canonical={canonical_aliases_missing}, "
-                    f"ambiguous_external_ids={ambiguous_aliases}"
+                    f"Вакансий без канонического псевдонима: {canonical_aliases_missing}; "
+                    f"неоднозначных внешних идентификаторов: {ambiguous_aliases}."
                 ),
             )
             add(
                 "database_foreign_keys",
                 foreign_key_issues == 0,
-                f"issues={foreign_key_issues}",
+                f"Нарушений внешних ключей: {foreign_key_issues}.",
             )
         except sqlite3.Error as exc:
             add("database_integrity", False, str(exc))
     else:
-        add("database", False, f"missing: {display_path(DB_PATH, ROOT)}")
+        add(
+            "database",
+            False,
+            f"База данных отсутствует: {display_path(DB_PATH, ROOT)}",
+        )
 
     add(
         "automation_confirmation",
         SETTINGS.automation.require_visible_confirmation,
-        "visible confirmation required"
+        "Видимое внешнее подтверждение обязательно."
         if SETTINGS.automation.require_visible_confirmation
-        else "visible confirmation disabled",
+        else "Требование видимого внешнего подтверждения выключено.",
     )
     add(
         "search_streams",
         bool(REQUIRED_SEARCH_STREAMS),
-        ", ".join(REQUIRED_SEARCH_STREAMS) or "none configured",
+        ", ".join(REQUIRED_SEARCH_STREAMS) or "Обязательные потоки не настроены.",
+    )
+    telegram_handles = [channel.handle for channel in TELEGRAM_CHANNELS]
+    add(
+        "telegram_sources",
+        not TELEGRAM_ENABLED or bool(telegram_handles),
+        (
+            "Источники Telegram выключены."
+            if not TELEGRAM_ENABLED
+            else (
+                f"Источники Telegram включены; начальный период: "
+                f"{TELEGRAM_INITIAL_LOOKBACK_DAYS} дн.; "
+                + ", ".join(telegram_handles)
+            )
+        ),
     )
 
     failed = [check for check in checks if check["required"] and not check["ok"]]
@@ -6082,16 +13196,604 @@ def doctor(args: argparse.Namespace) -> None:
         "apply_threshold": SETTINGS.automation.apply_threshold,
         "scan_linkedin_inbox": SETTINGS.mail.scan_linkedin_inbox,
         "archive_processed_linkedin": SETTINGS.mail.archive_processed_linkedin,
+        "telegram_enabled": TELEGRAM_ENABLED,
+        "telegram_initial_lookback_days": TELEGRAM_INITIAL_LOOKBACK_DAYS,
+        "telegram_channels": telegram_handles,
         "checks": checks,
     }
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
         for check in checks:
-            marker = "OK" if check["ok"] else "FAIL"
+            marker = "ПРОЙДЕНО" if check["ok"] else "ОШИБКА"
             print(f"[{marker}] {check['name']}: {check['detail']}")
-        print("Workspace is ready." if not failed else "Workspace needs attention.")
+        print(
+            "Рабочая область готова."
+            if not failed
+            else "Рабочая область требует внимания."
+        )
     if args.strict and failed:
+        raise SystemExit(1)
+
+
+def latest_completed_coverage(
+    conn: sqlite3.Connection, source: str
+) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT * FROM search_runs
+        WHERE source = ? AND status = 'completed'
+        ORDER BY run_date DESC, id DESC LIMIT 1
+        """,
+        (source,),
+    ).fetchone()
+
+
+def _validated_p2_completion_payload(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    step_key: str,
+    item_key: str,
+    manifest_hash: str,
+    manifest_kind: str,
+    source_kind: str,
+) -> dict[str, Any] | None:
+    """Return one exact immutable HH v2 completion manifest, if present."""
+
+    if not manifest_hash:
+        return None
+    row = conn.execute(
+        """
+        SELECT payload_json
+        FROM daily_run_manifests
+        WHERE run_id = ? AND step_key = ? AND item_key = ?
+          AND payload_hash = ? AND manifest_kind = ?
+          AND record_type = 'completion' AND validation_status = 'validated'
+        ORDER BY id DESC LIMIT 1
+        """,
+        (run_id, step_key, item_key, manifest_hash, manifest_kind),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(str(row["payload_json"]))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    scope = payload.get("captured_scope")
+    if not isinstance(scope, dict):
+        return None
+    if not (
+        payload.get("manifest_version") == 2
+        and payload.get("run_id") == run_id
+        and payload.get("step_key") == step_key
+        and payload.get("item_key") == item_key
+        and payload.get("kind") == manifest_kind
+        and payload.get("remote_boundary_verified") is True
+        and payload.get("blockers") == []
+        and scope.get("source_kind") == source_kind
+    ):
+        return None
+    return payload
+
+
+def _p2_ordinary_hh_coverage_complete(
+    conn: sqlite3.Connection, *, run_id: str
+) -> bool:
+    step = conn.execute(
+        """
+        SELECT required, state FROM daily_run_steps
+        WHERE run_id = ? AND step_key = 'hh_coverage'
+        """,
+        (run_id,),
+    ).fetchone()
+    if step is None or not bool(step["required"]) or step["state"] != "completed":
+        return False
+    items = conn.execute(
+        """
+        SELECT item_key, state, manifest_hash
+        FROM daily_run_work_items
+        WHERE run_id = ? AND step_key = 'hh_coverage' AND required = 1
+        ORDER BY order_no, item_key
+        """,
+        (run_id,),
+    ).fetchall()
+    if not items:
+        return False
+    return all(
+        item["state"] == "completed"
+        and _validated_p2_completion_payload(
+            conn,
+            run_id=run_id,
+            step_key="hh_coverage",
+            item_key=str(item["item_key"]),
+            manifest_hash=str(item["manifest_hash"] or ""),
+            manifest_kind="hh_stream",
+            source_kind="ordinary_search",
+        )
+        is not None
+        for item in items
+    )
+
+
+def _p2_personal_hh_coverage_complete(
+    conn: sqlite3.Connection, *, run_id: str
+) -> bool:
+    step = conn.execute(
+        """
+        SELECT required, state, manifest_hash FROM daily_run_steps
+        WHERE run_id = ? AND step_key = 'personal_recommendations'
+        """,
+        (run_id,),
+    ).fetchone()
+    return bool(
+        step
+        and bool(step["required"])
+        and step["state"] == "completed"
+        and _validated_p2_completion_payload(
+            conn,
+            run_id=run_id,
+            step_key="personal_recommendations",
+            item_key="",
+            manifest_hash=str(step["manifest_hash"] or ""),
+            manifest_kind="source_gate",
+            source_kind="personal_recommendations",
+        )
+        is not None
+    )
+
+
+def operational_doctor(args: argparse.Namespace) -> None:
+    """Separate structural health from fail-closed daily closeout readiness."""
+
+    as_of_value = clean_cell(args.as_of)
+    if not as_of_value and clean_cell(getattr(args, "run_id", "")) and args.db.exists():
+        try:
+            with sqlite3.connect(args.db) as probe:
+                row = probe.execute(
+                    "SELECT run_date FROM daily_runs WHERE run_id = ?",
+                    (clean_cell(args.run_id),),
+                ).fetchone()
+                if row:
+                    as_of_value = str(row[0])
+        except sqlite3.Error:
+            pass
+    as_of = parse_iso_date(as_of_value or dt.date.today().isoformat(), label="--as-of")
+    checks: list[dict[str, Any]] = []
+
+    def add(
+        name: str,
+        status: str,
+        detail: str,
+        *,
+        blocks_closeout: bool = False,
+        technical: bool = False,
+    ) -> None:
+        if status not in {"pass", "warn", "fail"}:
+            raise ValueError("Состояние проверки операционного доктора должно быть pass, warn или fail.")
+        checks.append(
+            {
+                "name": name,
+                "status": status,
+                "detail": detail,
+                "blocks_closeout": blocks_closeout,
+                "technical": technical,
+            }
+        )
+
+    required_paths = [SETTINGS.config_path, *SETTINGS.profile.all_files()]
+    missing_paths = [display_path(path, ROOT) for path in required_paths if not path.is_file()]
+    add(
+        "required_workspace_files",
+        "pass" if not missing_paths else "fail",
+        "Все обязательные файлы рабочей области доступны."
+        if not missing_paths
+        else "Отсутствуют обязательные файлы: " + ", ".join(missing_paths),
+        blocks_closeout=True,
+        technical=True,
+    )
+    safe_defaults = (
+        not SETTINGS.automation.auto_apply
+        and SETTINGS.automation.require_visible_confirmation
+    )
+    add(
+        "safe_external_action_defaults",
+        "pass" if safe_defaults else "fail",
+        "Автоматические внешние действия выключены; видимое подтверждение обязательно."
+        if safe_defaults
+        else "Небезопасная политика: требуется auto_apply=false и require_visible_confirmation=true.",
+        blocks_closeout=True,
+    )
+    add(
+        "configured_resume_identifiers",
+        "pass" if DECISION_RESUME_IDS else "warn",
+        "Настроенные идентификаторы резюме: "
+        + (", ".join(DECISION_RESUME_IDS) if DECISION_RESUME_IDS else "не заданы; полнота исходов будет н/д"),
+    )
+
+    if not DB_PATH.exists():
+        add(
+            "database",
+            "fail",
+            f"База данных отсутствует: {display_path(DB_PATH, ROOT)}.",
+            blocks_closeout=True,
+            technical=True,
+        )
+    else:
+        try:
+            with connect_db(args.db) as conn:
+                ensure_schema(conn)
+                quick_check = str(conn.execute("PRAGMA quick_check").fetchone()[0])
+                foreign_keys = len(conn.execute("PRAGMA foreign_key_check").fetchall())
+                schema_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+                add(
+                    "database_quick_check",
+                    "pass" if quick_check == "ok" else "fail",
+                    "Результат проверки целостности SQLite quick_check: " + quick_check + ".",
+                    blocks_closeout=True,
+                    technical=True,
+                )
+                add(
+                    "database_foreign_keys",
+                    "pass" if foreign_keys == 0 else "fail",
+                    f"Нарушений внешних ключей: {foreign_keys}.",
+                    blocks_closeout=True,
+                    technical=True,
+                )
+                add(
+                    "schema_version",
+                    "pass" if schema_version == SCHEMA_VERSION else "fail",
+                    f"Версия базы: {schema_version}; поддерживается: {SCHEMA_VERSION}.",
+                    blocks_closeout=True,
+                    technical=True,
+                )
+
+                orphan_applications = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*) FROM applications a
+                        LEFT JOIN lifecycle_events le ON le.id = a.lifecycle_event_id
+                        WHERE a.lifecycle_event_id IS NOT NULL
+                          AND (le.id IS NULL OR le.vacancy_id != a.vacancy_id)
+                        """
+                    ).fetchone()[0]
+                )
+                confirmed_without_action = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*) FROM lifecycle_events
+                        WHERE event_type = 'application_confirmed'
+                          AND authorization_status = 'explicit'
+                          AND external_action_id IS NULL
+                        """
+                    ).fetchone()[0]
+                )
+                add(
+                    "application_event_reconciliation",
+                    "pass"
+                    if orphan_applications == 0 and confirmed_without_action == 0
+                    else "fail",
+                    f"Несогласованных откликов: {orphan_applications}; "
+                    f"явных подтверждений без внешнего действия: {confirmed_without_action}.",
+                    blocks_closeout=True,
+                )
+                invalid_actions = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*) FROM action_events
+                        WHERE action_state NOT IN (
+                            'review', 'needs_input', 'employer_reply', 'follow_up',
+                            'account_research', 'waiting', 'none'
+                        ) OR bucket NOT IN (
+                            'urgent', 'due_follow_up', 'deep_review',
+                            'account_research', 'backlog'
+                        )
+                        """
+                    ).fetchone()[0]
+                )
+                invalid_lifecycle = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*) FROM lifecycle_events
+                        WHERE event_type IN (
+                            'interview_invited', 'interview_scheduled',
+                            'interview_completed', 'interview_cancelled',
+                            'interview_no_show_candidate', 'interview_no_show_employer'
+                        ) AND (round_no IS NULL OR round_no < 1)
+                        """
+                    ).fetchone()[0]
+                )
+                add(
+                    "valid_lifecycle_action_states",
+                    "pass" if invalid_actions == 0 and invalid_lifecycle == 0 else "fail",
+                    f"Некорректных рабочих состояний: {invalid_actions}; "
+                    f"интервью без номера раунда: {invalid_lifecycle}.",
+                    blocks_closeout=True,
+                )
+
+                scorecard, _ = build_outcome_scorecard_data(conn, as_of)
+                completeness = scorecard["overall"]["field_completeness"]
+                completeness_pct = completeness["percent"]
+                if scorecard["overall"]["confirmed_applications"] == 0:
+                    completeness_status = "warn"
+                    completeness_detail = "Подтверждённых откликов нет; полнота полей пока н/д."
+                elif completeness_pct is not None and completeness_pct >= 80:
+                    completeness_status = "pass"
+                    completeness_detail = f"Полнота полей исходов: {completeness_pct:.1f}%."
+                else:
+                    completeness_status = "warn"
+                    completeness_detail = (
+                        "Полнота полей исходов ниже 80%: "
+                        + ("н/д" if completeness_pct is None else f"{completeness_pct:.1f}%")
+                    )
+                add("field_completeness", completeness_status, completeness_detail)
+
+                quarantine_pending = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM quarantine_records WHERE status = 'pending'"
+                    ).fetchone()[0]
+                )
+                add(
+                    "quarantine_volume",
+                    "pass" if quarantine_pending == 0 else "warn",
+                    f"Необработанных записей карантина: {quarantine_pending}.",
+                )
+                wip = build_wip_queue_data(conn, as_of=as_of, page=1, page_size=1)
+                add(
+                    "wip_overflow",
+                    "pass" if wip["overflow_total"] == 0 else "warn",
+                    f"Записей сверх лимита WIP: {wip['overflow_total']}.",
+                )
+                add(
+                    "sla_overflow",
+                    "pass" if wip["overdue_total"] == 0 else "warn",
+                    f"Просроченных записей по SLA: {wip['overdue_total']}.",
+                )
+
+                generated_paths = [
+                    DASHBOARD_PATH,
+                    REPORTS_DIR / "outcome_scorecard.md",
+                    VIEWS_DIR / "wip_queue.md",
+                ]
+                missing_generated = [
+                    display_path(path, ROOT) for path in generated_paths if not path.is_file()
+                ]
+                projection = projection_state_data(conn)
+                manifest_path = projection_store_dir() / "current" / "manifest.json"
+                manifest_ok = False
+                if manifest_path.is_file():
+                    try:
+                        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                        manifest_ok = (
+                            int(manifest.get("projection_revision", -1))
+                            == int(projection["rendered_revision"])
+                            and str(manifest.get("generation") or "")
+                            == str(projection["published_generation"])
+                        )
+                        if not manifest_ok:
+                            recovery = conn.execute(
+                                """
+                                SELECT details_json FROM daily_run_transitions
+                                WHERE event_type = 'final_projection_recovered'
+                                ORDER BY id DESC LIMIT 1
+                                """
+                            ).fetchone()
+                            if recovery is not None:
+                                details = json.loads(str(recovery["details_json"]))
+                                manifest_ok = (
+                                    str(details.get("generation") or "")
+                                    == str(manifest.get("generation") or "")
+                                    == str(projection["published_generation"])
+                                    and int(details.get("projection_revision", -1))
+                                    == int(manifest.get("projection_revision", -1))
+                                    and int(details.get("acknowledged_revision", -1))
+                                    == int(projection["rendered_revision"])
+                                )
+                    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                        manifest_ok = False
+                generated_ok = (
+                    not missing_generated
+                    and not projection["dirty"]
+                    and manifest_ok
+                    and projection_links_managed(projection_store_dir())
+                )
+                add(
+                    "generated_read_model_freshness",
+                    "pass" if generated_ok else "fail",
+                    "Модели чтения синхронизированы с SQLite."
+                    if generated_ok
+                    else "Требуется возобновляемый rebuild; отсутствуют: "
+                    + (", ".join(missing_generated) or "нет")
+                    + f"; dirty={projection['dirty']}; manifest_ok={manifest_ok}; "
+                    + f"ревизия={projection['rendered_revision']}/{projection['dirty_revision']}.",
+                    blocks_closeout=True,
+                )
+
+                exact_run_id = clean_cell(getattr(args, "run_id", ""))
+                coverage_fresh = bool(
+                    exact_run_id
+                    and _p2_ordinary_hh_coverage_complete(conn, run_id=exact_run_id)
+                )
+                coverage_source = ""
+                if coverage_fresh:
+                    coverage_source = f"HH v2 запуска {exact_run_id}"
+                else:
+                    for run in conn.execute(
+                        """
+                        SELECT id, source FROM search_runs
+                        WHERE run_date = ? AND status = 'completed'
+                        ORDER BY id DESC
+                        """,
+                        (as_of.isoformat(),),
+                    ).fetchall():
+                        completed_streams = {
+                            str(row["stream_key"])
+                            for row in conn.execute(
+                                """
+                                SELECT stream_key FROM search_coverage
+                                WHERE search_run_id = ? AND status = 'completed'
+                                """,
+                                (int(run["id"]),),
+                            ).fetchall()
+                        }
+                        if set(REQUIRED_SEARCH_STREAMS).issubset(completed_streams):
+                            coverage_fresh = True
+                            coverage_source = str(run["source"])
+                            break
+                add(
+                    "required_search_coverage",
+                    "pass" if coverage_fresh else "fail",
+                    f"Все обязательные потоки поиска закрыты источником {coverage_source}."
+                    if coverage_fresh
+                    else "Нет завершённого обязательного покрытия поиска на "
+                    + as_of.isoformat()
+                    + ".",
+                    blocks_closeout=True,
+                )
+
+                if PERSONAL_RECOMMENDATIONS_ENABLED:
+                    personal_ok = bool(
+                        exact_run_id
+                        and _p2_personal_hh_coverage_complete(
+                            conn, run_id=exact_run_id
+                        )
+                    )
+                    if not personal_ok:
+                        personal = conn.execute(
+                            """
+                            SELECT sr.run_date, sr.status
+                            FROM search_runs sr
+                            JOIN search_coverage sc ON sc.search_run_id = sr.id
+                            WHERE sc.stream_key = ? AND sc.status = 'completed'
+                            ORDER BY sr.run_date DESC, sr.id DESC LIMIT 1
+                            """,
+                            (PERSONAL_RECOMMENDATION_STREAM,),
+                        ).fetchone()
+                        personal_ok = bool(
+                            personal
+                            and personal["status"] == "completed"
+                            and personal["run_date"] == as_of.isoformat()
+                        )
+                    add(
+                        "personal_recommendation_coverage",
+                        "pass" if personal_ok else "fail",
+                        "Персональные рекомендации покрыты отдельно."
+                        if personal_ok
+                        else f"Нет завершённого покрытия персонального потока {PERSONAL_RECOMMENDATION_STREAM!r} на {as_of.isoformat()}.",
+                        blocks_closeout=True,
+                    )
+                else:
+                    add(
+                        "personal_recommendation_coverage",
+                        "pass",
+                        "Отдельный поток персональных рекомендаций выключен.",
+                    )
+
+                if TELEGRAM_ENABLED:
+                    checkpoint_rows = conn.execute(
+                        """
+                        SELECT stream_key, last_completed_run_date
+                        FROM source_checkpoints WHERE source = 'telegram'
+                        """
+                    ).fetchall()
+                    checkpoint_map = {
+                        str(row["stream_key"]): str(row["last_completed_run_date"])
+                        for row in checkpoint_rows
+                    }
+                    missing_telegram = [
+                        channel.stream_key
+                        for channel in TELEGRAM_CHANNELS
+                        if checkpoint_map.get(channel.stream_key) != as_of.isoformat()
+                    ]
+                    add(
+                        "incremental_source_checkpoints",
+                        "pass" if not missing_telegram else "fail",
+                        "Все включённые Telegram-каналы закрыты на текущую дату."
+                        if not missing_telegram
+                        else "Нет свежей контрольной точки для: " + ", ".join(missing_telegram),
+                        blocks_closeout=True,
+                    )
+                else:
+                    add(
+                        "incremental_source_checkpoints",
+                        "pass",
+                        "Инкрементальные Telegram-источники выключены.",
+                    )
+
+                if exact_run_id:
+                    durable = get_durable_daily_run(conn, exact_run_id)
+                    if durable is None:
+                        add(
+                            "durable_daily_run",
+                            "fail",
+                            f"Долговечный ежедневный запуск {exact_run_id} не найден.",
+                            blocks_closeout=True,
+                        )
+                    else:
+                        run_readiness = daily_run_closeout_readiness(
+                            conn,
+                            SETTINGS,
+                            run_id=exact_run_id,
+                            mutate_dynamic=False,
+                        )
+                        add(
+                            "durable_daily_run_preconditions",
+                            "pass" if run_readiness["ready"] else "fail",
+                            "Все обязательные шаги зафиксированного плана и манифесты согласованы."
+                            if run_readiness["ready"]
+                            else "; ".join(run_readiness["issues"][:20]),
+                            blocks_closeout=True,
+                        )
+                        completed = durable["status"] == "completed"
+                        add(
+                            "durable_daily_run_completed",
+                            "pass" if completed else "fail",
+                            (
+                                f"Ежедневный запуск {exact_run_id} завершён программным закрытием."
+                                if completed
+                                else f"Ежедневный запуск {exact_run_id} имеет состояние {durable['status']}; "
+                                "структурное здоровье не является доказательством закрытия."
+                            ),
+                            blocks_closeout=True,
+                        )
+        except (sqlite3.Error, RuntimeError) as exc:
+            add(
+                "database_operational_read",
+                "fail",
+                f"Не удалось проверить операционное состояние: {exc}",
+                blocks_closeout=True,
+                technical=True,
+            )
+
+    technical_health = all(
+        check["status"] != "fail" for check in checks if check["technical"]
+    )
+    ready = technical_health and all(
+        not (check["blocks_closeout"] and check["status"] == "fail")
+        for check in checks
+    )
+    result = {
+        "as_of": as_of.isoformat(),
+        "run_id": clean_cell(getattr(args, "run_id", "")),
+        "technical_health": technical_health,
+        "ready_for_daily_closeout": ready,
+        "overall_status": "pass"
+        if ready
+        else ("warn" if technical_health else "fail"),
+        "checks": checks,
+    }
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        marker = {"pass": "ПРОЙДЕНО", "warn": "ПРЕДУПРЕЖДЕНИЕ", "fail": "ОШИБКА"}
+        for check in checks:
+            print(f"[{marker[check['status']]}] {check['name']}: {check['detail']}")
+        print(
+            "Ежедневное закрытие разрешено."
+            if ready
+            else "Ежедневное закрытие не готово: устраните точные ошибки выше."
+        )
+    if args.strict and not ready:
         raise SystemExit(1)
 
 
@@ -6105,7 +13807,7 @@ def extract_config_argument(argv: list[str]) -> tuple[list[str], Path | None]:
         value = argv[index]
         if value == "--config":
             if index + 1 >= len(argv):
-                raise SystemExit("--config requires a path")
+                raise SystemExit("Для --config требуется путь.")
             selected = Path(argv[index + 1])
             index += 2
             continue
@@ -6120,63 +13822,656 @@ def extract_config_argument(argv: list[str]) -> tuple[list[str], Path | None]:
     return normalized, selected
 
 
+def extract_runtime_arguments(argv: list[str]) -> list[str]:
+    """Allow global coordination flags before or after the subcommand."""
+
+    normalized: list[str] = []
+    extracted: list[str] = []
+    index = 0
+    while index < len(argv):
+        value = argv[index]
+        if value in {"--defer-render", "--no-render"}:
+            extracted.append("--defer-render")
+            index += 1
+            continue
+        matched = False
+        for option in ("--lock-timeout", "--run-lease"):
+            if value == option:
+                if index + 1 >= len(argv):
+                    normalized.append(value)
+                    index += 1
+                    matched = True
+                    break
+                extracted.extend((option, argv[index + 1]))
+                index += 2
+                matched = True
+                break
+            if value.startswith(option + "="):
+                extracted.extend((option, value.split("=", 1)[1]))
+                index += 1
+                matched = True
+                break
+        if matched:
+            continue
+        normalized.append(value)
+        index += 1
+    return [*extracted, *normalized]
+
+
+def environment_flag(name: str) -> bool:
+    return clean_cell(os.environ.get(name, "")).lower() in {"1", "true", "yes", "on"}
+
+
 def build_parser() -> argparse.ArgumentParser:
+    argparse_messages = {
+        "usage: ": "использование: ",
+        "positional arguments": "позиционные аргументы",
+        "options": "параметры",
+        "show this help message and exit": "показать эту справку и выйти",
+        "the following arguments are required: %s": "требуются следующие аргументы: %s",
+        "unrecognized arguments: %s": "нераспознанные аргументы: %s",
+        "expected one argument": "ожидается один аргумент",
+        "not allowed with argument %s": "нельзя использовать вместе с аргументом %s",
+        "argument %s: invalid choice: %(value)r (choose from %(choices)s)": (
+            "аргумент %s: недопустимое значение %(value)r; выберите из %(choices)s"
+        ),
+    }
+    argparse._ = lambda message: argparse_messages.get(message, message)
     parser = argparse.ArgumentParser(
-        description="Job-search database, reports, and dashboard"
+        description="База поиска работы, отчёты и панель"
     )
     parser.set_defaults(func=rebuild)
     parser.add_argument(
         "--config",
         type=Path,
         default=SETTINGS.config_path,
-        help="Local TOML settings path (also supports JOB_SEARCH_CONFIG)",
+        help="Путь к локальным настройкам TOML; также поддерживается JOB_SEARCH_CONFIG",
     )
-    parser.add_argument("--db", type=Path, default=DB_PATH, help="SQLite database path")
-    parser.add_argument("--json", action="store_true", help="Print machine-readable rebuild summary")
+    parser.add_argument("--db", type=Path, default=DB_PATH, help="Путь к базе SQLite")
+    parser.add_argument("--json", action="store_true", help="Вывести машиночитаемый JSON")
+    parser.add_argument(
+        "--defer-render",
+        "--no-render",
+        dest="defer_render",
+        action="store_true",
+        default=environment_flag("JOB_SEARCH_DEFER_RENDER"),
+        help="Зафиксировать SQLite и ревизию dirty без пересборки проекций",
+    )
+    parser.add_argument(
+        "--lock-timeout",
+        type=validate_lock_timeout,
+        default=float(
+            os.environ.get(
+                "JOB_SEARCH_LOCK_TIMEOUT", str(DEFAULT_LOCK_TIMEOUT_SECONDS)
+            )
+        ),
+        help="Ограниченное ожидание блокировок записи и render в секундах",
+    )
+    parser.add_argument(
+        "--run-lease",
+        default=os.environ.get("JOB_SEARCH_RUN_LEASE", ""),
+        help="Токен активного ежедневного запуска для защиты от конкурирующих оркестраторов",
+    )
 
     sub = parser.add_subparsers()
 
     init_parser = sub.add_parser(
-        "init", help="Create local settings, private profile templates, and database"
+        "init", help="Создать локальные настройки, приватные шаблоны и базу"
     )
     init_parser.add_argument("--json", action="store_true")
     init_parser.set_defaults(func=initialize_workspace)
 
     doctor_parser = sub.add_parser(
-        "doctor", help="Check local configuration, profile files, and database"
+        "doctor", help="Проверить настройки, файлы профиля и базу"
     )
     doctor_parser.add_argument("--json", action="store_true")
     doctor_parser.add_argument(
-        "--strict", action="store_true", help="Exit non-zero when a required check fails"
+        "--strict", action="store_true", help="Вернуть ненулевой код при обязательной ошибке"
     )
     doctor_parser.set_defaults(func=doctor)
 
-    rebuild_parser = sub.add_parser("rebuild", help="Regenerate views and dashboard from SQLite")
+    operational_doctor_parser = sub.add_parser(
+        "operational-doctor",
+        help="Проверить готовность ежедневного операционного закрытия",
+    )
+    operational_doctor_parser.add_argument("--db", type=Path, default=DB_PATH)
+    operational_doctor_parser.add_argument("--as-of", default="")
+    operational_doctor_parser.add_argument(
+        "--run-id", default="", help="Проверить точный долговечный ежедневный запуск"
+    )
+    operational_doctor_parser.add_argument("--json", action="store_true")
+    operational_doctor_parser.add_argument(
+        "--strict", action="store_true", help="Вернуть ненулевой код, если закрытие не готово"
+    )
+    operational_doctor_parser.set_defaults(func=operational_doctor)
+
+    rebuild_parser = sub.add_parser("rebuild", help="Пересобрать представления, отчёты и панель из SQLite")
     rebuild_parser.add_argument("--db", type=Path, default=DB_PATH)
     rebuild_parser.add_argument("--json", action="store_true")
     rebuild_parser.set_defaults(func=rebuild)
 
-    stats_parser = sub.add_parser("stats", help="Print current database KPI summary")
+    projection_parser = sub.add_parser(
+        "projection-status",
+        help="Показать ревизию проекций dirty/fresh и активный lease ежедневного запуска",
+    )
+    projection_parser.add_argument("--db", type=Path, default=DB_PATH)
+    projection_parser.add_argument("--json", action="store_true")
+    projection_parser.set_defaults(func=projection_status_command)
+
+    begin_run_parser = sub.add_parser(
+        "begin-daily-run",
+        help="Получить ограниченный lease для оркестрации одного ежедневного запуска",
+    )
+    begin_run_parser.add_argument("--db", type=Path, default=DB_PATH)
+    begin_run_parser.add_argument("--run-id", required=True)
+    begin_run_parser.add_argument("--run-date", default="")
+    begin_run_parser.add_argument(
+        "--timezone",
+        default=SETTINGS.project.timezone,
+        help="Часовой пояс IANA для зафиксированного плана",
+    )
+    begin_run_parser.add_argument("--owner", default="")
+    begin_run_parser.add_argument(
+        "--lease-seconds",
+        type=int,
+        default=DEFAULT_DAILY_RUN_LEASE_SECONDS,
+    )
+    begin_run_parser.add_argument("--json", action="store_true")
+    begin_run_parser.set_defaults(func=begin_daily_run_command)
+
+    finalize_run_parser = sub.add_parser(
+        "finalize-daily-run",
+        help="Один раз атомарно пересобрать проекции и закрыть lease ежедневного запуска",
+    )
+    finalize_run_parser.add_argument("--db", type=Path, default=DB_PATH)
+    finalize_run_parser.add_argument("--json", action="store_true")
+    finalize_run_parser.set_defaults(func=finalize_daily_run_command)
+
+    run_status_parser = sub.add_parser(
+        "daily-run-status",
+        help="Компактно показать незавершённый долговечный запуск и следующий безопасный шаг",
+    )
+    run_status_parser.add_argument("--db", type=Path, default=DB_PATH)
+    run_status_parser.add_argument("--run-id", default="")
+    run_status_parser.add_argument(
+        "--verbose", action="store_true", help="Включить полный план, манифесты и историю"
+    )
+    run_status_parser.add_argument("--history-limit", type=int, default=100)
+    run_status_parser.add_argument("--json", action="store_true")
+    run_status_parser.set_defaults(func=daily_run_status_command)
+
+    resume_run_parser = sub.add_parser(
+        "resume-daily-run",
+        help="Получить новый lease для существующего незавершённого ежедневного запуска",
+    )
+    resume_run_parser.add_argument("--db", type=Path, default=DB_PATH)
+    resume_run_parser.add_argument("--run-id", default="")
+    resume_run_parser.add_argument("--owner", default="")
+    resume_run_parser.add_argument(
+        "--lease-seconds", type=int, default=DEFAULT_DAILY_RUN_LEASE_SECONDS
+    )
+    resume_run_parser.add_argument("--json", action="store_true")
+    resume_run_parser.set_defaults(func=resume_daily_run_command)
+
+    pause_run_parser = sub.add_parser(
+        "pause-daily-run",
+        help="Чисто освободить lease, сохранив ежедневный запуск для продолжения",
+    )
+    pause_run_parser.add_argument("--db", type=Path, default=DB_PATH)
+    pause_run_parser.add_argument("--run-id", default="")
+    pause_run_parser.add_argument("--reason", required=True)
+    pause_run_parser.add_argument("--json", action="store_true")
+    pause_run_parser.set_defaults(func=pause_daily_run_command)
+
+    def add_daily_run_work_target(target: argparse.ArgumentParser) -> None:
+        target.add_argument("--db", type=Path, default=DB_PATH)
+        target.add_argument("--run-id", required=True)
+        target.add_argument("--step-key", required=True)
+        target.add_argument("--item-key", default="")
+        target.add_argument("--json", action="store_true")
+
+    start_work_parser = sub.add_parser(
+        "start-daily-run-work", help="Начать один ожидающий шаг или единицу работы"
+    )
+    add_daily_run_work_target(start_work_parser)
+    start_work_parser.set_defaults(func=start_daily_run_work_command)
+
+    checkpoint_work_parser = sub.add_parser(
+        "checkpoint-daily-run-work",
+        help="Сохранить проверенную частичную контрольную точку",
+    )
+    add_daily_run_work_target(checkpoint_work_parser)
+    checkpoint_work_parser.add_argument("--manifest", type=Path, required=True)
+    checkpoint_work_parser.set_defaults(func=checkpoint_daily_run_work_command)
+
+    complete_work_parser = sub.add_parser(
+        "complete-daily-run-work",
+        help="Завершить шаг или единицу работы по корректному манифесту",
+    )
+    add_daily_run_work_target(complete_work_parser)
+    complete_work_parser.add_argument("--manifest", type=Path, required=True)
+    complete_work_parser.set_defaults(func=complete_daily_run_work_command)
+
+    block_work_parser = sub.add_parser(
+        "block-daily-run-work", help="Сохранить точную блокировку и возможность повтора"
+    )
+    add_daily_run_work_target(block_work_parser)
+    block_work_parser.add_argument("--code", required=True)
+    block_work_parser.add_argument("--reason", required=True)
+    retryability = block_work_parser.add_mutually_exclusive_group(required=True)
+    retryability.add_argument("--retryable", action="store_true")
+    retryability.add_argument("--not-retryable", action="store_false", dest="retryable")
+    block_work_parser.set_defaults(func=block_daily_run_work_command)
+
+    uncertain_work_parser = sub.add_parser(
+        "mark-daily-run-work-uncertain",
+        help="Потребовать сверку без автоматической повторной отправки",
+    )
+    add_daily_run_work_target(uncertain_work_parser)
+    uncertain_work_parser.add_argument("--reason", required=True)
+    uncertain_work_parser.set_defaults(func=uncertain_daily_run_work_command)
+
+    invalidate_work_parser = sub.add_parser(
+        "invalidate-daily-run-work",
+        help="Аудируемо инвалидировать или переоткрыть завершённую работу",
+    )
+    add_daily_run_work_target(invalidate_work_parser)
+    invalidate_work_parser.add_argument("--reason", required=True)
+    invalidate_work_parser.add_argument("--leave-invalidated", action="store_true")
+    invalidate_work_parser.set_defaults(func=invalidate_daily_run_work_command)
+
+    cancel_due_followup_parser = sub.add_parser(
+        "cancel-due-followup-obligation",
+        help=(
+            "Аудируемо отменить точную frozen due-follow-up обязанность без "
+            "отзыва отклика или изменения lifecycle"
+        ),
+        description=(
+            "Требует точные run ID и item key из daily-run-status --verbose, "
+            "очищает только даты повторного обращения вакансии и отклика, "
+            "записывает user_cancelled_followup_obligation и завершает item."
+        ),
+    )
+    cancel_due_followup_parser.add_argument("--db", type=Path, default=DB_PATH)
+    cancel_due_followup_parser.add_argument("--run-id", required=True)
+    cancel_due_followup_parser.add_argument("--item-key", required=True)
+    cancel_due_followup_parser.add_argument(
+        "--reason",
+        required=True,
+        help="Непустая точная причина оператора для append-only audit",
+    )
+    cancel_due_followup_parser.add_argument("--json", action="store_true")
+    cancel_due_followup_parser.set_defaults(
+        func=cancel_due_followup_obligation_command
+    )
+
+    reverified_inbound_parser = sub.add_parser(
+        "resolve-due-followup-from-reverified-inbound",
+        help=(
+            "Разрешить frozen follow-up свежей проверкой исторического "
+            "человеческого входящего без изменения его даты"
+        ),
+        description=(
+            "Требует точные run/item/interaction, канал, conversation target, "
+            "remote evidence и отдельный fail-closed JSON-манифест. Команда "
+            "не создаёт новое взаимодействие и не меняет status, stage или lifecycle."
+        ),
+    )
+    reverified_inbound_parser.add_argument("--db", type=Path, default=DB_PATH)
+    reverified_inbound_parser.add_argument("--run-id", required=True)
+    reverified_inbound_parser.add_argument("--item-key", required=True)
+    reverified_inbound_parser.add_argument(
+        "--interaction-id", type=int, required=True, help="ID исходного inbound human_reply"
+    )
+    reverified_inbound_parser.add_argument(
+        "--observed-at", required=True, help="Текущее время повторной проверки ISO 8601"
+    )
+    reverified_inbound_parser.add_argument("--channel", required=True)
+    reverified_inbound_parser.add_argument(
+        "--conversation-target", required=True, help="Точная идентичность диалога или адресата"
+    )
+    reverified_inbound_parser.add_argument(
+        "--remote-evidence-reference",
+        required=True,
+        help="Точная ссылка или устойчивый ID удалённого доказательства",
+    )
+    reverified_inbound_parser.add_argument(
+        "--manifest", type=Path, required=True, help="JSON-манифест reverified_historical_inbound_v1"
+    )
+    reverified_inbound_parser.add_argument("--json", action="store_true")
+    reverified_inbound_parser.set_defaults(
+        func=resolve_due_followup_from_reverified_inbound_command
+    )
+
+    refresh_plan_parser = sub.add_parser(
+        "refresh-daily-run-plan",
+        help="Явно обновить зафиксированный план после изменения конфигурации",
+    )
+    refresh_plan_parser.add_argument("--db", type=Path, default=DB_PATH)
+    refresh_plan_parser.add_argument("--run-id", required=True)
+    refresh_plan_parser.add_argument("--reason", required=True)
+    refresh_plan_parser.add_argument(
+        "--reclassify-legacy-external-actions",
+        action="store_true",
+        help=(
+            "Явно перенести старые drafted/authorized-only элементы активного плана "
+            "в аудируемый необязательный backlog без изменения истории действий"
+        ),
+    )
+    refresh_plan_parser.add_argument("--json", action="store_true")
+    refresh_plan_parser.set_defaults(func=refresh_daily_run_plan_command)
+
+    hh_adapter_parser = sub.add_parser(
+        "hh-browser-adapter",
+        help="Показать проверенный DOM-адаптер HH только для чтения и его SHA-256",
+    )
+    hh_adapter_parser.add_argument("--print-source", action="store_true")
+    hh_adapter_parser.add_argument("--json", action="store_true")
+    hh_adapter_parser.set_defaults(func=hh_browser_adapter_command)
+
+    hh_validate_parser = sub.add_parser(
+        "validate-hh-capture",
+        help="Строго проверить синтетический снимок DOM HH без записи в SQLite",
+    )
+    hh_validate_parser.add_argument("--capture", type=Path, required=True)
+    hh_validate_parser.add_argument("--detail", action="store_true")
+    hh_validate_parser.add_argument("--verbose", action="store_true")
+    hh_validate_parser.add_argument("--json", action="store_true")
+    hh_validate_parser.set_defaults(func=validate_hh_capture_command)
+
+    def add_hh_run_stream_target(target: argparse.ArgumentParser) -> None:
+        target.add_argument("--db", type=Path, default=DB_PATH)
+        target.add_argument("--run-id", required=True)
+        target.add_argument("--stream-key", required=True)
+        target.add_argument("--json", action="store_true")
+
+    hh_plan_parser = sub.add_parser(
+        "plan-hh-acquisition",
+        help="Зафиксировать план full/shadow/delta/resume/audit точного потока HH в P1",
+    )
+    add_hh_run_stream_target(hh_plan_parser)
+    hh_plan_parser.add_argument(
+        "--source-kind",
+        choices=("ordinary_search", "personal_recommendations"),
+        required=True,
+    )
+    hh_plan_parser.add_argument("--query-json", type=Path, default=None)
+    hh_plan_parser.add_argument("--query-fingerprint", default="")
+    hh_plan_parser.set_defaults(func=plan_hh_acquisition_command)
+
+    hh_record_parser = sub.add_parser(
+        "record-hh-page",
+        help="Записать устойчивый снимок страницы, сверенные ID и манифест контрольной точки P1 v2",
+    )
+    add_hh_run_stream_target(hh_record_parser)
+    hh_record_parser.add_argument("--capture", type=Path, required=True)
+    hh_record_parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Явно вывести полную сверку вместо ограниченного результата",
+    )
+    hh_record_parser.set_defaults(func=record_hh_page_command)
+
+    hh_detail_parser = sub.add_parser(
+        "record-hh-detail",
+        help="Сохранить снимок вакансии только для ограниченной очереди новых и изменённых ID",
+    )
+    add_hh_run_stream_target(hh_detail_parser)
+    hh_detail_parser.add_argument("--capture", type=Path, required=True)
+    hh_detail_parser.set_defaults(func=record_hh_detail_command)
+
+    hh_next_parser = sub.add_parser(
+        "next-hh-work",
+        help="Показать следующий безопасный шаг сбора, детализации или завершения HH",
+    )
+    hh_next_parser.add_argument("--db", type=Path, default=DB_PATH)
+    hh_next_parser.add_argument("--run-id", required=True)
+    hh_next_parser.add_argument("--stream-key", default="")
+    hh_next_parser.add_argument("--json", action="store_true")
+    hh_next_parser.set_defaults(func=next_hh_work_command)
+
+    hh_finalize_parser = sub.add_parser(
+        "finalize-hh-stream",
+        help="Завершить обычный поток HH по полному обходу или доказанной границе delta",
+    )
+    add_hh_run_stream_target(hh_finalize_parser)
+    hh_finalize_parser.set_defaults(func=finalize_hh_stream_command)
+
+    hh_personal_finalize_parser = sub.add_parser(
+        "finalize-hh-personal-recommendations",
+        help="Отдельно завершить персональные рекомендации по собственному манифесту v2",
+    )
+    add_hh_run_stream_target(hh_personal_finalize_parser)
+    hh_personal_finalize_parser.set_defaults(func=finalize_hh_personal_command)
+
+    hh_inspect_parser = sub.add_parser(
+        "inspect-hh-checkpoint",
+        help="Показать контрольную точку, доказательства shadow/audit и состояние потоков HH",
+    )
+    hh_inspect_parser.add_argument("--db", type=Path, default=DB_PATH)
+    hh_inspect_parser.add_argument("--run-id", default="")
+    hh_inspect_parser.add_argument("--stream-key", default="")
+    hh_inspect_parser.add_argument("--history-limit", type=int, default=20)
+    hh_inspect_parser.add_argument("--json", action="store_true")
+    hh_inspect_parser.set_defaults(func=inspect_hh_checkpoint_command)
+
+    hh_zero_evidence_invalidate_parser = sub.add_parser(
+        "invalidate-hh-zero-evidence-plan",
+        help=(
+            "Аудируемо инвалидировать только пустой замороженный план HH перед "
+            "перепланированием"
+        ),
+        description=(
+            "Проверить отсутствие страниц, карточек, деталей, контрольных точек, "
+            "манифеста и любого прогресса; сохранить audit-событие и разрешить "
+            "перепланирование с текущим DOM-адаптером."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Workflow: 1) при необходимости переоткройте точную единицу P1 через "
+            "invalidate-daily-run-work --reason; 2) выполните эту команду; "
+            "3) повторите plan-hh-acquisition для того же --run-id, --stream-key, "
+            "--source-kind и прежнего query fingerprint.\n"
+            "Флаги каждой записи: --defer-render --run-lease <token>."
+        ),
+    )
+    add_hh_run_stream_target(hh_zero_evidence_invalidate_parser)
+    hh_zero_evidence_invalidate_parser.add_argument(
+        "--reason",
+        required=True,
+        help="Явная причина оператора для append-only audit-события",
+    )
+    hh_zero_evidence_invalidate_parser.set_defaults(
+        func=invalidate_hh_zero_evidence_plan_command
+    )
+
+    hh_invalidate_parser = sub.add_parser(
+        "invalidate-hh-checkpoint",
+        help="Аудируемо запретить небезопасную контрольную точку delta для точного потока HH",
+    )
+    add_hh_run_stream_target(hh_invalidate_parser)
+    hh_invalidate_parser.add_argument("--reason", required=True)
+    hh_invalidate_parser.set_defaults(func=invalidate_hh_checkpoint_command)
+
+    stats_parser = sub.add_parser("stats", help="Вывести текущие показатели базы")
     stats_parser.add_argument("--db", type=Path, default=DB_PATH)
     stats_parser.set_defaults(func=print_stats)
 
     conversion_parser = sub.add_parser(
         "conversion-report",
-        help="Calculate vacancy-level application conversion cohorts",
+        help="Рассчитать совместимые когорты исходов откликов",
     )
     conversion_parser.add_argument("--db", type=Path, default=DB_PATH)
     conversion_parser.add_argument("--as-of", default="")
     conversion_parser.add_argument("--json", action="store_true")
     conversion_parser.set_defaults(func=conversion_report_command)
 
-    migrate_parser = sub.add_parser("migrate-stages", help="Migrate existing DB rows to the compact funnel stage model")
+    scorecard_parser = sub.add_parser(
+        "outcome-scorecard",
+        help="Сформировать карту исходов по подтверждённым откликам",
+    )
+    scorecard_parser.add_argument("--db", type=Path, default=DB_PATH)
+    scorecard_parser.add_argument("--as-of", default="")
+    scorecard_parser.add_argument("--json", action="store_true")
+    scorecard_parser.set_defaults(func=outcome_scorecard_command)
+
+    wip_parser = sub.add_parser(
+        "wip-queue", help="Показать ограниченную очередь WIP с пагинацией и SLA"
+    )
+    wip_parser.add_argument("--db", type=Path, default=DB_PATH)
+    wip_parser.add_argument("--as-of", default="")
+    wip_parser.add_argument("--page", type=int, default=1)
+    wip_parser.add_argument("--page-size", type=int, default=WIP_PAGE_SIZE)
+    wip_parser.add_argument("--bucket", choices=sorted(WIP_BUCKET_KEYS), default="")
+    wip_parser.add_argument("--json", action="store_true")
+    wip_parser.set_defaults(func=wip_queue_command)
+
+    lifecycle_parser = sub.add_parser(
+        "record-lifecycle-event",
+        help="Добавить доказательное событие жизненного цикла вакансии",
+    )
+    lifecycle_parser.add_argument("--db", type=Path, default=DB_PATH)
+    lifecycle_parser.add_argument("--id", type=int, default=None)
+    lifecycle_parser.add_argument("--url", default="")
+    lifecycle_parser.add_argument("--external-id", default="")
+    lifecycle_parser.add_argument(
+        "--event-type", choices=sorted(LIFECYCLE_EVENT_TYPES), required=True
+    )
+    lifecycle_parser.add_argument("--at", default="")
+    lifecycle_parser.add_argument("--evidence-at", default="")
+    lifecycle_parser.add_argument("--evidence-note", required=True)
+    lifecycle_parser.add_argument("--evidence-url", default="")
+    lifecycle_parser.add_argument("--source", required=True)
+    lifecycle_parser.add_argument("--external-reference", default="")
+    lifecycle_parser.add_argument("--round-no", type=int, default=None)
+    lifecycle_parser.add_argument("--scheduled-at", default="")
+    lifecycle_parser.add_argument("--campaign-id", default="")
+    lifecycle_parser.add_argument("--role-family", default="")
+    lifecycle_parser.add_argument(
+        "--confidence", choices=sorted(EVIDENCE_CONFIDENCE | {"unknown"}), default=""
+    )
+    lifecycle_parser.add_argument("--master-resume-id", default="")
+    lifecycle_parser.add_argument("--planned-resume-id", default="")
+    lifecycle_parser.add_argument("--actual-resume-id", default="")
+    lifecycle_parser.add_argument("--message-variant", default="")
+    lifecycle_parser.add_argument(
+        "--human-path-status", choices=sorted(HUMAN_PATH_STATUSES), default=""
+    )
+    lifecycle_parser.add_argument("--hard-gates-json", default="")
+    lifecycle_parser.add_argument("--unresolved-questions-json", default="")
+    lifecycle_parser.add_argument("--json", action="store_true")
+    lifecycle_parser.set_defaults(func=record_lifecycle_event_command)
+
+    action_parser = sub.add_parser(
+        "set-current-action",
+        help="Добавить новое текущее рабочее действие, не меняя жизненный цикл",
+    )
+    action_parser.add_argument("--db", type=Path, default=DB_PATH)
+    action_parser.add_argument("--id", type=int, default=None)
+    action_parser.add_argument("--url", default="")
+    action_parser.add_argument("--external-id", default="")
+    action_parser.add_argument("--action-state", choices=sorted(ACTION_STATES), required=True)
+    action_parser.add_argument("--bucket", choices=sorted(WIP_BUCKET_KEYS), required=True)
+    action_parser.add_argument("--at", default="")
+    action_parser.add_argument("--due-date", default="")
+    action_parser.add_argument("--priority", type=int, default=0)
+    action_parser.add_argument("--priority-reason", default="")
+    action_parser.add_argument("--evidence-note", default="")
+    action_parser.add_argument("--source", default="cli:set-current-action")
+    action_parser.add_argument("--json", action="store_true")
+    action_parser.set_defaults(func=set_current_action_command)
+
+    external_action_parser = sub.add_parser(
+        "record-external-action",
+        help="Зафиксировать состояние внешнего действия с разрешением и доказательством",
+    )
+    external_action_parser.add_argument("--db", type=Path, default=DB_PATH)
+    external_action_parser.add_argument("--id", type=int, default=None)
+    external_action_parser.add_argument("--url", default="")
+    external_action_parser.add_argument("--external-id", default="")
+    external_action_parser.add_argument("--action-key", required=True)
+    external_action_parser.add_argument(
+        "--action-type", choices=sorted(EXTERNAL_ACTION_TYPES), required=True
+    )
+    external_action_parser.add_argument(
+        "--state", choices=sorted(EXTERNAL_ACTION_STATES), required=True
+    )
+    external_action_parser.add_argument("--at", default="")
+    external_action_parser.add_argument("--evidence-at", default="")
+    external_action_parser.add_argument("--authorization-note", default="")
+    external_action_parser.add_argument("--evidence-note", default="")
+    external_action_parser.add_argument("--evidence-url", default="")
+    external_action_parser.add_argument("--source", required=True)
+    external_action_parser.add_argument("--external-reference", default="")
+    external_action_parser.add_argument("--application-source-hit-id", type=int, default=None)
+    external_action_parser.add_argument("--campaign-id", default="")
+    external_action_parser.add_argument("--role-family", default="")
+    external_action_parser.add_argument(
+        "--confidence", choices=sorted(EVIDENCE_CONFIDENCE | {"unknown"}), default=""
+    )
+    external_action_parser.add_argument("--master-resume-id", default="")
+    external_action_parser.add_argument("--planned-resume-id", default="")
+    external_action_parser.add_argument("--actual-resume-id", default="")
+    external_action_parser.add_argument("--message-variant", default="")
+    external_action_parser.add_argument(
+        "--human-path-status", choices=sorted(HUMAN_PATH_STATUSES), default=""
+    )
+    external_action_parser.add_argument("--hard-gates-json", default="")
+    external_action_parser.add_argument("--unresolved-questions-json", default="")
+    external_action_parser.add_argument("--json", action="store_true")
+    external_action_parser.set_defaults(func=record_external_action_command)
+
+    quarantine_parser = sub.add_parser(
+        "quarantine-report", help="Показать аудит записей карантина"
+    )
+    quarantine_parser.add_argument("--db", type=Path, default=DB_PATH)
+    quarantine_parser.add_argument("--page", type=int, default=1)
+    quarantine_parser.add_argument("--page-size", type=int, default=50)
+    quarantine_parser.add_argument("--status", choices=sorted(QUARANTINE_STATUSES), default="")
+    quarantine_parser.add_argument(
+        "--classification", choices=sorted(QUARANTINE_CLASSIFICATIONS), default=""
+    )
+    quarantine_parser.add_argument("--json", action="store_true")
+    quarantine_parser.set_defaults(func=quarantine_report_command)
+
+    reprocess_parser = sub.add_parser(
+        "reprocess-quarantine", help="Повторно обработать одну точную запись карантина"
+    )
+    reprocess_parser.add_argument("--db", type=Path, default=DB_PATH)
+    reprocess_parser.add_argument("--id", dest="quarantine_id", type=int, required=True)
+    reprocess_parser.add_argument("--replacement-json", type=Path, default=None)
+    reprocess_parser.add_argument("--json", action="store_true")
+    reprocess_parser.set_defaults(func=reprocess_quarantine_command)
+
+    legacy_classification_parser = sub.add_parser(
+        "classify-legacy-records",
+        help="Показать пробную классификацию исторических строк без изменений",
+    )
+    legacy_classification_parser.add_argument("--db", type=Path, default=DB_PATH)
+    legacy_classification_parser.add_argument("--dry-run", action="store_true")
+    legacy_classification_parser.add_argument("--limit", type=int, default=100)
+    legacy_classification_parser.add_argument("--json", action="store_true")
+    legacy_classification_parser.set_defaults(func=legacy_classification_dry_run_command)
+
+    false_negative_parser = sub.add_parser(
+        "false-negative-audit",
+        help="Провести воспроизводимый аудит отклонённых и низкоприоритетных вакансий",
+    )
+    false_negative_parser.add_argument("--db", type=Path, default=DB_PATH)
+    false_negative_parser.add_argument("--as-of", default="")
+    false_negative_parser.add_argument("--sample-size", type=int, default=25)
+    false_negative_parser.add_argument("--seed", default="find-dream-job-v6")
+    false_negative_parser.add_argument("--json", action="store_true")
+    false_negative_parser.set_defaults(func=false_negative_audit_command)
+
+    migrate_parser = sub.add_parser("migrate-stages", help="Перенести старые этапы в компактную модель воронки")
     migrate_parser.add_argument("--db", type=Path, default=DB_PATH)
-    migrate_parser.add_argument("--no-backup", action="store_true", help="Do not create a .bak copy before migration")
+    migrate_parser.add_argument("--no-backup", action="store_true", help="Не создавать резервную копию перед переносом")
     migrate_parser.set_defaults(func=migrate_stages)
 
     schema_parser = sub.add_parser(
         "migrate-schema",
-        help="Back up and migrate an existing SQLite database to the current schema",
+        help="Создать резервную копию и обновить схему SQLite",
     )
     schema_parser.add_argument("--db", type=Path, default=DB_PATH)
     schema_parser.add_argument("--no-backup", action="store_true")
@@ -6185,51 +14480,73 @@ def build_parser() -> argparse.ArgumentParser:
 
     plan_parser = sub.add_parser(
         "build-coverage-plan",
-        help="Build deterministic HH URLs and a coverage-manifest skeleton",
+        help="Построить детерминированные URL HH и шаблон манифеста покрытия",
     )
-    plan_parser.add_argument("file", type=Path, help="JSON plan with stream query specifications")
+    plan_parser.add_argument("file", type=Path, help="JSON-план со спецификациями потоков")
     plan_parser.add_argument("--output", type=Path, default=None)
     plan_parser.set_defaults(func=build_coverage_plan_command)
 
     coverage_parser = sub.add_parser(
         "check-coverage",
-        help="Persist and fail-closed validate a completed search coverage manifest",
+        help="Сохранить и строго проверить завершённый манифест покрытия",
     )
-    coverage_parser.add_argument("file", type=Path, help="Completed coverage manifest JSON")
+    coverage_parser.add_argument("file", type=Path, help="Завершённый JSON-манифест покрытия")
     coverage_parser.add_argument("--db", type=Path, default=DB_PATH)
     coverage_parser.set_defaults(func=check_coverage)
 
-    watch_parser = sub.add_parser("watch", help="Regenerate views automatically when the SQLite database changes")
+    telegram_plan_parser = sub.add_parser(
+        "build-telegram-plan",
+        help="Построить план первичного или инкрементального просмотра Telegram",
+    )
+    telegram_plan_parser.add_argument(
+        "--run-date", default="", help="Дата запуска YYYY-MM-DD; по умолчанию сегодня"
+    )
+    telegram_plan_parser.add_argument("--output", type=Path, default=None)
+    telegram_plan_parser.add_argument("--db", type=Path, default=DB_PATH)
+    telegram_plan_parser.add_argument("--json", action="store_true")
+    telegram_plan_parser.set_defaults(func=build_telegram_plan_command)
+
+    telegram_coverage_parser = sub.add_parser(
+        "check-telegram-coverage",
+        help="Проверить покрытие Telegram, импорт и продвижение курсоров",
+    )
+    telegram_coverage_parser.add_argument(
+        "file", type=Path, help="Завершённый JSON-манифест покрытия Telegram"
+    )
+    telegram_coverage_parser.add_argument("--db", type=Path, default=DB_PATH)
+    telegram_coverage_parser.set_defaults(func=check_telegram_coverage)
+
+    watch_parser = sub.add_parser("watch", help="Автоматически пересобирать вывод при изменении SQLite")
     watch_parser.add_argument("--db", type=Path, default=DB_PATH)
-    watch_parser.add_argument("--interval", type=float, default=2.0, help="Polling interval in seconds")
+    watch_parser.add_argument("--interval", type=float, default=2.0, help="Интервал проверки в секундах")
     watch_parser.set_defaults(func=watch)
 
-    ingest_parser = sub.add_parser("ingest-json", help="Ingest structured vacancy rows into SQLite")
-    ingest_parser.add_argument("file", type=Path, help="JSON array or object with vacancies/items/jobs/data")
+    ingest_parser = sub.add_parser("ingest-json", help="Импортировать структурированные записи вакансий в SQLite")
+    ingest_parser.add_argument("file", type=Path, help="Массив JSON или объект с vacancies/items/jobs/data")
     ingest_parser.add_argument("--db", type=Path, default=DB_PATH)
-    ingest_parser.add_argument("--channel", default="", help="Default channel for rows without a channel field")
-    ingest_parser.add_argument("--source", default="", help="Default source/source_stream for rows without source fields")
+    ingest_parser.add_argument("--channel", default="", help="Канал по умолчанию, если поле отсутствует")
+    ingest_parser.add_argument("--source", default="", help="Источник по умолчанию, если поле отсутствует")
     ingest_parser.add_argument("--json", action="store_true")
     ingest_parser.set_defaults(func=ingest_json)
 
     gmail_parser = sub.add_parser(
         "ingest-gmail-json",
-        help="Ingest HH or LinkedIn vacancy links extracted from Gmail",
+        help="Импортировать ссылки на вакансии HH или LinkedIn из Gmail",
     )
-    gmail_parser.add_argument("file", type=Path, help="JSON file with vacancies")
+    gmail_parser.add_argument("file", type=Path, help="JSON-файл с вакансиями")
     gmail_parser.add_argument("--db", type=Path, default=DB_PATH)
     gmail_parser.add_argument(
         "--provider",
         choices=("hh", "linkedin"),
         default="hh",
-        help="Mail provider defaults to apply to rows without channel/source fields",
+        help="Почтовый источник по умолчанию для строк без channel/source",
     )
     gmail_parser.add_argument("--json", action="store_true")
     gmail_parser.set_defaults(func=ingest_gmail_json)
 
-    update_parser = sub.add_parser("update-vacancy", help="Update one vacancy status/stage in SQLite")
+    update_parser = sub.add_parser("update-vacancy", help="Обновить изменяемые поля одной вакансии в SQLite")
     update_parser.add_argument("--db", type=Path, default=DB_PATH)
-    update_parser.add_argument("--id", type=int, default=None, help="Internal vacancy id from Review Inbox")
+    update_parser.add_argument("--id", type=int, default=None, help="Внутренний ID вакансии из очереди проверки")
     update_parser.add_argument("--url", default="")
     update_parser.add_argument("--external-id", default="")
     update_parser.add_argument("--date", default="")
@@ -6252,19 +14569,19 @@ def build_parser() -> argparse.ArgumentParser:
     update_parser.add_argument(
         "--sync-application",
         action="store_true",
-        help="Also sync status, stage, and follow-up date to the latest application row",
+        help="Также синхронизировать состояние, этап и дату повторного обращения в последней строке отклика",
     )
     update_parser.set_defaults(func=update_vacancy)
 
     interaction_parser = sub.add_parser(
         "record-employer-interaction",
-        help="Append an evidence-backed employer interaction without changing funnel stage",
+        help="Добавить доказательное взаимодействие с работодателем без изменения жизненного цикла",
     )
     interaction_parser.add_argument("--db", type=Path, default=DB_PATH)
     interaction_parser.add_argument("--id", type=int, default=None)
     interaction_parser.add_argument("--url", default="")
     interaction_parser.add_argument("--external-id", default="")
-    interaction_parser.add_argument("--at", default="", help="ISO date or timestamp")
+    interaction_parser.add_argument("--at", default="", help="Дата или время ISO 8601")
     interaction_parser.add_argument(
         "--direction", choices=("inbound", "outbound"), default="inbound"
     )
@@ -6281,11 +14598,30 @@ def build_parser() -> argparse.ArgumentParser:
     interaction_parser.add_argument("--evidence-note", default="")
     interaction_parser.add_argument("--evidence-url", default="")
     interaction_parser.add_argument("--external-reference", default="")
+    interaction_parser.add_argument("--external-action-key", default="")
     interaction_parser.add_argument("--json", action="store_true")
     interaction_parser.set_defaults(func=record_employer_interaction)
 
+    invalidation_parser = sub.add_parser(
+        "invalidate-employer-interaction",
+        help="Добавить аудируемое исправление ошибочного взаимодействия",
+    )
+    invalidation_parser.add_argument("--db", type=Path, default=DB_PATH)
+    invalidation_parser.add_argument("--interaction-id", type=int, required=True)
+    vacancy_guard = invalidation_parser.add_mutually_exclusive_group()
+    vacancy_guard.add_argument("--vacancy-id", type=int, default=None)
+    vacancy_guard.add_argument("--vacancy-url", default="")
+    vacancy_guard.add_argument("--vacancy-external-id", default="")
+    invalidation_parser.add_argument("--corrected-at", default="")
+    invalidation_parser.add_argument("--reason", required=True)
+    invalidation_parser.add_argument("--evidence-note", required=True)
+    invalidation_parser.add_argument("--source", required=True)
+    invalidation_parser.add_argument("--operator-context", default="")
+    invalidation_parser.add_argument("--json", action="store_true")
+    invalidation_parser.set_defaults(func=invalidate_employer_interaction)
+
     account_parser = sub.add_parser(
-        "upsert-employer-account", help="Create or update an exact employer account"
+        "upsert-employer-account", help="Создать или обновить точную карточку работодателя"
     )
     account_parser.add_argument("--db", type=Path, default=DB_PATH)
     account_parser.add_argument("--account-id", type=int, default=None)
@@ -6297,11 +14633,28 @@ def build_parser() -> argparse.ArgumentParser:
     account_parser.add_argument("--status", dest="account_status", default=None)
     account_parser.add_argument("--last-checked-date", default=None)
     account_parser.add_argument("--notes", default=None)
+    account_parser.add_argument("--portfolio-limit", type=int, default=None)
+    account_parser.add_argument("--review-cadence-days", type=int, default=None)
+    account_parser.add_argument("--next-review-date", default=None)
+    account_parser.add_argument("--website-checked-date", default=None)
+    account_parser.add_argument("--careers-checked-date", default=None)
+    account_parser.add_argument(
+        "--target-campaigns", default=None, help="Список campaign_id через запятую"
+    )
+    account_parser.add_argument(
+        "--target-role-families", default=None, help="Список role_family через запятую"
+    )
+    account_parser.add_argument("--owner-evidence", default=None)
+    account_parser.add_argument("--sponsor-evidence", default=None)
+    account_parser.add_argument("--governance-evidence", default=None)
+    account_parser.add_argument(
+        "--human-path-status", choices=sorted(HUMAN_PATH_STATUSES), default=None
+    )
     account_parser.add_argument("--json", action="store_true")
     account_parser.set_defaults(func=upsert_employer_account)
 
     signal_parser = sub.add_parser(
-        "record-employer-signal", help="Append an evidence-backed employer account signal"
+        "record-employer-signal", help="Добавить доказательный сигнал работодателя"
     )
     signal_parser.add_argument("--db", type=Path, default=DB_PATH)
     signal_account = signal_parser.add_mutually_exclusive_group(required=True)
@@ -6320,7 +14673,7 @@ def build_parser() -> argparse.ArgumentParser:
     signal_parser.set_defaults(func=record_employer_signal)
 
     link_parser = sub.add_parser(
-        "link-vacancy-account", help="Explicitly link one vacancy to one employer account"
+        "link-vacancy-account", help="Явно связать вакансию с карточкой работодателя"
     )
     link_parser.add_argument("--db", type=Path, default=DB_PATH)
     link_parser.add_argument("--id", type=int, default=None)
@@ -6335,7 +14688,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     factor_parser = sub.add_parser(
         "record-vacancy-factor",
-        help="Append an evidence-backed vacancy factor without changing score",
+        help="Добавить доказательный фактор вакансии без изменения балла",
     )
     factor_parser.add_argument("--db", type=Path, default=DB_PATH)
     factor_parser.add_argument("--id", type=int, default=None)
@@ -6344,7 +14697,7 @@ def build_parser() -> argparse.ArgumentParser:
     factor_parser.add_argument(
         "--factor-key",
         required=True,
-        help="Lowercase snake_case; core keys: " + ", ".join(sorted(CORE_VACANCY_FACTORS)),
+        help="Ключ в lowercase snake_case; основные ключи: " + ", ".join(sorted(CORE_VACANCY_FACTORS)),
     )
     factor_parser.add_argument("--value", required=True)
     factor_parser.add_argument("--observed-date", default="")
@@ -6358,7 +14711,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     contact_parser = sub.add_parser(
         "upsert-contact",
-        help="Store or update a verified recruiter/hiring-manager contact for one vacancy",
+        help="Сохранить или обновить проверенный контакт по одной вакансии",
     )
     contact_parser.add_argument("--db", type=Path, default=DB_PATH)
     contact_parser.add_argument("--id", type=int, default=None)
@@ -6391,7 +14744,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     contact_search_parser = sub.add_parser(
         "record-contact-search",
-        help="Record direct-contact research when no follow-up message is being recorded",
+        help="Зафиксировать поиск прямого контакта без отправки сообщения",
     )
     contact_search_parser.add_argument("--db", type=Path, default=DB_PATH)
     contact_search_parser.add_argument("--id", type=int, default=None)
@@ -6408,7 +14761,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--channels-checked",
         required=True,
         help=(
-            "Comma-separated subset of configured direct channels: "
+            "Настроенные прямые каналы через запятую: "
             + ",".join(DIRECT_OUTREACH_CHANNELS)
         ),
     )
@@ -6417,7 +14770,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     followup_parser = sub.add_parser(
         "record-followup",
-        help="Record one multi-channel follow-up round and schedule the next one",
+        help="Зафиксировать один раунд повторных обращений и назначить следующий",
     )
     followup_parser.add_argument("--db", type=Path, default=DB_PATH)
     followup_parser.add_argument("--id", type=int, default=None)
@@ -6433,43 +14786,154 @@ def build_parser() -> argparse.ArgumentParser:
         "--outreach-json",
         type=Path,
         required=True,
-        help="JSON with contact_search and exact channel touchpoints plus delivery evidence",
+        help="JSON с contact_search, точными сообщениями и доказательствами доставки",
     )
     followup_parser.add_argument("--note", default="")
     followup_parser.set_defaults(func=record_followup)
 
-    interview_parser = sub.add_parser("attach-interview-summary", help="Attach a Markdown interview summary to one vacancy")
+    interview_parser = sub.add_parser("attach-interview-summary", help="Связать Markdown-резюме интервью с вакансией")
     interview_parser.add_argument("--db", type=Path, default=DB_PATH)
-    interview_parser.add_argument("--id", type=int, default=None, help="Internal vacancy id from dashboard")
+    interview_parser.add_argument("--id", type=int, default=None, help="Внутренний ID вакансии из панели")
     interview_parser.add_argument("--url", default="")
     interview_parser.add_argument("--external-id", default="")
-    interview_parser.add_argument("--file", type=Path, required=True, help="Markdown summary file inside the project folder")
-    interview_parser.add_argument("--interview-no", type=int, default=None, help="Interview sequence number, supports 1, 2, 3, 4, ...")
-    interview_parser.add_argument("--stage", default="", help="Interview stage label, defaults to interview_<number>")
-    interview_parser.add_argument("--date", default="", help="Interview or summary date, defaults to today")
-    interview_parser.add_argument("--title", default="", help="Short dashboard link label, defaults to Interview <number>")
+    interview_parser.add_argument("--file", type=Path, required=True, help="Файл Markdown внутри рабочей области")
+    interview_parser.add_argument("--interview-no", type=int, default=None, help="Номер интервью: 1, 2, 3, 4 и далее")
+    interview_parser.add_argument("--stage", default="", help="Код этапа; по умолчанию interview_<номер>")
+    interview_parser.add_argument("--date", default="", help="Дата интервью или резюме; по умолчанию сегодня")
+    interview_parser.add_argument("--title", default="", help="Краткая подпись ссылки; по умолчанию «Интервью <номер>»")
     interview_parser.add_argument("--note", default="")
+    interview_parser.add_argument(
+        "--confirms-completion",
+        action="store_true",
+        help="Явно подтвердить завершение интервью по проверенному резюме",
+    )
+    interview_parser.add_argument("--completion-evidence-note", default="")
     interview_parser.set_defaults(func=attach_interview_summary)
 
     return parser
 
 
+def mutating_command_functions() -> set[Any]:
+    return {
+        initialize_workspace,
+        migrate_schema,
+        migrate_stages,
+        check_coverage,
+        check_telegram_coverage,
+        ingest_json,
+        ingest_gmail_json,
+        update_vacancy,
+        record_employer_interaction,
+        invalidate_employer_interaction,
+        record_lifecycle_event_command,
+        set_current_action_command,
+        record_external_action_command,
+        reprocess_quarantine_command,
+        upsert_employer_account,
+        record_employer_signal,
+        link_vacancy_account,
+        record_vacancy_factor,
+        upsert_employer_contact,
+        record_contact_search,
+        record_followup,
+        attach_interview_summary,
+        begin_daily_run_command,
+        resume_daily_run_command,
+        pause_daily_run_command,
+        start_daily_run_work_command,
+        checkpoint_daily_run_work_command,
+        complete_daily_run_work_command,
+        block_daily_run_work_command,
+        uncertain_daily_run_work_command,
+        invalidate_daily_run_work_command,
+        cancel_due_followup_obligation_command,
+        resolve_due_followup_from_reverified_inbound_command,
+        refresh_daily_run_plan_command,
+        plan_hh_acquisition_command,
+        record_hh_page_command,
+        record_hh_detail_command,
+        finalize_hh_stream_command,
+        finalize_hh_personal_command,
+        invalidate_hh_zero_evidence_plan_command,
+        invalidate_hh_checkpoint_command,
+        finalize_daily_run_command,
+    }
+
+
+def lease_control_functions() -> set[Any]:
+    return {
+        initialize_workspace,
+        migrate_schema,
+        begin_daily_run_command,
+        resume_daily_run_command,
+        pause_daily_run_command,
+        finalize_daily_run_command,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     raw_argv, config_path = extract_config_argument(raw_argv)
+    raw_argv = extract_runtime_arguments(raw_argv)
     try:
         configure_runtime(config_path)
     except (OSError, ValueError) as exc:
-        print(f"jobctl config error: {exc}", file=sys.stderr)
+        print(f"Ошибка конфигурации jobctl: {exc}", file=sys.stderr)
         return 2
     parser = build_parser()
     args = parser.parse_args(raw_argv)
     if hasattr(args, "db"):
         args.db = args.db.resolve() if not args.db.is_absolute() else args.db
     try:
-        args.func(args)
+        if args.func in mutating_command_functions():
+            db_path = getattr(args, "db", DB_PATH)
+            with interprocess_lock(
+                db_path,
+                "writer",
+                timeout=command_lock_timeout(args),
+            ):
+                args.writer_locked = True
+                if args.func not in lease_control_functions():
+                    with connect_db(db_path) as conn:
+                        ensure_schema(conn)
+                        active_lease = require_daily_run_lease(
+                            conn,
+                            clean_cell(getattr(args, "run_lease", "")),
+                            heartbeat=True,
+                        )
+                        open_run = durable_daily_run_row(conn, open_only=True)
+                        if active_lease is None and open_run is not None:
+                            raise RuntimeError(
+                                "Открыт незавершённый долговечный ежедневный запуск "
+                                f"{open_run['run_id']}. Сначала выполните resume-daily-run "
+                                "и передайте точный --run-lease."
+                            )
+                        if active_lease is not None:
+                            durable_run = durable_daily_run_row(
+                                conn, str(active_lease["run_id"])
+                            )
+                            if (
+                                durable_run is not None
+                                and durable_run["status"] == "finalizing"
+                            ):
+                                raise RuntimeError(
+                                    "Ежедневный запуск находится в состоянии finalizing; до завершения "
+                                    "разрешены только finalize-daily-run или pause-daily-run."
+                                )
+                        if active_lease is not None and not bool(
+                            getattr(args, "defer_render", False)
+                        ):
+                            raise RuntimeError(
+                                "Активный ежедневный запуск требует --defer-render для каждой "
+                                "команды записи; единственный полный render выполняет "
+                                "finalize-daily-run."
+                            )
+                        conn.commit()
+                args.func(args)
+        else:
+            args.func(args)
     except Exception as exc:  # Keep CLI errors readable for daily runs.
-        print(f"jobctl error: {exc}", file=sys.stderr)
+        print(f"Ошибка jobctl: {exc}", file=sys.stderr)
         return 1
     return 0
 

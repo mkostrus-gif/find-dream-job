@@ -123,8 +123,12 @@ the following:
 4. the final content is known and any required review is complete;
 5. visible external success can be checked.
 
-Record the action in SQLite only after visible success. A CLI write is not
-evidence that an external action happened.
+Before execution, persist the exact action's `authorized` state with its
+authorization note. After execution, append `attempted`, `visibly_confirmed`,
+`blocked`, or `failed` evidence as applicable. Only `visibly_confirmed` may
+create a confirmed application or sent-message fact. A score, recommendation
+band, draft, `automation.auto_apply`, or CLI write is never authorization and
+is never evidence that an external action happened.
 
 ## Completion contracts
 
@@ -145,11 +149,16 @@ A search run is complete only when:
 - every locally configured search stream has a successful persisted coverage
   checkpoint; missing streams, incomplete pagination, and partial lazy-loads
   are fail-closed conditions;
+- every enabled incremental source has a successful manifest for every
+  configured stream; a first scan must complete its configured backfill and
+  later scans must begin from the last success-gated cursor;
 - discovered vacancies were deduplicated and written through `jobctl.py`;
 - scores cite verified evidence and hard constraints;
 - external actions distinguish drafted, attempted, visibly confirmed, and
   blocked states;
 - read models were rebuilt and final health checks passed;
+- `operational-doctor --strict --json` reports
+  `"ready_for_daily_closeout": true`;
 - the user receives counts, strongest matches, actions, unresolved questions,
   and blockers.
 

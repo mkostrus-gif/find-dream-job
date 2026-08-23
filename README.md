@@ -75,17 +75,37 @@ It provides:
 - canonical external-ID plus persisted repost aliases, conservative
   semantic-repost deduplication, and source/evaluation history;
 - deterministic HH query plans and fail-closed stream/page/lazy-load coverage;
+- безопасное инкрементальное получение вакансий HH в схеме v10: версионированный
+  DOM-адаптер только для чтения, режимы `full`, `shadow`, `delta`, `resume` и
+  `audit`, observer- или timer-based доказательство стабильности видимого DOM
+  в авторизованном встроенном браузере Codex, программная сверка канонических
+  ID и псевдонимов в SQLite, отдельные персональные рекомендации, ограниченная
+  очередь деталей и периодические полные аудиты;
+- configurable public Telegram channels with a per-channel 30-day first
+  backfill, success-gated post cursors, incremental daily deltas, and
+  fail-closed post/ingest reconciliation;
 - Gmail HH and LinkedIn job-mail ingestion, with per-message reconciliation and
   authorized archive verification in the daily workflow;
-- a compact application funnel and structured follow-up rounds;
+- append-only durable lifecycle events independent from current work actions;
+- explicit drafted/authorized/attempted/visibly-confirmed/blocked external
+  action evidence, with no score-based permission semantics;
+- a capped, paginated WIP/SLA queue with overflow and overdue evidence;
 - evidence-backed recruiter and hiring-manager contacts;
 - structured employer interactions that distinguish automated acknowledgments
   from human replies without changing funnel stage;
-- vacancy-level 14/30-day conversion cohorts with deterministic first-touch
-  source attribution and canonical stream aliases;
+- vacancy-level 14/30-day outcome cohorts with precise interview states,
+  deterministic first-touch attribution, field completeness, and configured
+  campaign/resume/message breakdowns;
+- preserved raw source hits with explicit many-to-many normalized labels;
+- quarantine and explicit reprocessing for technical/non-vacancy records;
+- separate structural and fail-closed operational closeout doctors;
 - an explicit employer account radar, evidence-backed employer signals, and
   structured vacancy factors that remain separate from candidate-relative score;
 - generated `views/*.md`, `reports/*.md`, and `dashboard/index.html`;
+- deferred durable writes plus one atomic closeout render for large daily runs;
+- ограниченные межпроцессные блокировки записи и `render`, долговечный план
+  ежедневного запуска в SQLite, возобновляемые контрольные точки и сменяемые
+  истекающие `lease`;
 - agent workflows for onboarding, discovery, scoring, ATS documents,
   applications, and reconciliation;
 - safe review-only defaults and a default-deny public Git allowlist.
@@ -190,14 +210,46 @@ The core CLI uses only the Python standard library.
 ```text
 init                      Create local settings, profile templates, and DB
 doctor --strict --json    Validate config, profile paths, and SQLite health
+operational-doctor        Check technical health and daily-closeout readiness
+projection-status         Show dirty/fresh projection revision and active lease
+begin-daily-run           Acquire the single daily-run orchestration lease
+daily-run-status          Показать план, блокировки, контрольные точки и следующий шаг
+resume-daily-run          Получить новый lease для незавершённого запуска
+pause-daily-run           Освободить lease без завершения запуска
+checkpoint-daily-run-work Сохранить проверенный частичный результат без render
+complete-daily-run-work   Закрыть единицу работы по проверенному манифесту
+cancel-due-followup-obligation Отменить точную frozen follow-up обязанность
+resolve-due-followup-from-reverified-inbound Разрешить её свежей проверкой старого human inbound
+refresh-daily-run-plan    Зафиксировать изменение конфигурации и расширить план
+finalize-daily-run        Publish one atomic final generation and release lease
+hh-browser-adapter        Найти версионированный DOM-адаптер HH только для чтения
+plan-hh-acquisition       Выбрать безопасный режим full/shadow/delta/resume/audit
+record-hh-page            Проверить снимок, сверить ID и сохранить контрольную точку P1
+record-hh-detail          Сохранить подробности только для ограниченной очереди
+next-hh-work              Показать точное безопасное продолжение потока HH
+finalize-hh-stream        Завершить обычный поток HH по манифесту v2
+finalize-hh-personal-recommendations Завершить отдельный персональный источник
+inspect-hh-checkpoint     Показать курсор и доказательства shadow/audit
+invalidate-hh-zero-evidence-plan Перепланировать только пустой frozen HH-план
+invalidate-hh-checkpoint  Явно отключить небезопасный инкрементальный курсор
 ingest-json FILE          Import structured vacancy/evaluation rows
 ingest-gmail-json FILE    Import HH or LinkedIn vacancy links extracted from Gmail
 build-coverage-plan FILE  Generate deterministic HH URLs and manifest skeleton
 check-coverage FILE       Persist and fail-closed validate daily-run coverage
+build-telegram-plan       Generate per-channel first-backfill or delta plan
+check-telegram-coverage   Validate post/ingest evidence and advance cursors
 migrate-schema            Back up and upgrade an existing SQLite workspace
 update-vacancy            Change one vacancy and optionally its application
+set-current-action        Append current WIP/action state without lifecycle loss
+record-lifecycle-event    Append evidence-backed outcome/interview state
+record-external-action    Append authorization, attempt, and visible evidence
 record-employer-interaction Append a human or automated employer event
 conversion-report         Calculate vacancy-level 14/30-day cohorts
+outcome-scorecard         Calculate the first-class evidence outcome scorecard
+wip-queue                 Read the capped, paginated WIP/SLA queue
+quarantine-report         Audit quarantined ingestion records
+reprocess-quarantine      Retry one exact quarantine record
+false-negative-audit      Deterministically sample rejected/low-priority rows
 upsert-employer-account   Create or update an exact employer account
 record-employer-signal    Append an evidence-backed account signal
 link-vacancy-account      Explicitly link a vacancy to an account
@@ -212,6 +264,43 @@ watch                      Rebuild when the SQLite file changes
 ```
 
 Run `python3 scripts/jobctl.py COMMAND --help` for exact fields.
+
+`cancel-due-followup-obligation` фиксирует append-only resolution
+`user_cancelled_followup_obligation`; он не означает отзыв отклика, отказ,
+входящий ответ или доставку сообщения.
+
+`resolve-due-followup-from-reverified-inbound` — отдельная evidence-backed
+операция. Она требует точный диалог, исходный `human_reply`, свежую удалённую
+границу и манифест `reverified_historical_inbound_v1`, но не создаёт новый
+inbound и не меняет его исходный `event_at`. Успех фиксируется отдельным
+переходом `reverified_historical_inbound_due_resolution`, а не пользовательской
+отменой.
+
+All existing writes still render immediately by default. For a batch, add
+`--defer-render` (or `--no-render`) to commit SQLite and mark projections dirty
+without touching generated files, then run one `rebuild`. A live daily run uses
+`begin-daily-run`, passes its `--run-lease` together with `--defer-render` to
+every mutation, and ends with `finalize-daily-run`.
+
+Перед созданием нового запуска агент обязан вызвать `daily-run-status --json`.
+Незавершённый план возобновляется через `resume-daily-run`; уже выполненная
+работа не повторяется после смены процесса. Блокировка входом, CAPTCHA или
+источником фиксируется в соответствующей единице работы и приводит к чистому
+`pause-daily-run`, а не к ложному завершению.
+
+The reproducible performance fixture is synthetic and never opens an existing
+workspace:
+
+```bash
+python3 scripts/benchmark_daily_run.py --rows 25000 --workflow deferred
+python3 scripts/benchmark_hh_incremental.py --streams 10 --cards 3000
+```
+
+Тест производительности HH создаёт только одноразовые синтетические рабочие
+области, сравнивает `full` и `delta` по числу страниц, повторным загрузкам,
+объёму снимков и времени сверки, проверяет все ожидаемые новые и изменённые ID,
+а также подтверждает, что нарушение порядка и конфликтующие повторные снимки
+приводят к полному обходу или блокировке.
 
 ## Repository map
 
@@ -236,7 +325,9 @@ tree.
 - [System contract](JOB_SYSTEM.md)
 - [Project rules](PROJECT_RULES.md)
 - [Architecture](docs/architecture.md)
+- [Evidence corrections](docs/evidence-corrections.md)
 - [Configuration](docs/configuration.md)
+- [Russian v6 operator guide](docs/operations-v6.ru.md)
 - [Privacy model](docs/privacy.md)
 - [Roadmap](docs/roadmap.md)
 - [Contributing](CONTRIBUTING.md)
