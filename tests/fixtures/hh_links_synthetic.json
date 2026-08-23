@@ -1,0 +1,86 @@
+{
+  "base_url": "https://example.test/search/vacancy?page=0",
+  "source_reported_count": 1,
+  "success_links": [
+    {
+      "case": "valid_semantic_vacancy",
+      "href": "/vacancy/910001",
+      "text": "Synthetic Product General Manager",
+      "company": "Example Organization",
+      "data_qa": "serp-item__title",
+      "card_vacancy_id": "910001",
+      "expected_kind": "vacancy",
+      "expected_id": "910001"
+    },
+    {
+      "case": "vacancy_map_navigation",
+      "href": "/search/vacancy/map",
+      "text": "Vacancies on the map",
+      "expected_kind": "ignored"
+    },
+    {
+      "case": "ordinary_search_navigation",
+      "href": "/search/vacancy?area=1",
+      "text": "All search results",
+      "expected_kind": "ignored"
+    },
+    {
+      "case": "duplicate_valid_vacancy_link",
+      "href": "/vacancy/910001?from=duplicate-visible-link",
+      "text": "Synthetic Product General Manager duplicate",
+      "company": "Example Organization",
+      "expected_kind": "vacancy",
+      "expected_id": "910001"
+    },
+    {
+      "case": "unrelated_navigation",
+      "href": "/employers",
+      "text": "Employers",
+      "expected_kind": "ignored"
+    }
+  ],
+  "sponsored_links": [
+    {
+      "case": "sponsored_title_with_single_visible_response_identity",
+      "href": "https://adsrv.hh.ru/click?b=2000001&clickType=link_to_vacancy",
+      "text": "Synthetic Sponsored General Manager",
+      "company": "Synthetic Sponsored Organization",
+      "data_qa": "serp-item__title",
+      "in_card": true,
+      "response_vacancy_ids": ["910101"]
+    }
+  ],
+  "ambiguous_sponsored_links": [
+    {
+      "case": "sponsored_title_with_ambiguous_response_identity",
+      "href": "https://adsrv.hh.ru/click?b=2000002&clickType=link_to_vacancy",
+      "text": "Synthetic Ambiguous Sponsored Role",
+      "data_qa": "serp-item__title",
+      "in_card": true,
+      "response_vacancy_ids": ["910101", "910102"]
+    }
+  ],
+  "malformed_links": [
+    {
+      "case": "malformed_vacancy_like_path",
+      "href": "/vacancy/not-a-number",
+      "text": "Malformed vacancy-like link",
+      "expected_kind": "malformed"
+    },
+    {
+      "case": "genuine_title_missing_identity",
+      "href": "/vacancy/",
+      "text": "Synthetic vacancy without an ID",
+      "data_qa": "vacancy-serp__vacancy-title",
+      "expected_kind": "malformed"
+    },
+    {
+      "case": "unstable_card_and_path_identity",
+      "href": "/vacancy/910002",
+      "text": "Synthetic vacancy with conflicting IDs",
+      "data_qa": "serp-item__title",
+      "card_vacancy_id": "999999",
+      "expected_kind": "malformed"
+    }
+  ]
+}

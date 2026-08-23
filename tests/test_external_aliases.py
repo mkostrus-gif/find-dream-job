@@ -315,6 +315,39 @@ class VacancyExternalAliasIntegrationTests(unittest.TestCase):
             "Synthetic verified contact found",
         )
         outreach = self.workspace / "tmp" / "alias-outreach.json"
+        action_key = "synthetic-alias-follow-up"
+        self.run_cli(
+            "record-external-action",
+            "--external-id",
+            alias_id,
+            "--action-key",
+            action_key,
+            "--action-type",
+            "follow_up",
+            "--state",
+            "authorized",
+            "--authorization-note",
+            "Synthetic test authorization",
+            "--source",
+            "synthetic_test",
+        )
+        self.run_cli(
+            "record-external-action",
+            "--external-id",
+            alias_id,
+            "--action-key",
+            action_key,
+            "--action-type",
+            "follow_up",
+            "--state",
+            "visibly_confirmed",
+            "--evidence-note",
+            "Synthetic visible sent marker",
+            "--external-reference",
+            "synthetic-alias-message-1",
+            "--source",
+            "synthetic_test",
+        )
         outreach.write_text(
             json.dumps(
                 {
@@ -329,6 +362,7 @@ class VacancyExternalAliasIntegrationTests(unittest.TestCase):
                             "message_text": "Synthetic follow-up text.",
                             "delivery_status": "sent",
                             "evidence_note": "Synthetic visible sent marker",
+                            "external_action_key": action_key,
                         }
                     ],
                 }
@@ -413,7 +447,7 @@ class VacancyExternalAliasIntegrationTests(unittest.TestCase):
         self.assertNotEqual(blocked.returncode, 0)
         migrated = json.loads(self.run_cli("migrate-schema", "--json").stdout)
         self.assertEqual(migrated["from_version"], 2)
-        self.assertEqual(migrated["to_version"], 4)
+        self.assertEqual(migrated["to_version"], 10)
         self.assertEqual(migrated["backfilled_aliases"], 1)
         self.assertTrue(migrated["backup"])
         backups = list(self.database.parent.glob("job_search.sqlite.bak-schema-v2-*"))

@@ -77,6 +77,18 @@ class PublicAuditDetectionTests(unittest.TestCase):
         self.assertIn("absolute Windows home path", issues)
         self.assertIn("non-example email address", issues)
 
+    def test_only_synthetic_test_html_is_allowed_as_public_text(self) -> None:
+        fixture = self.audit(
+            '<a href="https://example.test/vacancy/123">Synthetic role</a>',
+            name="tests/fixtures/synthetic.html",
+        )
+        runtime = self.audit(
+            "<p>Generated candidate dashboard</p>",
+            name="dashboard-copy.html",
+        )
+        self.assertEqual(fixture, [])
+        self.assertIn("private/binary file type is public: .html", runtime)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2,9 +2,11 @@
 # local copy. Never place a real candidate's facts or credentials in this file.
 
 [project]
-title = "My Job Search"
+title = "Мой поиск работы"
 # Language for agent communication and generated output where supported.
-locale = "en"
+locale = "ru"
+# Часовой пояс IANA неизменно сохраняется в каждом долговечном плане ежедневного запуска.
+timezone = "UTC"
 
 [paths]
 database = "data/job_search.sqlite"
@@ -43,19 +45,111 @@ max_direct_messages_per_round = 1
 scan_linkedin_inbox = false
 archive_processed_linkedin = false
 
+[telegram]
+# Public channel handles belong only in the ignored local settings file. The
+# first completed scan covers this many calendar days; later plans use the
+# durable per-channel post cursor and request only the delta.
+enabled = false
+initial_lookback_days = 30
+channels = []
+
 [search]
 # A daily run is not complete until every configured stream has a validated
 # coverage checkpoint. Replace these generic names in the ignored local copy.
 required_streams = ["recommendations", "target_roles"]
 default_period_days = 3
 items_per_page = 100
+# Keep personal recommendations as a separate fail-closed coverage stream when
+# the selected source exposes one independently.
+personal_recommendations_enabled = false
+personal_recommendation_stream = "personal_recommendations"
+
+[search.hh_acquisition]
+# Безопасное публичное значение: вычислять возможную границу `delta`, но
+# продолжать полный обход. Ранняя остановка разрешается только при
+# incremental_mode = "enabled" и после требуемого числа чистых запусков
+# `shadow`.
+incremental_mode = "shadow" # disabled | shadow | enabled
+minimum_overlap_pages = 2
+consecutive_known_boundary_pages = 2
+guard_page_required = true
+checkpoint_staleness_days = 7
+shadow_runs_required = 3
+full_audit_interval_days = 7
+page_stability_samples = 3
+page_stability_delay_ms = 750
+page_stability_timeout_ms = 30000
+count_drift_recaptures = 2
+max_pages_per_stream = 100
+max_returned_ids = 50
+personal_initial_depth_pages = 3
+personal_minimum_stable_pages = 2
+personal_consecutive_known_pages = 2
+personal_max_pages = 10
+personal_max_is_completion_boundary = false
+
+[daily_run]
+# Приватная рабочая область может добавить непрозрачные обязательные условия без
+# изменения Engine. Зависимости указывают встроенный ключ шага либо ключ другого
+# объявленного условия; публичные примеры остаются обобщёнными.
+# [[daily_run.required_gates]]
+# key = "additional_source"
+# kind = "workspace_gate"
+# order = 100
+# depends_on = ["hh_coverage"]
+# required = true
+# enabled = true
+# require_remote_boundary = true
+
+[decision]
+# All reusable metadata values are workspace-configured. Empty arrays are safe:
+# historical or new rows remain explicitly unknown until a value is supplied.
+campaign_ids = []
+role_families = []
+resume_ids = []
+message_variants = []
+
+[queue]
+page_size = 50
+
+[queue.limits]
+urgent = 20
+due_follow_up = 30
+deep_review = 20
+account_research = 10
+backlog = 0
+
+[queue.sla_days]
+urgent = 1
+due_follow_up = 2
+deep_review = 5
+account_research = 7
+backlog = 30
+
+[queue.labels]
+urgent = "Срочный ответ работодателю или данные от пользователя"
+due_follow_up = "Наступивший срок повторного обращения"
+deep_review = "Углублённая проверка сильной возможности"
+account_research = "Исследование целевого работодателя"
+backlog = "Резерв вне активного лимита"
+
+[policy]
+# Exactly one effective screening policy is active in SQLite. Change both
+# fields intentionally when screening rules change.
+active_version = "engine-safe-default-v1"
+effective_date = "2026-01-01"
+
+[account]
+active_portfolio_limit = 20
 
 [source_stream_aliases]
-# Optional case-insensitive raw alias -> canonical reporting key mapping.
+# Optional exact raw alias -> one or more canonical reporting keys.
 # Raw source_hits.source_stream values are always preserved. Keep this empty
 # when no historical aliases need consolidation.
 # "Legacy Product Stream" = "product_roles"
+# "Campaign Alpha + Campaign Beta" = ["campaign_alpha", "campaign_beta"]
 
 [channel_labels]
-email = "Email"
+company_site = "Сайт работодателя"
+email = "Почта"
 linkedin = "LinkedIn"

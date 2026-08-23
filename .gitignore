@@ -42,11 +42,23 @@
 !/scripts/
 /scripts/*
 !/scripts/jobctl.py
+!/scripts/daily_run_orchestration.py
+!/scripts/hh_acquisition.py
+!/scripts/hh_browser_adapter.js
 !/scripts/jobsearch_config.py
 !/scripts/search_coverage.py
+!/scripts/telegram_source.py
 !/scripts/public_audit.py
 !/scripts/qa_dashboard.mjs
+!/scripts/benchmark_daily_run.py
+!/scripts/benchmark_hh_incremental.py
 
 !/tests/
 /tests/*
 !/tests/test_*.py
+!/tests/hh_browser_adapter_harness.mjs
+!/tests/test_hh_browser_adapter.mjs
+!/tests/fixtures/
+!/tests/fixtures/**/
+!/tests/fixtures/**/*.html
+!/tests/fixtures/hh_links_synthetic.json
