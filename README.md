@@ -77,7 +77,8 @@ It provides:
 - deterministic HH query plans and fail-closed stream/page/lazy-load coverage;
 - безопасное инкрементальное получение вакансий HH в схеме v10: версионированный
   DOM-адаптер только для чтения, режимы `full`, `shadow`, `delta`, `resume` и
-  `audit`, доказательство стабильности страницы, программная сверка канонических
+  `audit`, observer- или timer-based доказательство стабильности видимого DOM
+  в авторизованном встроенном браузере Codex, программная сверка канонических
   ID и псевдонимов в SQLite, отдельные персональные рекомендации, ограниченная
   очередь деталей и периодические полные аудиты;
 - configurable public Telegram channels with a per-channel 30-day first
@@ -217,6 +218,8 @@ resume-daily-run          Получить новый lease для незаве�
 pause-daily-run           Освободить lease без завершения запуска
 checkpoint-daily-run-work Сохранить проверенный частичный результат без render
 complete-daily-run-work   Закрыть единицу работы по проверенному манифесту
+cancel-due-followup-obligation Отменить точную frozen follow-up обязанность
+resolve-due-followup-from-reverified-inbound Разрешить её свежей проверкой старого human inbound
 refresh-daily-run-plan    Зафиксировать изменение конфигурации и расширить план
 finalize-daily-run        Publish one atomic final generation and release lease
 hh-browser-adapter        Найти версионированный DOM-адаптер HH только для чтения
@@ -227,6 +230,7 @@ next-hh-work              Показать точное безопасное п�
 finalize-hh-stream        Завершить обычный поток HH по манифесту v2
 finalize-hh-personal-recommendations Завершить отдельный персональный источник
 inspect-hh-checkpoint     Показать курсор и доказательства shadow/audit
+invalidate-hh-zero-evidence-plan Перепланировать только пустой frozen HH-план
 invalidate-hh-checkpoint  Явно отключить небезопасный инкрементальный курсор
 ingest-json FILE          Import structured vacancy/evaluation rows
 ingest-gmail-json FILE    Import HH or LinkedIn vacancy links extracted from Gmail
@@ -260,6 +264,17 @@ watch                      Rebuild when the SQLite file changes
 ```
 
 Run `python3 scripts/jobctl.py COMMAND --help` for exact fields.
+
+`cancel-due-followup-obligation` фиксирует append-only resolution
+`user_cancelled_followup_obligation`; он не означает отзыв отклика, отказ,
+входящий ответ или доставку сообщения.
+
+`resolve-due-followup-from-reverified-inbound` — отдельная evidence-backed
+операция. Она требует точный диалог, исходный `human_reply`, свежую удалённую
+границу и манифест `reverified_historical_inbound_v1`, но не создаёт новый
+inbound и не меняет его исходный `event_at`. Успех фиксируется отдельным
+переходом `reverified_historical_inbound_due_resolution`, а не пользовательской
+отменой.
 
 All existing writes still render immediately by default. For a batch, add
 `--defer-render` (or `--no-render`) to commit SQLite and mark projections dirty

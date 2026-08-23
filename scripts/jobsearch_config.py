@@ -115,6 +115,7 @@ class HHAcquisitionSettings:
     full_audit_interval_days: int
     page_stability_samples: int
     page_stability_delay_ms: int
+    page_stability_timeout_ms: int
     count_drift_recaptures: int
     max_pages_per_stream: int
     max_returned_ids: int
@@ -695,6 +696,9 @@ def load_settings(code_root: Path, config_path: Path | None = None) -> Settings:
                 page_stability_delay_ms=_integer(
                     hh_acquisition, "page_stability_delay_ms", 750, 0
                 ),
+                page_stability_timeout_ms=_integer(
+                    hh_acquisition, "page_stability_timeout_ms", 30_000, 1_000
+                ),
                 count_drift_recaptures=_integer(
                     hh_acquisition, "count_drift_recaptures", 2, 2
                 ),
@@ -765,6 +769,7 @@ def load_settings(code_root: Path, config_path: Path | None = None) -> Settings:
         ("full_audit_interval_days", acquisition.full_audit_interval_days, 365),
         ("page_stability_samples", acquisition.page_stability_samples, 10),
         ("page_stability_delay_ms", acquisition.page_stability_delay_ms, 60_000),
+        ("page_stability_timeout_ms", acquisition.page_stability_timeout_ms, 300_000),
         ("count_drift_recaptures", acquisition.count_drift_recaptures, 5),
         ("max_pages_per_stream", acquisition.max_pages_per_stream, 1_000),
         ("max_returned_ids", acquisition.max_returned_ids, 500),
@@ -778,6 +783,15 @@ def load_settings(code_root: Path, config_path: Path | None = None) -> Settings:
             raise ValueError(
                 f"Значение search.hh_acquisition.{key} должно быть не больше {maximum}."
             )
+    minimum_stability_timeout = (
+        acquisition.page_stability_delay_ms
+        * (acquisition.page_stability_samples + 1)
+    )
+    if acquisition.page_stability_timeout_ms < minimum_stability_timeout:
+        raise ValueError(
+            "Значение search.hh_acquisition.page_stability_timeout_ms должно "
+            "покрывать устойчивое окно и отдельную финальную проверку."
+        )
     try:
         effective_date = __import__("datetime").date.fromisoformat(
             settings.policy.effective_date

@@ -13,6 +13,7 @@ from urllib.parse import parse_qs, urlsplit
 TELEGRAM_SOURCE = "telegram"
 TELEGRAM_POST_CLASSIFICATIONS = {"vacancy", "non_vacancy", "out_of_scope"}
 TELEGRAM_STREAM_PREFIX = "telegram:"
+TELEGRAM_COUNT_CONTRACT = "telegram_source_units_v1"
 
 
 def _clean_text(value: Any) -> str:
@@ -298,6 +299,7 @@ def validate_telegram_manifest(
             stream_issues.append("Завершённый поток должен содержать хотя бы одну загруженную страницу.")
         page_urls: set[str] = set()
         page_post_ids: set[int] = set()
+        page_post_observations = 0
         base_page_present = False
         for page_index, page in enumerate(pages):
             if not isinstance(page, dict):
@@ -317,6 +319,7 @@ def validate_telegram_manifest(
             if not isinstance(post_ids, list):
                 stream_issues.append(f"Поле pages[{page_index}].post_ids должно быть массивом.")
                 continue
+            page_post_observations += len(post_ids)
             local_ids: set[int] = set()
             for post_index, raw_post_id in enumerate(post_ids):
                 try:
@@ -343,11 +346,15 @@ def validate_telegram_manifest(
         post_dates: dict[int, dt.date] = {}
         in_scope_posts: set[int] = set()
         stream_external_ids: set[str] = set()
+        reconciled_external_ids: set[str] = set()
         stream_canonical_ids: set[int] = set()
+        processed_units = 0
+        extra_raw_vacancy_units = 0
         for post_index, post in enumerate(posts):
             if not isinstance(post, dict):
                 stream_issues.append(f"Элемент posts[{post_index}] должен быть объектом.")
                 continue
+            normalized_post = True
             try:
                 post_id = _positive_int(post.get("post_id"), f"posts[{post_index}].post_id")
             except ValueError as exc:
@@ -365,6 +372,7 @@ def validate_telegram_manifest(
             except ValueError as exc:
                 stream_issues.append(str(exc))
                 posted_date = dt.date.min
+                normalized_post = False
 
             post_url = _clean_text(post.get("url"))
             expected_post_url = f"https://t.me/{handle}/{post_id}"
@@ -372,6 +380,7 @@ def validate_telegram_manifest(
                 stream_issues.append(
                     f"Адрес публикации {post_id} должен быть {expected_post_url}."
                 )
+                normalized_post = False
 
             if mode == "backfill":
                 in_scope = posted_date >= since_date
@@ -389,10 +398,13 @@ def validate_telegram_manifest(
                 stream_issues.append(
                     f"Классификация публикации {post_id} должна иметь значение vacancy, non_vacancy или out_of_scope."
                 )
+                normalized_post = False
             if in_scope and classification == "out_of_scope":
                 stream_issues.append(f"Публикация {post_id} в пределах просмотра не может иметь классификацию out_of_scope.")
+                normalized_post = False
             if not in_scope and classification != "out_of_scope":
                 stream_issues.append(f"Граничная публикация {post_id} должна иметь классификацию out_of_scope.")
+                normalized_post = False
 
             try:
                 external_ids = _string_list(
@@ -402,14 +414,18 @@ def validate_telegram_manifest(
             except ValueError as exc:
                 stream_issues.append(str(exc))
                 external_ids = []
+                normalized_post = False
+            extra_raw_vacancy_units += max(len(external_ids) - 1, 0)
             if classification == "vacancy" and in_scope and not external_ids:
                 stream_issues.append(
                     f"Для публикации с вакансией {post_id} нужно перечислить внешние идентификаторы всех импортированных вакансий."
                 )
+                normalized_post = False
             if classification != "vacancy" and external_ids:
                 stream_issues.append(
                     f"У публикации {post_id} внешние идентификаторы вакансий допустимы только при классификации vacancy."
                 )
+                normalized_post = False
 
             for external_id in external_ids:
                 if not _telegram_external_id_ok(external_id, handle, post_id):
@@ -417,23 +433,39 @@ def validate_telegram_manifest(
                         f"Внешний идентификатор {external_id!r} должен начинаться с telegram:{handle}:{post_id}"
                         " и может содержать устойчивый суффикс элемента."
                     )
+                    normalized_post = False
+
+            if normalized_post:
+                # One classified post is one processed source unit. A post
+                # containing several vacancies contributes one unit per
+                # extracted vacancy so canonical unique can never exceed the
+                # number of processed units.
+                processed_units += max(1, len(external_ids))
+
+            for external_id in external_ids:
                 stream_external_ids.add(external_id)
                 all_external_ids.add(external_id)
+                external_reconciled = normalized_post and _telegram_external_id_ok(
+                    external_id, handle, post_id
+                )
                 evidence = vacancy_evidence.get(external_id)
                 if not evidence:
                     stream_issues.append(
                         f"После импорта внешний идентификатор {external_id!r} не найден в SQLite."
                     )
+                    external_reconciled = False
                     continue
                 if _clean_text(evidence.get("url")).rstrip("/") != expected_post_url:
                     stream_issues.append(
                         f"Для внешнего идентификатора {external_id!r} не сохранён адрес публикации Telegram."
                     )
+                    external_reconciled = False
                 score = evidence.get("score")
                 if not isinstance(score, int) or isinstance(score, bool) or not 0 <= score <= 100:
                     stream_issues.append(
                         f"У внешнего идентификатора {external_id!r} нет заполненного балла от 0 до 100."
                     )
+                    external_reconciled = False
                 source_streams = {
                     _clean_text(item).casefold()
                     for item in evidence.get("source_streams", [])
@@ -442,8 +474,12 @@ def validate_telegram_manifest(
                     stream_issues.append(
                         f"У внешнего идентификатора {external_id!r} нет попадания источника для {key}."
                     )
+                    external_reconciled = False
                 vacancy_id = evidence.get("vacancy_id")
-                if isinstance(vacancy_id, int) and not isinstance(vacancy_id, bool):
+                if not isinstance(vacancy_id, int) or isinstance(vacancy_id, bool):
+                    external_reconciled = False
+                if external_reconciled:
+                    reconciled_external_ids.add(external_id)
                     stream_canonical_ids.add(vacancy_id)
                     all_canonical_ids.add(vacancy_id)
 
@@ -526,6 +562,25 @@ def validate_telegram_manifest(
         if status == "completed" and known_count + new_count != unique_count:
             stream_issues.append("Сумма known и new должна равняться unique.")
 
+        # Raw counts every declared post record, page observations that lack a
+        # matching post checkpoint (including duplicate page observations),
+        # and each additional vacancy extracted from a multi-vacancy post.
+        # Boundary/out-of-scope posts are evidence and therefore count in both
+        # raw and processed when they normalize successfully.
+        raw_units = (
+            len(posts)
+            + max(page_post_observations - len(page_post_ids & post_ids_seen), 0)
+            + extra_raw_vacancy_units
+        )
+        if processed_units > raw_units:
+            stream_issues.append(
+                "Внутренний контракт счётчиков нарушен: processed превышает raw."
+            )
+        if len(reconciled_external_ids) > processed_units:
+            stream_issues.append(
+                "Внутренний контракт счётчиков нарушен: reconciled превышает processed."
+            )
+
         previous = checkpoints.get(key) or {}
         try:
             previous_cursor = _checkpoint_cursor(previous)
@@ -563,6 +618,10 @@ def validate_telegram_manifest(
             "pages_expected": len(pages),
             "pages_visited": len(page_urls),
             "extracted": len(post_ids_seen),
+            "raw": raw_units,
+            "processed": processed_units,
+            "reconciled": len(reconciled_external_ids),
+            "count_contract": TELEGRAM_COUNT_CONTRACT,
             "unique": unique_count,
             "known": known_count,
             "new": new_count,

@@ -28,14 +28,16 @@
     </main>
     <a data-qa="pager-next" href="?page=1">Следующая страница</a>
     <pre id="adapter-result">pending</pre>
-    <script src="/scripts/hh_browser_adapter.js"></script>
-    <script>
-      FindDreamJobHHAdapter.captureListPage({
+    <script type="module">
+      const adapterSource = await fetch("/scripts/hh_browser_adapter.js").then((response) => response.text());
+      const adapter = (0, eval)(adapterSource);
+      adapter.captureListPage({
         queryFingerprint: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         pageIndex: 0,
         pageSize: 4,
         stabilitySamples: 3,
         stabilityDelayMs: 10,
+        stabilityTimeoutMs: 1000,
         maxScrollAttempts: 8
       }).then((capture) => {
         document.querySelector("#adapter-result").textContent = JSON.stringify(capture);

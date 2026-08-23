@@ -56,6 +56,9 @@
 !/tests/
 /tests/*
 !/tests/test_*.py
+!/tests/hh_browser_adapter_harness.mjs
+!/tests/test_hh_browser_adapter.mjs
 !/tests/fixtures/
 !/tests/fixtures/**/
 !/tests/fixtures/**/*.html
+!/tests/fixtures/hh_links_synthetic.json

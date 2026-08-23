@@ -17,9 +17,10 @@
       <time data-qa="vacancy-creation-time" datetime="2026-08-19">19 августа</time>
     </main>
     <pre id="adapter-result">pending</pre>
-    <script src="/scripts/hh_browser_adapter.js"></script>
-    <script>
-      FindDreamJobHHAdapter.captureVacancyDetail().then((capture) => {
+    <script type="module">
+      const adapterSource = await fetch("/scripts/hh_browser_adapter.js").then((response) => response.text());
+      const adapter = (0, eval)(adapterSource);
+      adapter.captureVacancyDetail().then((capture) => {
         document.querySelector("#adapter-result").textContent = JSON.stringify(capture);
       }).catch((error) => {
         document.querySelector("#adapter-result").textContent = JSON.stringify({error: String(error)});

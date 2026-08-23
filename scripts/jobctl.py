@@ -90,6 +90,12 @@ def _lazy_hh_acquisition(name: str) -> Any:
 append_daily_run_transition = _lazy_daily_run("append_transition")
 bind_daily_run_lease = _lazy_daily_run("bind_lease")
 block_daily_run_work = _lazy_daily_run("block_work")
+cancel_due_followup_obligation_work = _lazy_daily_run(
+    "cancel_due_followup_obligation"
+)
+resolve_due_followup_from_reverified_inbound_work = _lazy_daily_run(
+    "resolve_due_followup_from_reverified_inbound"
+)
 daily_run_closeout_readiness = _lazy_daily_run("closeout_readiness")
 complete_daily_run_work = _lazy_daily_run("complete_work")
 create_durable_daily_run = _lazy_daily_run("create_run")
@@ -107,6 +113,9 @@ note_expired_lease = _lazy_daily_run("note_expired_lease")
 note_external_action_event = _lazy_daily_run("note_external_action_event")
 checkpoint_daily_run_work = _lazy_daily_run("record_checkpoint")
 refresh_durable_daily_run_plan = _lazy_daily_run("refresh_plan")
+reclassify_legacy_external_action_work = _lazy_daily_run(
+    "reclassify_legacy_external_action_work"
+)
 refresh_durable_daily_run_snapshot = _lazy_daily_run("refresh_run_snapshot")
 release_daily_run_lease = _lazy_daily_run("release_lease")
 durable_daily_run_status = _lazy_daily_run("run_status")
@@ -9061,6 +9070,7 @@ _SAFE_ACTION_LABELS = {
     "retry_after_blocker": "повторить после устранения блокировки",
     "resolve_blocker": "устранить блокировку",
     "reverify": "повторно проверить доказательство",
+    "reconcile_inbound_after_outbound": "повторно сверить входящие после внешнего действия",
     "continue_authorized_work": "продолжить разрешённое действие",
     "review_draft": "проверить черновик",
     "finalize": "завершить ежедневный запуск",
@@ -9304,13 +9314,80 @@ def invalidate_daily_run_work_command(args: argparse.Namespace) -> None:
     )
 
 
+def cancel_due_followup_obligation_command(args: argparse.Namespace) -> None:
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        run_id, _ = _require_exact_durable_lease(conn, args)
+        result = cancel_due_followup_obligation_work(
+            conn,
+            SETTINGS,
+            run_id=run_id,
+            item_key=clean_cell(args.item_key),
+            reason=args.reason,
+        )
+        result["projection_revision"] = (
+            commit_projection_write(conn)
+            if result["changed"]
+            else projection_state_data(conn)["dirty_revision"]
+        )
+    result["message"] = (
+        "Точная обязанность повторного обращения отменена пользователем; "
+        "даты очищены без изменения жизненного цикла."
+        if result["changed"]
+        else "Идентичная пользовательская отмена уже сохранена."
+    )
+    _daily_run_mutation_result(args, result)
+
+
+def resolve_due_followup_from_reverified_inbound_command(
+    args: argparse.Namespace,
+) -> None:
+    manifest = _load_workspace_json(
+        args.manifest, label="Манифест повторной проверки входящего"
+    )
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        run_id, _ = _require_exact_durable_lease(conn, args)
+        result = resolve_due_followup_from_reverified_inbound_work(
+            conn,
+            SETTINGS,
+            run_id=run_id,
+            item_key=clean_cell(args.item_key),
+            interaction_id=int(args.interaction_id),
+            observed_at=args.observed_at,
+            channel=clean_cell(args.channel),
+            conversation_target=clean_cell(args.conversation_target),
+            remote_evidence_reference=clean_cell(args.remote_evidence_reference),
+            manifest=manifest,
+        )
+        result["projection_revision"] = (
+            commit_projection_write(conn)
+            if result["changed"]
+            else projection_state_data(conn)["dirty_revision"]
+        )
+    result["message"] = (
+        "Frozen follow-up разрешён свежей повторной проверкой исходного "
+        "человеческого входящего; исходная дата взаимодействия сохранена."
+        if result["changed"]
+        else "Идентичное evidence-backed разрешение уже сохранено."
+    )
+    _daily_run_mutation_result(args, result)
+
+
 def refresh_daily_run_plan_command(args: argparse.Namespace) -> None:
     with connect_db(args.db) as conn:
         ensure_schema(conn)
         run_id, _ = _require_exact_durable_lease(conn, args)
+        reclassification = None
+        if bool(args.reclassify_legacy_external_actions):
+            reclassification = reclassify_legacy_external_action_work(
+                conn, run_id=run_id, reason=args.reason
+            )
         result = refresh_durable_daily_run_plan(
             conn, SETTINGS, run_id=run_id, reason=args.reason
         )
+        if reclassification is not None:
+            result["legacy_external_action_reclassification"] = reclassification
         result["projection_revision"] = commit_projection_write(conn)
     result["run_id"] = run_id
     result["message"] = "Снимок плана обновлён; прежние обязательные элементы не удалены молча."
@@ -9590,6 +9667,14 @@ def hh_browser_adapter_command(args: argparse.Namespace) -> None:
         "path": str(path),
         "sha256": digest,
         "read_only": True,
+        "execution_contract": "returned_adapter_object_v1",
+        "requires_global_installation": False,
+        "normal_browser": "authenticated_codex_in_app_browser",
+        "invocation": (
+            "Evaluate the exact source as one expression, retain the returned "
+            "adapter object locally, then call captureListPage, "
+            "capturePersonalRecommendations, or captureVacancyDetail."
+        ),
         "capture_contracts": [
             _hh_acquisition_api().PAGE_CAPTURE_KIND,
             _hh_acquisition_api().DETAIL_CAPTURE_KIND,
@@ -9602,6 +9687,7 @@ def hh_browser_adapter_command(args: argparse.Namespace) -> None:
     else:
         print(f"DOM-адаптер HH только для чтения {_hh_acquisition_api().ADAPTER_VERSION}: {path}")
         print(f"  SHA-256: {digest}")
+        print("  Выполнение: expression возвращает adapter object; globalThis не изменяется.")
 
 
 def validate_hh_capture_command(args: argparse.Namespace) -> None:
@@ -9943,6 +10029,32 @@ def inspect_hh_checkpoint_command(args: argparse.Namespace) -> None:
             f"Контрольные точки HH: {len(result['checkpoints'])}; "
             f"запуски: {len(result['runs'])}; события: {len(result['events'])}."
         )
+
+
+def invalidate_hh_zero_evidence_plan_command(args: argparse.Namespace) -> None:
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        run_id, _ = _require_exact_durable_lease(conn, args)
+        result = _hh_acquisition_api().invalidate_zero_evidence_plan(
+            conn,
+            SETTINGS,
+            run_id=run_id,
+            stream_key=args.stream_key,
+            reason=args.reason,
+        )
+        revision = (
+            commit_projection_write(conn)
+            if bool(result.get("changed"))
+            else projection_state_data(conn)["dirty_revision"]
+        )
+    result["projection_revision"] = revision
+    result["message"] = (
+        "Пустой план HH аудируемо инвалидирован; повторите plan-hh-acquisition "
+        "с прежними source-kind и query fingerprint."
+        if result["replan_required"]
+        else "Recovery пустого плана HH уже завершён; текущий план актуален."
+    )
+    _daily_run_mutation_result(args, result)
 
 
 def invalidate_hh_checkpoint_command(args: argparse.Namespace) -> None:
@@ -11361,6 +11473,16 @@ def record_external_action_command(args: argparse.Namespace) -> None:
     metadata = metadata_from_cli(args)
     with connect_db(args.db) as conn:
         ensure_schema(conn)
+        active = active_daily_run_lease(conn)
+        if (
+            active is not None
+            and get_durable_daily_run(conn, str(active["run_id"])) is not None
+        ):
+            metadata = {
+                **metadata,
+                "daily_run_id": str(active["run_id"]),
+                "daily_run_scope_contract": "daily_run_external_action_scope_v1",
+            }
         vacancy_id: int | None = None
         if args.id is not None or args.url or args.external_id:
             vacancy = resolve_vacancy_row(conn, args)
@@ -11475,9 +11597,9 @@ def record_external_action_command(args: argparse.Namespace) -> None:
                 evidence_note=args.evidence_note,
                 source="cli:record-external-action",
             )
-        active = active_daily_run_lease(conn)
         if (
-            active is not None
+            created
+            and active is not None
             and get_durable_daily_run(conn, str(active["run_id"])) is not None
         ):
             note_external_action_event(
@@ -13958,6 +14080,69 @@ def build_parser() -> argparse.ArgumentParser:
     invalidate_work_parser.add_argument("--leave-invalidated", action="store_true")
     invalidate_work_parser.set_defaults(func=invalidate_daily_run_work_command)
 
+    cancel_due_followup_parser = sub.add_parser(
+        "cancel-due-followup-obligation",
+        help=(
+            "Аудируемо отменить точную frozen due-follow-up обязанность без "
+            "отзыва отклика или изменения lifecycle"
+        ),
+        description=(
+            "Требует точные run ID и item key из daily-run-status --verbose, "
+            "очищает только даты повторного обращения вакансии и отклика, "
+            "записывает user_cancelled_followup_obligation и завершает item."
+        ),
+    )
+    cancel_due_followup_parser.add_argument("--db", type=Path, default=DB_PATH)
+    cancel_due_followup_parser.add_argument("--run-id", required=True)
+    cancel_due_followup_parser.add_argument("--item-key", required=True)
+    cancel_due_followup_parser.add_argument(
+        "--reason",
+        required=True,
+        help="Непустая точная причина оператора для append-only audit",
+    )
+    cancel_due_followup_parser.add_argument("--json", action="store_true")
+    cancel_due_followup_parser.set_defaults(
+        func=cancel_due_followup_obligation_command
+    )
+
+    reverified_inbound_parser = sub.add_parser(
+        "resolve-due-followup-from-reverified-inbound",
+        help=(
+            "Разрешить frozen follow-up свежей проверкой исторического "
+            "человеческого входящего без изменения его даты"
+        ),
+        description=(
+            "Требует точные run/item/interaction, канал, conversation target, "
+            "remote evidence и отдельный fail-closed JSON-манифест. Команда "
+            "не создаёт новое взаимодействие и не меняет status, stage или lifecycle."
+        ),
+    )
+    reverified_inbound_parser.add_argument("--db", type=Path, default=DB_PATH)
+    reverified_inbound_parser.add_argument("--run-id", required=True)
+    reverified_inbound_parser.add_argument("--item-key", required=True)
+    reverified_inbound_parser.add_argument(
+        "--interaction-id", type=int, required=True, help="ID исходного inbound human_reply"
+    )
+    reverified_inbound_parser.add_argument(
+        "--observed-at", required=True, help="Текущее время повторной проверки ISO 8601"
+    )
+    reverified_inbound_parser.add_argument("--channel", required=True)
+    reverified_inbound_parser.add_argument(
+        "--conversation-target", required=True, help="Точная идентичность диалога или адресата"
+    )
+    reverified_inbound_parser.add_argument(
+        "--remote-evidence-reference",
+        required=True,
+        help="Точная ссылка или устойчивый ID удалённого доказательства",
+    )
+    reverified_inbound_parser.add_argument(
+        "--manifest", type=Path, required=True, help="JSON-манифест reverified_historical_inbound_v1"
+    )
+    reverified_inbound_parser.add_argument("--json", action="store_true")
+    reverified_inbound_parser.set_defaults(
+        func=resolve_due_followup_from_reverified_inbound_command
+    )
+
     refresh_plan_parser = sub.add_parser(
         "refresh-daily-run-plan",
         help="Явно обновить зафиксированный план после изменения конфигурации",
@@ -13965,6 +14150,14 @@ def build_parser() -> argparse.ArgumentParser:
     refresh_plan_parser.add_argument("--db", type=Path, default=DB_PATH)
     refresh_plan_parser.add_argument("--run-id", required=True)
     refresh_plan_parser.add_argument("--reason", required=True)
+    refresh_plan_parser.add_argument(
+        "--reclassify-legacy-external-actions",
+        action="store_true",
+        help=(
+            "Явно перенести старые drafted/authorized-only элементы активного плана "
+            "в аудируемый необязательный backlog без изменения истории действий"
+        ),
+    )
     refresh_plan_parser.add_argument("--json", action="store_true")
     refresh_plan_parser.set_defaults(func=refresh_daily_run_plan_command)
 
@@ -14061,6 +14254,36 @@ def build_parser() -> argparse.ArgumentParser:
     hh_inspect_parser.add_argument("--history-limit", type=int, default=20)
     hh_inspect_parser.add_argument("--json", action="store_true")
     hh_inspect_parser.set_defaults(func=inspect_hh_checkpoint_command)
+
+    hh_zero_evidence_invalidate_parser = sub.add_parser(
+        "invalidate-hh-zero-evidence-plan",
+        help=(
+            "Аудируемо инвалидировать только пустой замороженный план HH перед "
+            "перепланированием"
+        ),
+        description=(
+            "Проверить отсутствие страниц, карточек, деталей, контрольных точек, "
+            "манифеста и любого прогресса; сохранить audit-событие и разрешить "
+            "перепланирование с текущим DOM-адаптером."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Workflow: 1) при необходимости переоткройте точную единицу P1 через "
+            "invalidate-daily-run-work --reason; 2) выполните эту команду; "
+            "3) повторите plan-hh-acquisition для того же --run-id, --stream-key, "
+            "--source-kind и прежнего query fingerprint.\n"
+            "Флаги каждой записи: --defer-render --run-lease <token>."
+        ),
+    )
+    add_hh_run_stream_target(hh_zero_evidence_invalidate_parser)
+    hh_zero_evidence_invalidate_parser.add_argument(
+        "--reason",
+        required=True,
+        help="Явная причина оператора для append-only audit-события",
+    )
+    hh_zero_evidence_invalidate_parser.set_defaults(
+        func=invalidate_hh_zero_evidence_plan_command
+    )
 
     hh_invalidate_parser = sub.add_parser(
         "invalidate-hh-checkpoint",
@@ -14623,12 +14846,15 @@ def mutating_command_functions() -> set[Any]:
         block_daily_run_work_command,
         uncertain_daily_run_work_command,
         invalidate_daily_run_work_command,
+        cancel_due_followup_obligation_command,
+        resolve_due_followup_from_reverified_inbound_command,
         refresh_daily_run_plan_command,
         plan_hh_acquisition_command,
         record_hh_page_command,
         record_hh_detail_command,
         finalize_hh_stream_command,
         finalize_hh_personal_command,
+        invalidate_hh_zero_evidence_plan_command,
         invalidate_hh_checkpoint_command,
         finalize_daily_run_command,
     }

@@ -52,6 +52,13 @@ REMOTE_MANIFEST_KINDS = {
 }
 TERMINAL_EXTERNAL_ACTION_STATES = {"visibly_confirmed", "blocked", "failed"}
 NONTERMINAL_EXTERNAL_ACTION_STATES = {"drafted", "authorized", "attempted"}
+EXTERNAL_ACTION_SCOPE_CONTRACT = "daily_run_external_action_scope_v1"
+LEGACY_EXTERNAL_ACTION_STATES = {"drafted", "authorized"}
+USER_CANCELLED_FOLLOWUP_RESOLUTION = "user_cancelled_followup_obligation"
+REVERIFIED_HISTORICAL_INBOUND_RESOLUTION = (
+    "reverified_historical_inbound_due_resolution"
+)
+REVERIFIED_INBOUND_MANIFEST_CONTRACT = "reverified_historical_inbound_v1"
 COUNT_FIELDS = (
     "raw",
     "unique",
@@ -409,6 +416,7 @@ def _config_snapshot(settings: Settings, timezone: str) -> dict[str, Any]:
             "full_audit_interval_days": settings.search.hh_acquisition.full_audit_interval_days,
             "page_stability_samples": settings.search.hh_acquisition.page_stability_samples,
             "page_stability_delay_ms": settings.search.hh_acquisition.page_stability_delay_ms,
+            "page_stability_timeout_ms": settings.search.hh_acquisition.page_stability_timeout_ms,
             "count_drift_recaptures": settings.search.hh_acquisition.count_drift_recaptures,
             "max_pages_per_stream": settings.search.hh_acquisition.max_pages_per_stream,
             "max_returned_ids": settings.search.hh_acquisition.max_returned_ids,
@@ -443,6 +451,22 @@ def _config_snapshot(settings: Settings, timezone: str) -> dict[str, Any]:
             for gate in settings.daily_run.required_gates
         ],
     }
+
+
+def _hh_acquisition_step_scope(
+    settings: Settings, timezone: str, *, personal: bool
+) -> dict[str, Any]:
+    scope = dict(_config_snapshot(settings, timezone)["hh_acquisition"])
+    if not personal:
+        for key in (
+            "personal_initial_depth_pages",
+            "personal_minimum_stable_pages",
+            "personal_consecutive_known_pages",
+            "personal_max_pages",
+            "personal_max_is_completion_boundary",
+        ):
+            scope.pop(key, None)
+    return scope
 
 
 def configuration_fingerprint(settings: Settings, timezone: str) -> str:
@@ -503,6 +527,101 @@ def latest_nonterminal_external_actions(conn: sqlite3.Connection) -> list[dict[s
         """
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+def _external_action_id_floor(
+    conn: sqlite3.Connection, run: sqlite3.Row | None = None
+) -> tuple[int, str]:
+    """Return the immutable action-ID boundary captured by one daily run."""
+
+    if run is not None:
+        scope = json.loads(str(run["scope_json"]))
+        captured = scope.get("external_action_id_floor")
+        if isinstance(captured, int) and not isinstance(captured, bool) and captured >= 0:
+            return captured, "captured_plan"
+        # Compatibility for a run created before this patch. The explicit
+        # backlog-reclassification path persists the derived floor in its next
+        # audited plan revision; it never rewrites external action history.
+        legacy = conn.execute(
+            """
+            SELECT COALESCE(MAX(id), 0) FROM external_actions
+            WHERE datetime(created_at) <= datetime(?)
+            """,
+            (run["created_at"],),
+        ).fetchone()
+        return int(legacy[0] or 0), "legacy_run_created_at_fallback"
+    row = conn.execute("SELECT COALESCE(MAX(id), 0) FROM external_actions").fetchone()
+    return int(row[0] or 0), "captured_plan"
+
+
+def external_action_scope_groups(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str | None = None,
+    action_id_floor: int | None = None,
+) -> dict[str, Any]:
+    """Classify nonterminal actions without time windows or delivery inference."""
+
+    run = get_run(conn, run_id) if run_id else None
+    if action_id_floor is None:
+        action_id_floor, floor_source = _external_action_id_floor(conn, run)
+    else:
+        floor_source = "captured_plan"
+    latest = latest_nonterminal_external_actions(conn)
+    max_ids = {
+        str(row["action_key"]): int(row["max_id"])
+        for row in conn.execute(
+            "SELECT action_key, MAX(id) AS max_id FROM external_actions GROUP BY action_key"
+        ).fetchall()
+    }
+    explicit_run_keys: set[str] = set()
+    if run_id:
+        for row in conn.execute(
+            "SELECT action_key, metadata_json FROM external_actions ORDER BY id"
+        ).fetchall():
+            try:
+                metadata = json.loads(str(row["metadata_json"] or "{}"))
+            except json.JSONDecodeError:
+                metadata = {}
+            if metadata.get("daily_run_id") == run_id:
+                explicit_run_keys.add(str(row["action_key"]))
+
+    current_run: list[dict[str, Any]] = []
+    unresolved_attempted: list[dict[str, Any]] = []
+    legacy_backlog: list[dict[str, Any]] = []
+    for raw in latest:
+        row = dict(raw)
+        action_key = str(row["action_key"])
+        if max_ids.get(action_key, 0) > action_id_floor or action_key in explicit_run_keys:
+            row["reconciliation_scope"] = "current_run"
+            current_run.append(row)
+        elif row["state"] == "attempted":
+            row["reconciliation_scope"] = "unresolved_attempted_carryover"
+            unresolved_attempted.append(row)
+        else:
+            row["reconciliation_scope"] = "legacy_authorization_backlog"
+            legacy_backlog.append(row)
+    return {
+        "contract": EXTERNAL_ACTION_SCOPE_CONTRACT,
+        "action_id_floor": action_id_floor,
+        "floor_source": floor_source,
+        "current_run": current_run,
+        "unresolved_attempted": unresolved_attempted,
+        "legacy_backlog": legacy_backlog,
+    }
+
+
+def external_actions_requiring_reconciliation(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str | None = None,
+    action_id_floor: int | None = None,
+) -> list[dict[str, Any]]:
+    groups = external_action_scope_groups(
+        conn, run_id=run_id, action_id_floor=action_id_floor
+    )
+    rows = [*groups["current_run"], *groups["unresolved_attempted"]]
+    return sorted(rows, key=lambda row: (str(row["action_key"]), int(row["id"])))
 
 
 def _step(
@@ -604,10 +723,13 @@ def build_plan_definition(
     *,
     run_date: str,
     timezone: str,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
     """Capture one deterministic configuration and authoritative SQLite scope."""
 
     ZoneInfo(timezone)
+    existing_run = get_run(conn, run_id) if run_id else None
+    action_id_floor, _ = _external_action_id_floor(conn, existing_run)
     hh_items = [
         _item(
             stable_item_key("hh", stream.casefold()),
@@ -654,7 +776,12 @@ def build_plan_definition(
         for index, row in enumerate(authoritative_due_followups(conn, run_date), start=1)
     ]
     action_items: list[dict[str, Any]] = []
-    for index, row in enumerate(latest_nonterminal_external_actions(conn), start=1):
+    for index, row in enumerate(
+        external_actions_requiring_reconciliation(
+            conn, run_id=run_id, action_id_floor=action_id_floor
+        ),
+        start=1,
+    ):
         state = "needs_verification" if row["state"] == "attempted" else "pending"
         action_items.append(
             _item(
@@ -668,6 +795,8 @@ def build_plan_definition(
                     "state": row["state"],
                     "vacancy_id": row["vacancy_id"],
                     "external_reference": row["external_reference"] or "",
+                    "reconciliation_scope": row["reconciliation_scope"],
+                    "scope_contract": EXTERNAL_ACTION_SCOPE_CONTRACT,
                 },
                 state=state,
             )
@@ -703,7 +832,9 @@ def build_plan_definition(
                 "required_streams": list(settings.search.required_streams),
                 "period_days": settings.search.default_period_days,
                 "items_per_page": settings.search.items_per_page,
-                "hh_acquisition": _config_snapshot(settings, timezone)["hh_acquisition"],
+                "hh_acquisition": _hh_acquisition_step_scope(
+                    settings, timezone, personal=False
+                ),
             },
             items=hh_items,
         ),
@@ -730,7 +861,9 @@ def build_plan_definition(
             depends_on=("inbound_reconciliation",),
             scope={
                 "stream_key": settings.search.personal_recommendation_stream,
-                "hh_acquisition": _config_snapshot(settings, timezone)["hh_acquisition"],
+                "hh_acquisition": _hh_acquisition_step_scope(
+                    settings, timezone, personal=True
+                ),
             },
         ),
     ]
@@ -824,6 +957,8 @@ def build_plan_definition(
     scope = {
         "run_date": run_date,
         "timezone": timezone,
+        "external_action_scope_contract": EXTERNAL_ACTION_SCOPE_CONTRACT,
+        "external_action_id_floor": action_id_floor,
         "configuration": config,
         "steps": steps,
     }
@@ -1274,6 +1409,65 @@ def _validate_artifact(
     return str(resolved.relative_to(workspace_root.resolve())), actual_sha
 
 
+def _iso_moment(value: str) -> dt.datetime:
+    parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def _inbound_revalidation_floor(
+    conn: sqlite3.Connection, run_id: str
+) -> tuple[dt.datetime | None, dict[str, Any]]:
+    latest: dt.datetime | None = None
+    evidence: dict[str, Any] = {}
+    rows = conn.execute(
+        """
+        SELECT event_type, details_json, occurred_at
+        FROM daily_run_transitions
+        WHERE run_id = ? AND entity_type = 'step'
+          AND entity_key = 'inbound_reconciliation'
+          AND reason = 'external_action_after_inbound_checkpoint'
+        ORDER BY id
+        """,
+        (run_id,),
+    ).fetchall()
+    for transition in rows:
+        try:
+            details = json.loads(str(transition["details_json"] or "{}"))
+        except json.JSONDecodeError:
+            details = {}
+        action = None
+        action_id = details.get("external_action_id")
+        if isinstance(action_id, int) and not isinstance(action_id, bool):
+            action = conn.execute(
+                "SELECT id, action_key, state, event_at FROM external_actions WHERE id = ?",
+                (action_id,),
+            ).fetchone()
+        elif details.get("action_key"):
+            action = conn.execute(
+                """
+                SELECT id, action_key, state, event_at FROM external_actions
+                WHERE action_key = ? AND state IN ('attempted','visibly_confirmed')
+                ORDER BY datetime(event_at) DESC, id DESC LIMIT 1
+                """,
+                (details["action_key"],),
+            ).fetchone()
+        if action is None:
+            continue
+        moment = _iso_moment(str(action["event_at"]))
+        if latest is None or moment > latest:
+            latest = moment
+            evidence = {
+                "external_action_id": int(action["id"]),
+                "action_key": str(action["action_key"]),
+                "state": str(action["state"]),
+                "event_at": str(action["event_at"]),
+                "transition_event": str(transition["event_type"]),
+            }
+    return latest, evidence
+
+
 def validate_manifest(
     conn: sqlite3.Connection,
     manifest: Mapping[str, Any],
@@ -1310,7 +1504,7 @@ def validate_manifest(
     if not isinstance(observed_at, str):
         raise ValueError("Для манифеста требуется observed_at в формате ISO 8601.")
     try:
-        dt.datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+        observed_moment = _iso_moment(observed_at)
     except ValueError as exc:
         raise ValueError("Поле observed_at должно иметь формат ISO 8601.") from exc
     captured_scope = normalized.get("captured_scope")
@@ -1320,6 +1514,24 @@ def validate_manifest(
         conn, expected_run_id, expected_step_key, expected_item_key
     )
     expected_scope = json.loads(str(expected_row["scope_json"]))
+    if (
+        completion
+        and expected_step_key == "inbound_reconciliation"
+        and not expected_item_key
+    ):
+        freshness_floor, freshness_evidence = _inbound_revalidation_floor(
+            conn, expected_run_id
+        )
+        if freshness_floor is not None and observed_moment <= freshness_floor:
+            raise ValueError(
+                "Повторная сверка входящих должна иметь observed_at позже последнего "
+                "внешнего действия, инвалидировавшего контрольную точку."
+            )
+        if freshness_floor is not None:
+            normalized["freshness_requirement"] = {
+                "observed_after_external_action": freshness_evidence,
+                "satisfied": True,
+            }
     typed_identity_fields: tuple[str, ...] = ()
     if expected_kind in {"hh_stream", "telegram_channel"}:
         typed_identity_fields = ("stream_key",)
@@ -1418,7 +1630,9 @@ def validate_manifest(
         )
         if not valid:
             raise ValueError(
-                "Повторное обращение не имеет подтверждённой доставки, свежего входящего ответа или терминального решения."
+                "Повторное обращение не имеет подтверждённой доставки, свежего "
+                "входящего ответа, терминального решения или точной аудируемой "
+                "пользовательской отмены."
             )
         normalized["programmatic_resolution"] = resolution
     if completion and expected_kind == "external_action":
@@ -2214,7 +2428,13 @@ def _next_safe_items(conn: sqlite3.Connection, run_id: str, limit: int = 10) -> 
         elif item["state"] == "blocked":
             action = "retry_after_blocker" if item["retryable"] else "resolve_blocker"
         elif item["state"] == "invalidated":
-            action = "reverify"
+            action = (
+                "reconcile_inbound_after_outbound"
+                if item["kind"] == "inbound_reconciliation"
+                and item.get("blocker_reason")
+                == "external_action_after_inbound_checkpoint"
+                else "reverify"
+            )
         elif item["state"] == "pending" and item["kind"] == "external_action":
             action = (
                 "continue_authorized_work"
@@ -2412,6 +2632,59 @@ def _compact_checkpoint(raw: str) -> dict[str, Any]:
     }
 
 
+def external_action_scope_summary(
+    conn: sqlite3.Connection, *, run_id: str, verbose: bool
+) -> dict[str, Any]:
+    groups = external_action_scope_groups(conn, run_id=run_id)
+    backlog = list(groups["legacy_backlog"])
+    backlog_keys = {str(row["action_key"]) for row in backlog}
+    frozen_required = 0
+    for row in conn.execute(
+        """
+        SELECT scope_json FROM daily_run_work_items
+        WHERE run_id = ? AND step_key = 'external_action_reconciliation'
+          AND required = 1
+        """,
+        (run_id,),
+    ).fetchall():
+        try:
+            action_key = str(json.loads(str(row["scope_json"])).get("action_key", ""))
+        except json.JSONDecodeError:
+            action_key = ""
+        if action_key in backlog_keys:
+            frozen_required += 1
+    state_counts = {state: 0 for state in sorted(LEGACY_EXTERNAL_ACTION_STATES)}
+    for row in backlog:
+        state = str(row["state"])
+        state_counts[state] = state_counts.get(state, 0) + 1
+    summary: dict[str, Any] = {
+        "contract": groups["contract"],
+        "action_id_floor": groups["action_id_floor"],
+        "floor_source": groups["floor_source"],
+        "required_current_run": len(groups["current_run"]),
+        "required_unresolved_attempted": len(groups["unresolved_attempted"]),
+        "legacy_backlog": {
+            "total": len(backlog),
+            "states": state_counts,
+            "frozen_required_items": frozen_required,
+            "requires_explicit_reclassification": frozen_required > 0,
+        },
+    }
+    if verbose:
+        summary["legacy_backlog"]["items"] = [
+            {
+                "external_action_id": row["id"],
+                "action_key": row["action_key"],
+                "action_type": row["action_type"],
+                "state": row["state"],
+                "vacancy_id": row["vacancy_id"],
+            }
+            for row in backlog[:100]
+        ]
+        summary["legacy_backlog"]["items_truncated"] = max(len(backlog) - 100, 0)
+    return summary
+
+
 def run_status(
     conn: sqlite3.Connection,
     settings: Settings,
@@ -2501,6 +2774,9 @@ def run_status(
         ),
         "last_verified_step": run["last_verified_step_key"] or "",
         "next_safe_work": _next_safe_items(conn, run_id_value, 10),
+        "external_action_scope": external_action_scope_summary(
+            conn, run_id=run_id_value, verbose=verbose
+        ),
         "lease": (
             {
                 "active": True,
@@ -2605,6 +2881,15 @@ def _coverage_manifest(
     observed_at: str,
     source_run_id: int,
 ) -> dict[str, Any]:
+    captured_scope = {
+        "stream_key": stream.get("key"),
+        "query_url": stream.get("query_url", ""),
+        "manifest_file": manifest_file,
+        "manifest_sha256": manifest_sha256,
+        "source_run_id": source_run_id,
+    }
+    if stream.get("count_contract"):
+        captured_scope["count_contract"] = stream.get("count_contract")
     return {
         "manifest_version": 1,
         "kind": kind,
@@ -2612,22 +2897,27 @@ def _coverage_manifest(
         "step_key": step_key,
         "item_key": item_key,
         "observed_at": observed_at,
-        "captured_scope": {
-            "stream_key": stream.get("key"),
-            "query_url": stream.get("query_url", ""),
-            "manifest_file": manifest_file,
-            "manifest_sha256": manifest_sha256,
-            "source_run_id": source_run_id,
-        },
+        "captured_scope": captured_scope,
         "counts": {
-            "raw": int(stream.get("found") or 0),
+            "raw": int(
+                stream.get("raw")
+                if stream.get("raw") is not None
+                else stream.get("found") or 0
+            ),
             "unique": int(stream.get("unique") or 0),
             "known": int(stream.get("known") or 0),
             "new": int(stream.get("new") or 0),
             "processed": int(
-                stream.get("extracted")
+                stream.get("processed")
+                if stream.get("processed") is not None
+                else stream.get("extracted")
                 if stream.get("extracted") is not None
                 else stream.get("found") or 0
+            ),
+            "reconciled": int(
+                stream.get("reconciled")
+                if stream.get("reconciled") is not None
+                else stream.get("unique") or 0
             ),
             "blocked": 1 if stream.get("status") == "blocked" else 0,
         },
@@ -2782,9 +3072,1050 @@ def due_followup_resolution(
     ).fetchone()
     if terminal is not None:
         return True, {"type": "terminal_resolution", "lifecycle_event_id": terminal["id"], "event_type": terminal["event_type"]}
+    reverified = _reverified_historical_inbound_resolution(
+        conn, run_id=run_id, step_key=step_key, item_key=item_key
+    )
+    if reverified is not None:
+        return bool(reverified.pop("valid")), reverified
+    cancellation = _user_cancelled_followup_resolution(
+        conn, run_id=run_id, step_key=step_key, item_key=item_key
+    )
+    if cancellation is not None:
+        return bool(cancellation.pop("valid")), cancellation
     if external is not None and external["state"] == "attempted":
         return False, {"type": "needs_verification", "external_action_id": external["id"], "default_action": "reconcile_without_resend"}
     return False, {}
+
+
+def _interaction_evidence_snapshot(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "id": int(row["id"]),
+        "vacancy_id": int(row["vacancy_id"]),
+        "event_at": str(row["event_at"]),
+        "direction": str(row["direction"]),
+        "event_type": str(row["event_type"]),
+        "channel": str(row["channel"]),
+        "actor_type": str(row["actor_type"]),
+        "is_human": int(row["is_human"]),
+        "evidence_note": str(row["evidence_note"] or ""),
+        "evidence_url": str(row["evidence_url"] or ""),
+        "external_reference": str(row["external_reference"] or ""),
+        "dedupe_key": str(row["dedupe_key"]),
+        "created_at": str(row["created_at"]),
+        "external_action_id": (
+            int(row["external_action_id"])
+            if row["external_action_id"] is not None
+            else None
+        ),
+    }
+
+
+def _reverified_historical_inbound_event(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    step_key: str,
+    item_key: str,
+) -> dict[str, Any] | None:
+    rows = conn.execute(
+        """
+        SELECT id, reason, details_json, event_hash, occurred_at
+        FROM daily_run_transitions
+        WHERE run_id = ? AND entity_type = 'work_item' AND entity_key = ?
+          AND event_type = ?
+        ORDER BY id
+        """,
+        (
+            run_id,
+            f"{step_key}/{item_key}",
+            REVERIFIED_HISTORICAL_INBOUND_RESOLUTION,
+        ),
+    ).fetchall()
+    if not rows:
+        return None
+    if len(rows) != 1:
+        raise RuntimeError(
+            "Для frozen follow-up найдено несколько событий повторной проверки входящего."
+        )
+    row = rows[0]
+    try:
+        details = json.loads(str(row["details_json"]))
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            "Событие повторной проверки исторического входящего повреждено."
+        ) from exc
+    if not isinstance(details, dict):
+        raise RuntimeError(
+            "Событие повторной проверки исторического входящего имеет неверный формат."
+        )
+    return {
+        "id": int(row["id"]),
+        "reason": str(row["reason"]),
+        "details": details,
+        "event_hash": str(row["event_hash"]),
+        "occurred_at": str(row["occurred_at"]),
+    }
+
+
+def _historical_inbound_live_issues(
+    conn: sqlite3.Connection,
+    *,
+    run: sqlite3.Row,
+    item: sqlite3.Row,
+    scope: Mapping[str, Any],
+    live: sqlite3.Row,
+    interaction: sqlite3.Row,
+    observed_at: str,
+) -> list[str]:
+    issues: list[str] = []
+    interaction_moment = _iso_moment(str(interaction["event_at"]))
+    if interaction_moment >= _iso_moment(str(run["created_at"])):
+        issues.append("interaction_is_not_historical_for_this_run")
+    observed_moment = _iso_moment(observed_at)
+    if observed_moment < _iso_moment(str(run["created_at"])):
+        issues.append("reverification_predates_run")
+    if observed_moment > dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=5):
+        issues.append("reverification_is_in_the_future")
+    if (
+        str(interaction["direction"]) != "inbound"
+        or str(interaction["event_type"]) != "human_reply"
+        or int(interaction["is_human"]) != 1
+    ):
+        issues.append("interaction_is_not_effective_human_inbound_reply")
+    if int(interaction["vacancy_id"]) != int(scope["vacancy_id"]):
+        issues.append("interaction_vacancy_scope_mismatch")
+    latest_interaction = conn.execute(
+        """
+        SELECT id FROM effective_employer_interactions
+        WHERE vacancy_id = ?
+        ORDER BY datetime(event_at) DESC, id DESC LIMIT 1
+        """,
+        (scope["vacancy_id"],),
+    ).fetchone()
+    if latest_interaction is None or int(latest_interaction["id"]) != int(
+        interaction["id"]
+    ):
+        issues.append("historical_inbound_is_not_latest_interaction")
+    later_outbound = conn.execute(
+        """
+        SELECT id FROM effective_employer_interactions
+        WHERE vacancy_id = ? AND direction = 'outbound'
+          AND (
+            datetime(event_at) > datetime(?)
+            OR (datetime(event_at) = datetime(?) AND id > ?)
+          )
+        ORDER BY datetime(event_at), id LIMIT 1
+        """,
+        (
+            scope["vacancy_id"],
+            interaction["event_at"],
+            interaction["event_at"],
+            interaction["id"],
+        ),
+    ).fetchone()
+    if later_outbound is not None:
+        issues.append("later_outbound_interaction_exists")
+    later_action = conn.execute(
+        """
+        SELECT id FROM external_actions
+        WHERE vacancy_id = ? AND action_type IN ('follow_up','message')
+          AND state IN ('attempted','visibly_confirmed')
+          AND datetime(event_at) > datetime(?)
+        ORDER BY datetime(event_at), id LIMIT 1
+        """,
+        (scope["vacancy_id"], interaction["event_at"]),
+    ).fetchone()
+    if later_action is not None:
+        issues.append("later_outbound_action_exists_or_is_uncertain")
+    terminal = conn.execute(
+        """
+        SELECT id FROM lifecycle_events
+        WHERE vacancy_id = ? AND event_type IN ('rejected','offer_received')
+          AND datetime(event_at) > datetime(?)
+        ORDER BY datetime(event_at), id LIMIT 1
+        """,
+        (scope["vacancy_id"], interaction["event_at"]),
+    ).fetchone()
+    if terminal is not None:
+        issues.append("later_terminal_lifecycle_transition_exists")
+    if str(live["application_follow_up_date"] or ""):
+        issues.append("application_follow_up_date_reactivated")
+    if str(live["vacancy_follow_up_date"] or ""):
+        issues.append("vacancy_follow_up_date_reactivated")
+    incompatible_states = {
+        "rejected",
+        "offer",
+        "withdrawn",
+        "cancelled",
+    }
+    for field in (
+        "application_status",
+        "application_stage",
+        "vacancy_status",
+        "vacancy_stage",
+    ):
+        if str(live[field] or "").strip().casefold() in incompatible_states:
+            issues.append(f"incompatible_{field}")
+    if str(item["input_fingerprint"]) != _item_input_fingerprint(
+        _item(str(item["item_key"]), "due_followup", int(item["order_no"]), scope)
+    ):
+        issues.append("frozen_item_fingerprint_mismatch")
+    return issues
+
+
+def _reverified_historical_inbound_resolution(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    step_key: str,
+    item_key: str,
+) -> dict[str, Any] | None:
+    event = _reverified_historical_inbound_event(
+        conn, run_id=run_id, step_key=step_key, item_key=item_key
+    )
+    if event is None:
+        return None
+    run = get_run(conn, run_id)
+    if run is None:
+        return {
+            "valid": False,
+            "type": "reverified_historical_inbound_run_missing",
+            "transition_id": event["id"],
+        }
+    try:
+        item, scope, live = _exact_due_followup_context(
+            conn,
+            run_id=run_id,
+            item_key=item_key,
+            allow_reconciled_application_status_drift=True,
+        )
+    except (ValueError, RuntimeError):
+        return {
+            "valid": False,
+            "type": "reverified_historical_inbound_scope_changed",
+            "transition_id": event["id"],
+        }
+    details = event["details"]
+    interaction_id = details.get("original_interaction_id")
+    if not isinstance(interaction_id, int) or isinstance(interaction_id, bool):
+        return {
+            "valid": False,
+            "type": "reverified_historical_inbound_invalid_audit",
+            "transition_id": event["id"],
+        }
+    interaction = conn.execute(
+        "SELECT * FROM effective_employer_interactions WHERE id = ?",
+        (interaction_id,),
+    ).fetchone()
+    if interaction is None:
+        return {
+            "valid": False,
+            "type": "reverified_historical_inbound_interaction_ineffective",
+            "transition_id": event["id"],
+        }
+    snapshot = _interaction_evidence_snapshot(interaction)
+    expected_scope_fingerprint = payload_hash(
+        {
+            "run_id": run_id,
+            "item_key": item_key,
+            "frozen_scope": scope,
+        }
+    )
+    identity_matches = all(
+        (
+            details.get("contract") == REVERIFIED_INBOUND_MANIFEST_CONTRACT,
+            details.get("resolution_type")
+            == REVERIFIED_HISTORICAL_INBOUND_RESOLUTION,
+            details.get("run_id") == run_id,
+            details.get("step_key") == step_key,
+            details.get("item_key") == item_key,
+            details.get("vacancy_id") == scope.get("vacancy_id"),
+            details.get("application_id") == scope.get("application_id"),
+            details.get("follow_up_date") == scope.get("follow_up_date"),
+            details.get("frozen_scope_hash") == payload_hash(scope),
+            details.get("scope_fingerprint") == expected_scope_fingerprint,
+            details.get("original_dedupe_key") == snapshot["dedupe_key"],
+            details.get("original_event_at") == snapshot["event_at"],
+            details.get("original_evidence_hash") == payload_hash(snapshot),
+            details.get("channel") == snapshot["channel"],
+            details.get("remote_boundary_verified") is True,
+            details.get("latest_message_matches_interaction") is True,
+            details.get("no_new_outbound_after_inbound") is True,
+            details.get("original_interaction_timestamp_preserved") is True,
+        )
+    )
+    stored_states = details.get("preserved_states")
+    current_states = {
+        "application_status": str(live["application_status"] or ""),
+        "application_stage": str(live["application_stage"] or ""),
+        "vacancy_status": str(live["vacancy_status"] or ""),
+        "vacancy_stage": str(live["vacancy_stage"] or ""),
+    }
+    if not identity_matches or stored_states != current_states:
+        return {
+            "valid": False,
+            "type": "reverified_historical_inbound_invalid_audit_or_state",
+            "transition_id": event["id"],
+        }
+    live_issues = _historical_inbound_live_issues(
+        conn,
+        run=run,
+        item=item,
+        scope=scope,
+        live=live,
+        interaction=interaction,
+        observed_at=str(details.get("observed_at", "")),
+    )
+    return {
+        "valid": not live_issues,
+        "type": (
+            REVERIFIED_HISTORICAL_INBOUND_RESOLUTION
+            if not live_issues
+            else "reverified_historical_inbound_no_longer_valid"
+        ),
+        "transition_id": event["id"],
+        "original_interaction_id": interaction_id,
+        "original_event_at": snapshot["event_at"],
+        "observed_at": str(details["observed_at"]),
+        "channel": str(details["channel"]),
+        "conversation_target": str(details["conversation_target"]),
+        "remote_evidence_reference": str(details["remote_evidence_reference"]),
+        "original_interaction_timestamp_preserved": True,
+        "no_duplicate_interaction_created": True,
+        "no_lifecycle_or_stage_change_inferred": True,
+        "issues": live_issues,
+    }
+
+
+def _user_cancelled_followup_event(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    step_key: str,
+    item_key: str,
+) -> dict[str, Any] | None:
+    rows = conn.execute(
+        """
+        SELECT id, reason, details_json, event_hash, occurred_at
+        FROM daily_run_transitions
+        WHERE run_id = ? AND entity_type = 'work_item' AND entity_key = ?
+          AND event_type = ?
+        ORDER BY id
+        """,
+        (
+            run_id,
+            f"{step_key}/{item_key}",
+            USER_CANCELLED_FOLLOWUP_RESOLUTION,
+        ),
+    ).fetchall()
+    if not rows:
+        return None
+    if len(rows) != 1:
+        raise RuntimeError(
+            "Для точного повторного обращения найдено несколько событий пользовательской отмены."
+        )
+    row = rows[0]
+    try:
+        details = json.loads(str(row["details_json"]))
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            "Событие пользовательской отмены повторного обращения повреждено."
+        ) from exc
+    if not isinstance(details, dict):
+        raise RuntimeError(
+            "Событие пользовательской отмены повторного обращения имеет неверный формат."
+        )
+    return {
+        "id": int(row["id"]),
+        "reason": str(row["reason"]),
+        "details": details,
+        "event_hash": str(row["event_hash"]),
+        "occurred_at": str(row["occurred_at"]),
+    }
+
+
+def _user_cancelled_followup_resolution(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    step_key: str,
+    item_key: str,
+) -> dict[str, Any] | None:
+    event = _user_cancelled_followup_event(
+        conn, run_id=run_id, step_key=step_key, item_key=item_key
+    )
+    if event is None:
+        return None
+    _, item = _work_row(conn, run_id, step_key, item_key)
+    scope = json.loads(str(item["scope_json"]))
+    details = event["details"]
+    identity_matches = all(
+        (
+            details.get("run_id") == run_id,
+            details.get("step_key") == step_key,
+            details.get("item_key") == item_key,
+            details.get("resolution_type") == USER_CANCELLED_FOLLOWUP_RESOLUTION,
+            details.get("frozen_scope_hash") == payload_hash(scope),
+            details.get("vacancy_id") == scope.get("vacancy_id"),
+            details.get("application_id") == scope.get("application_id"),
+            details.get("original_follow_up_date") == scope.get("follow_up_date"),
+            details.get("message_delivery_inferred") is False,
+            details.get("fresh_inbound_inferred") is False,
+            details.get("rejection_inferred") is False,
+            details.get("withdrawal_inferred") is False,
+        )
+    )
+    if not identity_matches:
+        return {
+            "valid": False,
+            "type": "user_cancelled_followup_obligation_invalid_audit",
+            "transition_id": event["id"],
+        }
+    application = conn.execute(
+        """
+        SELECT id, vacancy_id, follow_up_date FROM applications
+        WHERE id = ? AND vacancy_id = ?
+        """,
+        (scope["application_id"], scope["vacancy_id"]),
+    ).fetchone()
+    vacancy = conn.execute(
+        "SELECT id, follow_up_date FROM vacancies WHERE id = ?",
+        (scope["vacancy_id"],),
+    ).fetchone()
+    if application is None or vacancy is None:
+        return {
+            "valid": False,
+            "type": "user_cancelled_followup_obligation_scope_missing",
+            "transition_id": event["id"],
+        }
+    original_date = str(scope["follow_up_date"])
+    application_date = str(application["follow_up_date"] or "")
+    vacancy_date = str(vacancy["follow_up_date"] or "")
+    exact_scope_reactivated = (
+        application_date == original_date or vacancy_date == original_date
+    )
+    return {
+        "valid": not exact_scope_reactivated,
+        "type": (
+            USER_CANCELLED_FOLLOWUP_RESOLUTION
+            if not exact_scope_reactivated
+            else "user_cancelled_followup_obligation_reactivated"
+        ),
+        "transition_id": event["id"],
+        "operator_reason": str(details["operator_reason"]),
+        "original_follow_up_date": original_date,
+        "application_follow_up_date": application_date,
+        "vacancy_follow_up_date": vacancy_date,
+        "no_message_delivery_inferred": True,
+        "no_lifecycle_outcome_inferred": True,
+    }
+
+
+def _exact_due_followup_context(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    item_key: str,
+    allow_reconciled_application_status_drift: bool = False,
+) -> tuple[sqlite3.Row, dict[str, Any], sqlite3.Row]:
+    if not item_key.strip():
+        raise ValueError("Для отмены повторного обращения требуется точный item key.")
+    _, item = _work_row(conn, run_id, "due_followups", item_key)
+    if str(item["item_kind"]) != "due_followup" or not bool(item["required"]):
+        raise ValueError(
+            "Указанный item не является обязательным повторным обращением этого запуска."
+        )
+    try:
+        scope = json.loads(str(item["scope_json"]))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Зафиксированный scope повторного обращения повреждён.") from exc
+    required_fields = {
+        "vacancy_id",
+        "application_id",
+        "follow_up_date",
+        "application_status",
+        "external_id",
+        "channel",
+        "company",
+        "title",
+    }
+    if not isinstance(scope, dict) or not required_fields <= set(scope):
+        raise RuntimeError("Зафиксированный scope повторного обращения неполон.")
+    expected_item_key = (
+        f"due:{scope['vacancy_id']}:{scope['application_id']}:{scope['follow_up_date']}"
+    )
+    if item_key != expected_item_key:
+        raise ValueError("item key не совпадает с зафиксированной обязанностью.")
+    live = conn.execute(
+        """
+        SELECT a.id AS application_id, a.vacancy_id,
+               a.status AS application_status, a.stage AS application_stage,
+               a.follow_up_date AS application_follow_up_date,
+               v.external_id, v.channel, v.company, v.title,
+               v.latest_status AS vacancy_status,
+               v.latest_stage AS vacancy_stage,
+               v.follow_up_date AS vacancy_follow_up_date
+        FROM applications a
+        JOIN vacancies v ON v.id = a.vacancy_id
+        WHERE a.id = ? AND a.vacancy_id = ?
+        """,
+        (scope["application_id"], scope["vacancy_id"]),
+    ).fetchone()
+    if live is None:
+        raise ValueError("Точная вакансия или запись отклика из frozen scope не найдена.")
+    effective = conn.execute(
+        "SELECT id FROM effective_applications WHERE vacancy_id = ?",
+        (scope["vacancy_id"],),
+    ).fetchone()
+    if effective is None or int(effective["id"]) != int(scope["application_id"]):
+        raise ValueError(
+            "Scope изменился: зафиксированный отклик больше не является текущим."
+        )
+    for field in (
+        "application_status",
+        "external_id",
+        "channel",
+        "company",
+        "title",
+    ):
+        if str(live[field] or "") != str(scope[field] or ""):
+            reconciled_status_drift = (
+                field == "application_status"
+                and allow_reconciled_application_status_drift
+                and bool(str(live["application_status"] or "").strip())
+                and str(live["application_status"] or "")
+                == str(live["vacancy_status"] or "")
+            )
+            if reconciled_status_drift:
+                continue
+            raise ValueError(f"Scope изменился: поле {field} больше не совпадает.")
+    original_date = str(scope["follow_up_date"])
+    for field in ("application_follow_up_date", "vacancy_follow_up_date"):
+        live_date = str(live[field] or "")
+        if live_date not in {"", original_date}:
+            raise ValueError(
+                f"Scope изменился: поле {field} содержит другую дату {live_date!r}."
+            )
+    return item, scope, live
+
+
+def resolve_due_followup_from_reverified_inbound(
+    conn: sqlite3.Connection,
+    settings: Settings,
+    *,
+    run_id: str,
+    item_key: str,
+    interaction_id: int,
+    observed_at: str,
+    channel: str,
+    conversation_target: str,
+    remote_evidence_reference: str,
+    manifest: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Resolve one frozen due item from a freshly reverified historical reply."""
+
+    run = get_run(conn, run_id)
+    if run is None or str(run["status"]) == "completed":
+        raise ValueError("Точный незавершённый ежедневный запуск не найден.")
+    if not isinstance(interaction_id, int) or isinstance(interaction_id, bool) or interaction_id < 1:
+        raise ValueError("Требуется положительный original interaction ID.")
+    observed_at = str(observed_at).strip()
+    try:
+        _iso_moment(observed_at)
+    except ValueError as exc:
+        raise ValueError("--observed-at должен иметь формат ISO 8601.") from exc
+    channel = str(channel).strip()
+    conversation_target = str(conversation_target).strip()
+    remote_evidence_reference = str(remote_evidence_reference).strip()
+    if not channel or len(channel) > 128:
+        raise ValueError("Требуется точный непустой канал длиной до 128 символов.")
+    if not conversation_target or len(conversation_target) > 1024:
+        raise ValueError("Требуется точный непустой conversation target.")
+    if not remote_evidence_reference or len(remote_evidence_reference) > 2048:
+        raise ValueError("Требуется точная ссылка или идентификатор удалённого доказательства.")
+    if not isinstance(manifest, Mapping):
+        raise ValueError("Манифест повторной проверки должен быть объектом JSON.")
+    if len(canonical_json(manifest).encode("utf-8")) > 100_000:
+        raise ValueError("Манифест повторной проверки превышает 100 КБ.")
+
+    item, scope, live = _exact_due_followup_context(
+        conn,
+        run_id=run_id,
+        item_key=item_key,
+        allow_reconciled_application_status_drift=True,
+    )
+    interaction = conn.execute(
+        "SELECT * FROM effective_employer_interactions WHERE id = ?",
+        (interaction_id,),
+    ).fetchone()
+    if interaction is None:
+        raise ValueError("Исходное взаимодействие отсутствует или уже не является effective.")
+    snapshot = _interaction_evidence_snapshot(interaction)
+    if snapshot["channel"] != channel:
+        raise ValueError("Канал повторной проверки не совпадает с исходным взаимодействием.")
+    scope_fingerprint = payload_hash(
+        {"run_id": run_id, "item_key": item_key, "frozen_scope": scope}
+    )
+    due_reason = str(scope.get("reason") or "scheduled_follow_up_date_due")
+    evidence_hash = payload_hash(snapshot)
+    completion_boundary = manifest.get("completion_boundary")
+    if not isinstance(completion_boundary, dict):
+        raise ValueError("Манифест требует объект completion_boundary.")
+    expected_manifest_fields = {
+        "contract": REVERIFIED_INBOUND_MANIFEST_CONTRACT,
+        "run_id": run_id,
+        "item_key": item_key,
+        "original_interaction_id": interaction_id,
+        "original_dedupe_key": snapshot["dedupe_key"],
+        "original_event_at": snapshot["event_at"],
+        "original_evidence_hash": evidence_hash,
+        "vacancy_id": int(scope["vacancy_id"]),
+        "application_id": int(scope["application_id"]),
+        "follow_up_date": str(scope["follow_up_date"]),
+        "due_reason": due_reason,
+        "frozen_scope_hash": payload_hash(scope),
+        "scope_fingerprint": scope_fingerprint,
+        "observed_at": observed_at,
+        "channel": channel,
+        "conversation_target": conversation_target,
+        "remote_evidence_reference": remote_evidence_reference,
+        "remote_boundary_verified": True,
+        "latest_message_matches_interaction": True,
+        "no_new_outbound_after_inbound": True,
+        "original_interaction_timestamp_preserved": True,
+    }
+    for field, expected in expected_manifest_fields.items():
+        if manifest.get(field) != expected:
+            raise ValueError(
+                f"Манифест повторной проверки: поле {field} не совпадает с точным evidence scope."
+            )
+    expected_boundary = {
+        "observed_at": observed_at,
+        "channel": channel,
+        "conversation_target": conversation_target,
+        "remote_evidence_reference": remote_evidence_reference,
+        "latest_message_interaction_id": interaction_id,
+    }
+    if completion_boundary != expected_boundary:
+        raise ValueError("completion_boundary не совпадает с точной удалённой границей.")
+    normalized_manifest = {**expected_manifest_fields, "completion_boundary": expected_boundary}
+
+    live_issues = _historical_inbound_live_issues(
+        conn,
+        run=run,
+        item=item,
+        scope=scope,
+        live=live,
+        interaction=interaction,
+        observed_at=observed_at,
+    )
+    if live_issues:
+        raise ValueError(
+            "Исторический входящий не может разрешить frozen follow-up: "
+            + ", ".join(live_issues)
+            + "."
+        )
+    existing = _reverified_historical_inbound_event(
+        conn,
+        run_id=run_id,
+        step_key="due_followups",
+        item_key=item_key,
+    )
+    requested_manifest_hash = payload_hash(normalized_manifest)
+    if existing is not None:
+        if existing["details"].get("reverification_manifest_hash") != requested_manifest_hash:
+            raise ValueError(
+                "Разрешение уже записано с другими существенными полями; история не переписана."
+            )
+        valid, resolution = due_followup_resolution(
+            conn, run_id, "due_followups", item_key
+        )
+        if not valid or resolution.get("type") != REVERIFIED_HISTORICAL_INBOUND_RESOLUTION:
+            raise ValueError("Существующее разрешение больше не проходит fail-closed проверку.")
+        if str(item["state"]) != "completed":
+            raise RuntimeError(
+                "Audit-событие повторной проверки существует, но frozen item не завершён."
+            )
+        return {
+            "run_id": run_id,
+            "item_key": item_key,
+            "changed": False,
+            "idempotent": True,
+            "resolution": resolution,
+            "audit_transition_id": existing["id"],
+            "original_interaction_id": interaction_id,
+            "original_event_at": snapshot["event_at"],
+            "observed_at": observed_at,
+            "interaction_timestamp_preserved": True,
+            "duplicate_interaction_created": False,
+            "lifecycle_preserved": True,
+        }
+    if str(item["state"]) in FINISHED_WORK_STATES:
+        raise ValueError("Повторное обращение уже завершено другим доказательным разрешением.")
+    already_valid, existing_resolution = due_followup_resolution(
+        conn, run_id, "due_followups", item_key
+    )
+    if already_valid:
+        raise ValueError(
+            "Повторное обращение уже имеет другое доказательное разрешение: "
+            + str(existing_resolution.get("type", "unknown"))
+            + "."
+        )
+
+    interaction_rows_before = conn.execute(
+        "SELECT * FROM employer_interactions WHERE vacancy_id = ? ORDER BY id",
+        (scope["vacancy_id"],),
+    ).fetchall()
+    interaction_fingerprint = payload_hash(
+        [_interaction_evidence_snapshot(row) for row in interaction_rows_before]
+    )
+    lifecycle_rows_before = conn.execute(
+        "SELECT * FROM lifecycle_events WHERE vacancy_id = ? ORDER BY id",
+        (scope["vacancy_id"],),
+    ).fetchall()
+    lifecycle_fingerprint = payload_hash([dict(row) for row in lifecycle_rows_before])
+    preserved_states = {
+        "application_status": str(live["application_status"] or ""),
+        "application_stage": str(live["application_stage"] or ""),
+        "vacancy_status": str(live["vacancy_status"] or ""),
+        "vacancy_stage": str(live["vacancy_stage"] or ""),
+    }
+    details = {
+        "contract": REVERIFIED_INBOUND_MANIFEST_CONTRACT,
+        "resolution_type": REVERIFIED_HISTORICAL_INBOUND_RESOLUTION,
+        "run_id": run_id,
+        "step_key": "due_followups",
+        "item_key": item_key,
+        "vacancy_id": int(scope["vacancy_id"]),
+        "application_id": int(scope["application_id"]),
+        "follow_up_date": str(scope["follow_up_date"]),
+        "due_reason": due_reason,
+        "frozen_scope_hash": payload_hash(scope),
+        "scope_fingerprint": scope_fingerprint,
+        "frozen_input_fingerprint": str(item["input_fingerprint"]),
+        "original_interaction_id": interaction_id,
+        "original_dedupe_key": snapshot["dedupe_key"],
+        "original_event_at": snapshot["event_at"],
+        "original_evidence_hash": evidence_hash,
+        "observed_at": observed_at,
+        "channel": channel,
+        "conversation_target": conversation_target,
+        "remote_evidence_reference": remote_evidence_reference,
+        "completion_boundary": expected_boundary,
+        "remote_boundary_verified": True,
+        "latest_message_matches_interaction": True,
+        "no_new_outbound_after_inbound": True,
+        "original_interaction_timestamp_preserved": True,
+        "reverification_manifest_hash": requested_manifest_hash,
+        "preserved_states": preserved_states,
+        "frozen_application_status": str(scope["application_status"] or ""),
+        "application_status_drift_observed": (
+            str(scope["application_status"] or "")
+            != preserved_states["application_status"]
+        ),
+        "interaction_history_fingerprint": interaction_fingerprint,
+        "lifecycle_fingerprint": lifecycle_fingerprint,
+        "duplicate_interaction_created": False,
+        "lifecycle_or_stage_change_inferred": False,
+    }
+    append_transition(
+        conn,
+        run_id=run_id,
+        entity_type="work_item",
+        entity_key=f"due_followups/{item_key}",
+        event_type=REVERIFIED_HISTORICAL_INBOUND_RESOLUTION,
+        from_state=str(item["state"]),
+        to_state=str(item["state"]),
+        reason="fresh_exact_dialog_reverification",
+        details=details,
+    )
+    event = _reverified_historical_inbound_event(
+        conn,
+        run_id=run_id,
+        step_key="due_followups",
+        item_key=item_key,
+    )
+    if event is None:
+        raise RuntimeError("Audit-событие повторной проверки входящего не сохранено.")
+    valid, resolution = due_followup_resolution(
+        conn, run_id, "due_followups", item_key
+    )
+    if not valid or resolution.get("type") != REVERIFIED_HISTORICAL_INBOUND_RESOLUTION:
+        raise RuntimeError("Новое разрешение не прошло программную fail-closed проверку.")
+    completion_manifest = {
+        "manifest_version": 1,
+        "kind": "due_followup",
+        "run_id": run_id,
+        "step_key": "due_followups",
+        "item_key": item_key,
+        "observed_at": observed_at,
+        "captured_scope": dict(scope),
+        "completion_boundary": expected_boundary,
+        "remote_boundary_verified": True,
+        "reverification_contract": REVERIFIED_INBOUND_MANIFEST_CONTRACT,
+        "reverification_manifest_hash": requested_manifest_hash,
+        "programmatic_resolution": resolution,
+        "blockers": [],
+    }
+    complete_work(
+        conn,
+        settings,
+        run_id=run_id,
+        step_key="due_followups",
+        item_key=item_key,
+        manifest=completion_manifest,
+        record_type="programmatic",
+    )
+    interaction_rows_after = conn.execute(
+        "SELECT * FROM employer_interactions WHERE vacancy_id = ? ORDER BY id",
+        (scope["vacancy_id"],),
+    ).fetchall()
+    if payload_hash(
+        [_interaction_evidence_snapshot(row) for row in interaction_rows_after]
+    ) != interaction_fingerprint:
+        raise RuntimeError("История взаимодействий изменилась во время resolution.")
+    lifecycle_rows_after = conn.execute(
+        "SELECT * FROM lifecycle_events WHERE vacancy_id = ? ORDER BY id",
+        (scope["vacancy_id"],),
+    ).fetchall()
+    if payload_hash([dict(row) for row in lifecycle_rows_after]) != lifecycle_fingerprint:
+        raise RuntimeError("Жизненный цикл изменился во время resolution.")
+    _, _, live_after = _exact_due_followup_context(
+        conn,
+        run_id=run_id,
+        item_key=item_key,
+        allow_reconciled_application_status_drift=True,
+    )
+    if preserved_states != {
+        "application_status": str(live_after["application_status"] or ""),
+        "application_stage": str(live_after["application_stage"] or ""),
+        "vacancy_status": str(live_after["vacancy_status"] or ""),
+        "vacancy_stage": str(live_after["vacancy_stage"] or ""),
+    }:
+        raise RuntimeError("Status или stage изменился во время resolution.")
+    return {
+        "run_id": run_id,
+        "item_key": item_key,
+        "changed": True,
+        "idempotent": False,
+        "resolution": resolution,
+        "audit_transition_id": event["id"],
+        "original_interaction_id": interaction_id,
+        "original_event_at": snapshot["event_at"],
+        "observed_at": observed_at,
+        "interaction_timestamp_preserved": True,
+        "duplicate_interaction_created": False,
+        "lifecycle_preserved": True,
+        "application_status_preserved": preserved_states["application_status"],
+        "application_stage_preserved": preserved_states["application_stage"],
+        "vacancy_status_preserved": preserved_states["vacancy_status"],
+        "vacancy_stage_preserved": preserved_states["vacancy_stage"],
+    }
+
+
+def cancel_due_followup_obligation(
+    conn: sqlite3.Connection,
+    settings: Settings,
+    *,
+    run_id: str,
+    item_key: str,
+    reason: str,
+) -> dict[str, Any]:
+    """Resolve one frozen due-follow-up item by explicit user cancellation."""
+
+    reason = reason.strip()
+    if not reason:
+        raise ValueError("Для отмены повторного обращения требуется непустая причина оператора.")
+    if len(reason) > 1000:
+        raise ValueError("Причина отмены повторного обращения не должна превышать 1000 символов.")
+    run = get_run(conn, run_id)
+    if run is None or str(run["status"]) == "completed":
+        raise ValueError("Точный незавершённый ежедневный запуск не найден.")
+    item, scope, live = _exact_due_followup_context(
+        conn, run_id=run_id, item_key=item_key
+    )
+    existing = _user_cancelled_followup_event(
+        conn,
+        run_id=run_id,
+        step_key="due_followups",
+        item_key=item_key,
+    )
+    if existing is not None:
+        details = existing["details"]
+        if str(details.get("operator_reason", "")) != reason:
+            raise ValueError(
+                "Обязанность уже отменена с другой причиной; история не переписана."
+            )
+        resolution = _user_cancelled_followup_resolution(
+            conn,
+            run_id=run_id,
+            step_key="due_followups",
+            item_key=item_key,
+        )
+        if resolution is None or not resolution.pop("valid"):
+            raise ValueError(
+                "Scope отменённой обязанности изменился или был повторно активирован."
+            )
+        if str(item["state"]) != "completed":
+            raise RuntimeError(
+                "Audit-событие отмены существует, но frozen work item не завершён."
+            )
+        return {
+            "run_id": run_id,
+            "item_key": item_key,
+            "changed": False,
+            "idempotent": True,
+            "resolution": resolution,
+            "audit_transition_id": existing["id"],
+            "application_id": int(scope["application_id"]),
+            "vacancy_id": int(scope["vacancy_id"]),
+            "dates_cleared": True,
+            "lifecycle_preserved": True,
+        }
+    if str(item["state"]) in FINISHED_WORK_STATES:
+        raise ValueError(
+            "Повторное обращение уже завершено другим доказательным разрешением."
+        )
+    already_valid, existing_resolution = due_followup_resolution(
+        conn, run_id, "due_followups", item_key
+    )
+    if already_valid:
+        raise ValueError(
+            "Повторное обращение уже имеет другое доказательное разрешение: "
+            + str(existing_resolution.get("type", "unknown"))
+            + "."
+        )
+
+    lifecycle_rows = conn.execute(
+        """
+        SELECT id, event_type, event_at, dedupe_key
+        FROM lifecycle_events WHERE vacancy_id = ? ORDER BY id
+        """,
+        (scope["vacancy_id"],),
+    ).fetchall()
+    lifecycle_fingerprint = payload_hash([dict(row) for row in lifecycle_rows])
+    timestamp = now_iso()
+    original_date = str(scope["follow_up_date"])
+    application_update = conn.execute(
+        """
+        UPDATE applications SET follow_up_date = ''
+        WHERE id = ? AND vacancy_id = ?
+          AND COALESCE(follow_up_date, '') IN ('', ?)
+        """,
+        (scope["application_id"], scope["vacancy_id"], original_date),
+    )
+    vacancy_update = conn.execute(
+        """
+        UPDATE vacancies SET follow_up_date = '', updated_at = ?
+        WHERE id = ? AND COALESCE(follow_up_date, '') IN ('', ?)
+        """,
+        (timestamp, scope["vacancy_id"], original_date),
+    )
+    if application_update.rowcount != 1 or vacancy_update.rowcount != 1:
+        raise RuntimeError(
+            "Scope повторного обращения изменился во время отмены; операция остановлена."
+        )
+    details = {
+        "resolution_type": USER_CANCELLED_FOLLOWUP_RESOLUTION,
+        "run_id": run_id,
+        "step_key": "due_followups",
+        "item_key": item_key,
+        "vacancy_id": int(scope["vacancy_id"]),
+        "application_id": int(scope["application_id"]),
+        "original_follow_up_date": original_date,
+        "operator_reason": reason,
+        "cancelled_at": timestamp,
+        "frozen_scope_hash": payload_hash(scope),
+        "frozen_input_fingerprint": str(item["input_fingerprint"]),
+        "application_state_preserved": {
+            "status": str(live["application_status"] or ""),
+            "stage": str(live["application_stage"] or ""),
+        },
+        "vacancy_state_preserved": {
+            "status": str(live["vacancy_status"] or ""),
+            "stage": str(live["vacancy_stage"] or ""),
+        },
+        "lifecycle_event_count": len(lifecycle_rows),
+        "lifecycle_fingerprint": lifecycle_fingerprint,
+        "application_follow_up_date_cleared": True,
+        "vacancy_follow_up_date_cleared": True,
+        "message_delivery_inferred": False,
+        "fresh_inbound_inferred": False,
+        "rejection_inferred": False,
+        "withdrawal_inferred": False,
+    }
+    append_transition(
+        conn,
+        run_id=run_id,
+        entity_type="work_item",
+        entity_key=f"due_followups/{item_key}",
+        event_type=USER_CANCELLED_FOLLOWUP_RESOLUTION,
+        from_state=str(item["state"]),
+        to_state=str(item["state"]),
+        reason=reason,
+        details=details,
+    )
+    event = _user_cancelled_followup_event(
+        conn,
+        run_id=run_id,
+        step_key="due_followups",
+        item_key=item_key,
+    )
+    if event is None:
+        raise RuntimeError("Audit-событие отмены повторного обращения не сохранено.")
+    valid, resolution = due_followup_resolution(
+        conn, run_id, "due_followups", item_key
+    )
+    if not valid or resolution.get("type") != USER_CANCELLED_FOLLOWUP_RESOLUTION:
+        raise RuntimeError(
+            "Audit-событие отмены не прошло программную проверку точного scope."
+        )
+    manifest = _programmatic_manifest(
+        run_id,
+        "due_followups",
+        item_key,
+        "due_followup",
+        scope,
+        resolution,
+    )
+    complete_work(
+        conn,
+        settings,
+        run_id=run_id,
+        step_key="due_followups",
+        item_key=item_key,
+        manifest=manifest,
+        record_type="programmatic",
+    )
+    lifecycle_after = conn.execute(
+        """
+        SELECT id, event_type, event_at, dedupe_key
+        FROM lifecycle_events WHERE vacancy_id = ? ORDER BY id
+        """,
+        (scope["vacancy_id"],),
+    ).fetchall()
+    if payload_hash([dict(row) for row in lifecycle_after]) != lifecycle_fingerprint:
+        raise RuntimeError("Жизненный цикл вакансии изменился во время отмены.")
+    return {
+        "run_id": run_id,
+        "item_key": item_key,
+        "changed": True,
+        "idempotent": False,
+        "resolution": resolution,
+        "audit_transition_id": event["id"],
+        "application_id": int(scope["application_id"]),
+        "vacancy_id": int(scope["vacancy_id"]),
+        "dates_cleared": True,
+        "lifecycle_preserved": True,
+        "application_status_preserved": str(live["application_status"] or ""),
+        "application_stage_preserved": str(live["application_stage"] or ""),
+        "vacancy_status_preserved": str(live["vacancy_status"] or ""),
+        "vacancy_stage_preserved": str(live["vacancy_stage"] or ""),
+        "message_delivery_inferred": False,
+        "fresh_inbound_inferred": False,
+        "rejection_inferred": False,
+        "withdrawal_inferred": False,
+    }
 
 
 def external_action_resolution(
@@ -2914,6 +4245,190 @@ def _record_dynamic_plan_revision(
     return new_revision
 
 
+def reclassify_legacy_external_action_work(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    reason: str,
+) -> dict[str, Any]:
+    """Move only proven legacy authorization items to a non-required backlog."""
+
+    reason = reason.strip()
+    if not reason:
+        raise ValueError("Для переноса старых разрешений в backlog требуется точная причина.")
+    run = get_run(conn, run_id)
+    if run is None:
+        raise RuntimeError(f"Ежедневный запуск {run_id} не найден.")
+    if run["status"] == "completed":
+        raise RuntimeError("Завершённый ежедневный запуск нельзя изменять.")
+    groups = external_action_scope_groups(conn, run_id=run_id)
+    legacy_by_key = {
+        str(row["action_key"]): row for row in groups["legacy_backlog"]
+    }
+    candidates: list[tuple[sqlite3.Row, dict[str, Any], dict[str, Any]]] = []
+    for item in conn.execute(
+        """
+        SELECT * FROM daily_run_work_items
+        WHERE run_id = ? AND step_key = 'external_action_reconciliation'
+          AND required = 1
+        ORDER BY order_no, item_key
+        """,
+        (run_id,),
+    ).fetchall():
+        try:
+            scope = json.loads(str(item["scope_json"]))
+        except json.JSONDecodeError:
+            continue
+        action = legacy_by_key.get(str(scope.get("action_key", "")))
+        if action is not None and action["state"] in LEGACY_EXTERNAL_ACTION_STATES:
+            candidates.append((item, scope, action))
+    if not candidates:
+        return {
+            "changed": False,
+            "reclassified": 0,
+            "retained_required": len(groups["current_run"])
+            + len(groups["unresolved_attempted"]),
+            "action_id_floor": groups["action_id_floor"],
+            "contract": groups["contract"],
+        }
+
+    timestamp = now_iso()
+    changed_items: list[tuple[str, str]] = []
+    for item, old_scope, action in candidates:
+        scope = {
+            **old_scope,
+            "reconciliation_scope": "legacy_authorization_backlog",
+            "scope_contract": EXTERNAL_ACTION_SCOPE_CONTRACT,
+            "reclassification_reason": reason,
+        }
+        manifest = {
+            "manifest_version": 1,
+            "kind": "legacy_external_action_backlog",
+            "run_id": run_id,
+            "step_key": "external_action_reconciliation",
+            "item_key": str(item["item_key"]),
+            "observed_at": timestamp,
+            "captured_scope": scope,
+            "completion_boundary": "legacy_authorization_backlog_reclassification",
+            "remote_boundary_verified": False,
+            "programmatic_resolution": {
+                "latest_state": action["state"],
+                "external_action_id": action["id"],
+                "history_preserved": True,
+                "delivery_inferred": False,
+                "automatic_retry_allowed": False,
+            },
+            "blockers": [],
+        }
+        digest, _ = _insert_manifest(
+            conn,
+            manifest=manifest,
+            record_type="programmatic",
+            validation_status="validated",
+        )
+        definition = _item(
+            str(item["item_key"]),
+            "external_action",
+            int(item["order_no"]),
+            scope,
+            required=False,
+            state="not_applicable",
+        )
+        conn.execute(
+            """
+            UPDATE daily_run_work_items
+            SET required = 0, state = 'not_applicable', scope_json = ?,
+                input_fingerprint = ?, manifest_hash = ?, evidence_hash = ?,
+                output_fingerprint = ?, completed_at = ?, updated_at = ?,
+                blocker_code = NULL, blocker_reason = NULL, retryable = NULL
+            WHERE run_id = ? AND step_key = 'external_action_reconciliation'
+              AND item_key = ?
+            """,
+            (
+                canonical_json(scope),
+                _item_input_fingerprint(definition),
+                digest,
+                digest,
+                digest,
+                timestamp,
+                timestamp,
+                run_id,
+                item["item_key"],
+            ),
+        )
+        append_transition(
+            conn,
+            run_id=run_id,
+            entity_type="work_item",
+            entity_key=f"external_action_reconciliation/{item['item_key']}",
+            event_type="reclassified_to_legacy_backlog",
+            from_state=str(item["state"]),
+            to_state="not_applicable",
+            reason=reason,
+            details={
+                "external_action_id": action["id"],
+                "latest_state": action["state"],
+                "history_preserved": True,
+                "delivery_inferred": False,
+            },
+        )
+        changed_items.append(("external_action_reconciliation", str(item["item_key"])))
+
+    # Persist the exact legacy-run fallback as the run's immutable ID boundary
+    # before recording the audited plan revision.
+    refreshed_run = get_run(conn, run_id)
+    assert refreshed_run is not None
+    run_scope = json.loads(str(refreshed_run["scope_json"]))
+    run_scope["external_action_scope_contract"] = EXTERNAL_ACTION_SCOPE_CONTRACT
+    run_scope["external_action_id_floor"] = groups["action_id_floor"]
+    conn.execute(
+        "UPDATE daily_runs SET scope_json = ?, updated_at = ? WHERE run_id = ?",
+        (canonical_json(run_scope), timestamp, run_id),
+    )
+    revision = _record_dynamic_plan_revision(
+        conn,
+        run_id=run_id,
+        added_items=(),
+        changed_items=changed_items,
+    )
+    _aggregate_step(conn, run_id, "external_action_reconciliation")
+    for step_key in ("sqlite_reconciliation", "closeout"):
+        step = conn.execute(
+            "SELECT state FROM daily_run_steps WHERE run_id = ? AND step_key = ?",
+            (run_id, step_key),
+        ).fetchone()
+        if step is not None and step["state"] == "completed":
+            conn.execute(
+                """
+                UPDATE daily_run_steps SET state = 'invalidated', completed_at = NULL,
+                    updated_at = ? WHERE run_id = ? AND step_key = ?
+                """,
+                (timestamp, run_id, step_key),
+            )
+            append_transition(
+                conn,
+                run_id=run_id,
+                entity_type="step",
+                entity_key=step_key,
+                event_type="invalidated",
+                from_state="completed",
+                to_state="invalidated",
+                reason="legacy_external_action_scope_reclassified",
+            )
+    refresh_run_snapshot(conn, run_id)
+    return {
+        "changed": True,
+        "reclassified": len(candidates),
+        "retained_required": len(groups["current_run"])
+        + len(groups["unresolved_attempted"]),
+        "plan_revision": revision,
+        "action_id_floor": groups["action_id_floor"],
+        "contract": groups["contract"],
+        "external_action_rows_changed": 0,
+        "delivery_inferred": False,
+    }
+
+
 def refresh_dynamic_work(
     conn: sqlite3.Connection, settings: Settings, *, run_id: str
 ) -> dict[str, int]:
@@ -2937,6 +4452,91 @@ def refresh_dynamic_work(
         item_definition = _item(item_key, "due_followup", index, scope)
         item_fingerprint = _item_input_fingerprint(item_definition)
         if existing:
+            cancellation_event = _user_cancelled_followup_event(
+                conn,
+                run_id=run_id,
+                step_key="due_followups",
+                item_key=item_key,
+            )
+            if cancellation_event is not None:
+                if str(existing["state"]) != "invalidated":
+                    conn.execute(
+                        """
+                        UPDATE daily_run_work_items
+                        SET input_fingerprint = ?, scope_json = ?, required = 1,
+                            state = 'invalidated', completed_at = NULL, updated_at = ?
+                        WHERE run_id = ? AND step_key = 'due_followups'
+                          AND item_key = ?
+                        """,
+                        (
+                            item_fingerprint,
+                            canonical_json(scope),
+                            timestamp,
+                            run_id,
+                            item_key,
+                        ),
+                    )
+                    append_transition(
+                        conn,
+                        run_id=run_id,
+                        entity_type="work_item",
+                        entity_key=f"due_followups/{item_key}",
+                        event_type="invalidated",
+                        from_state=str(existing["state"]),
+                        to_state="invalidated",
+                        reason="user_cancelled_followup_scope_reactivated",
+                        details={
+                            "cancellation_transition_id": cancellation_event["id"],
+                            "old_input_fingerprint": existing["input_fingerprint"],
+                            "new_input_fingerprint": item_fingerprint,
+                        },
+                    )
+                    changed_item_keys.append(("due_followups", item_key))
+                continue
+            reverified_event = _reverified_historical_inbound_event(
+                conn,
+                run_id=run_id,
+                step_key="due_followups",
+                item_key=item_key,
+            )
+            if reverified_event is not None:
+                valid_resolution, _ = due_followup_resolution(
+                    conn, run_id, "due_followups", item_key
+                )
+                if not valid_resolution and str(existing["state"]) != "invalidated":
+                    conn.execute(
+                        """
+                        UPDATE daily_run_work_items
+                        SET input_fingerprint = ?, scope_json = ?, required = 1,
+                            state = 'invalidated', completed_at = NULL, updated_at = ?
+                        WHERE run_id = ? AND step_key = 'due_followups'
+                          AND item_key = ?
+                        """,
+                        (
+                            item_fingerprint,
+                            canonical_json(scope),
+                            timestamp,
+                            run_id,
+                            item_key,
+                        ),
+                    )
+                    append_transition(
+                        conn,
+                        run_id=run_id,
+                        entity_type="work_item",
+                        entity_key=f"due_followups/{item_key}",
+                        event_type="invalidated",
+                        from_state=str(existing["state"]),
+                        to_state="invalidated",
+                        reason="reverified_historical_inbound_scope_reactivated",
+                        details={
+                            "reverification_transition_id": reverified_event["id"],
+                            "old_input_fingerprint": existing["input_fingerprint"],
+                            "new_input_fingerprint": item_fingerprint,
+                        },
+                    )
+                    changed_item_keys.append(("due_followups", item_key))
+                continue
             if str(existing["input_fingerprint"]) != item_fingerprint:
                 state = (
                     "invalidated"
@@ -3006,7 +4606,7 @@ def refresh_dynamic_work(
             reason="authoritative_queue_extended",
             details={"plan_revision": int(run["plan_revision"]) + 1},
         )
-    actions = latest_nonterminal_external_actions(conn)
+    actions = external_actions_requiring_reconciliation(conn, run_id=run_id)
     for index, scope in enumerate(actions, start=1):
         item_key = stable_item_key("external", str(scope["action_key"]))
         existing = conn.execute(
@@ -3024,22 +4624,29 @@ def refresh_dynamic_work(
             "state": scope["state"],
             "vacancy_id": scope["vacancy_id"],
             "external_reference": scope["external_reference"] or "",
+            "reconciliation_scope": scope["reconciliation_scope"],
+            "scope_contract": EXTERNAL_ACTION_SCOPE_CONTRACT,
         }
         item_definition = _item(
             item_key, "external_action", index, compact_scope, state=state
         )
         item_fingerprint = _item_input_fingerprint(item_definition)
         if existing:
-            if str(existing["input_fingerprint"]) != item_fingerprint:
-                refreshed_state = (
-                    "invalidated"
-                    if existing["state"] in FINISHED_WORK_STATES
-                    else str(existing["state"])
-                )
+            if (
+                str(existing["input_fingerprint"]) != item_fingerprint
+                or not bool(existing["required"])
+            ):
+                if not bool(existing["required"]):
+                    refreshed_state = "pending"
+                elif existing["state"] in FINISHED_WORK_STATES:
+                    refreshed_state = "invalidated"
+                else:
+                    refreshed_state = str(existing["state"])
                 conn.execute(
                     """
                     UPDATE daily_run_work_items SET input_fingerprint = ?, scope_json = ?,
-                        state = ?, completed_at = CASE WHEN ? = 'invalidated' THEN NULL ELSE completed_at END,
+                        required = 1, state = ?,
+                        completed_at = CASE WHEN ? IN ('invalidated','pending') THEN NULL ELSE completed_at END,
                         updated_at = ?
                     WHERE run_id = ? AND step_key = 'external_action_reconciliation'
                       AND item_key = ?
@@ -3064,7 +4671,11 @@ def refresh_dynamic_work(
                     ),
                     from_state=str(existing["state"]),
                     to_state=refreshed_state,
-                    reason="authoritative_queue_scope_changed",
+                    reason=(
+                        "restored_from_legacy_authorization_backlog"
+                        if not bool(existing["required"])
+                        else "authoritative_queue_scope_changed"
+                    ),
                     details={
                         "old_input_fingerprint": existing["input_fingerprint"],
                         "new_input_fingerprint": item_fingerprint,
@@ -3214,6 +4825,7 @@ def refresh_plan(
         settings,
         run_date=str(run["run_date"]),
         timezone=str(run["timezone"]),
+        run_id=run_id,
     )
     new_revision = int(run["plan_revision"]) + 1
     timestamp = now_iso()
@@ -3326,6 +4938,22 @@ def refresh_plan(
                 """,
                 (run_id, step["key"]),
             ).fetchall():
+                if step["key"] == "due_followups":
+                    valid_resolution, resolution = due_followup_resolution(
+                        conn,
+                        run_id,
+                        "due_followups",
+                        str(child["item_key"]),
+                    )
+                    if (
+                        valid_resolution
+                        and resolution.get("type")
+                        in {
+                            USER_CANCELLED_FOLLOWUP_RESOLUTION,
+                            REVERIFIED_HISTORICAL_INBOUND_RESOLUTION,
+                        }
+                    ):
+                        continue
                 conn.execute(
                     """
                     UPDATE daily_run_work_items SET state = 'invalidated',
@@ -3792,6 +5420,50 @@ def _manifest_integrity_issues(conn: sqlite3.Connection, run_id: str) -> list[st
     return issues
 
 
+def _due_followup_resolution_issues(
+    conn: sqlite3.Connection, run_id: str
+) -> list[str]:
+    issues: list[str] = []
+    rows = conn.execute(
+        """
+        SELECT item_key, state FROM daily_run_work_items
+        WHERE run_id = ? AND step_key = 'due_followups' AND required = 1
+        ORDER BY order_no, item_key
+        """,
+        (run_id,),
+    ).fetchall()
+    for row in rows:
+        cancellation_event = _user_cancelled_followup_event(
+            conn,
+            run_id=run_id,
+            step_key="due_followups",
+            item_key=str(row["item_key"]),
+        )
+        reverified_event = _reverified_historical_inbound_event(
+            conn,
+            run_id=run_id,
+            step_key="due_followups",
+            item_key=str(row["item_key"]),
+        )
+        if (
+            str(row["state"]) not in FINISHED_WORK_STATES
+            and cancellation_event is None
+            and reverified_event is None
+        ):
+            continue
+        valid, resolution = due_followup_resolution(
+            conn, run_id, "due_followups", str(row["item_key"])
+        )
+        if not valid:
+            resolution_type = str(resolution.get("type", "missing_resolution"))
+            issues.append(
+                "Завершённое повторное обращение "
+                f"due_followups/{row['item_key']} больше не имеет действующего "
+                f"разрешения ({resolution_type})."
+            )
+    return issues
+
+
 def _dynamic_scope_issues(conn: sqlite3.Connection, run: sqlite3.Row) -> list[str]:
     if run["status"] == "completed":
         return []
@@ -3822,7 +5494,9 @@ def _dynamic_scope_issues(conn: sqlite3.Connection, run: sqlite3.Row) -> list[st
     }
     authoritative_actions = {
         stable_item_key("external", str(row["action_key"]))
-        for row in latest_nonterminal_external_actions(conn)
+        for row in external_actions_requiring_reconciliation(
+            conn, run_id=str(run["run_id"])
+        )
     }
     issues: list[str] = []
     if missing := sorted(authoritative_due - existing_due):
@@ -3851,6 +5525,22 @@ def closeout_readiness(
         if mutate_dynamic and run["status"] != "completed"
         else {"due_followups": 0, "external_actions": 0, "resolved": 0, "uncertain": 0}
     )
+    if mutate_dynamic and run["status"] != "completed":
+        # An explicit upstream revalidation invalidates descendant step
+        # aggregates without discarding their immutable child manifests.  Once
+        # the upstream evidence is fresh again, derive those aggregates from
+        # the child states before applying closeout checks.  Otherwise a fully
+        # proved P2 source can incorrectly fall back to the legacy search-run
+        # contract solely because its cached step state is stale.
+        for step in conn.execute(
+            """
+            SELECT DISTINCT step_key FROM daily_run_work_items
+            WHERE run_id = ? AND required = 1
+            ORDER BY step_key
+            """,
+            (run_id,),
+        ).fetchall():
+            _aggregate_step(conn, run_id, str(step["step_key"]))
     run = get_run(conn, run_id)
     assert run is not None
     issues: list[str] = []
@@ -3865,6 +5555,7 @@ def closeout_readiness(
     issues.extend(_dynamic_scope_issues(conn, run))
     issues.extend(_coverage_closeout_issues(conn, run))
     issues.extend(_manifest_integrity_issues(conn, run_id))
+    issues.extend(_due_followup_resolution_issues(conn, run_id))
     quick_check = str(conn.execute("PRAGMA quick_check").fetchone()[0])
     if quick_check != "ok":
         issues.append(f"PRAGMA quick_check вернул: {quick_check}.")
@@ -4019,7 +5710,7 @@ def note_external_action_event(
     refresh_dynamic_work(conn, settings, run_id=run_id)
     latest_action = conn.execute(
         """
-        SELECT state FROM external_actions
+        SELECT id, action_key, state, event_at FROM external_actions
         WHERE action_key = ? ORDER BY event_at DESC, id DESC LIMIT 1
         """,
         (action_key,),
@@ -4035,24 +5726,35 @@ def note_external_action_event(
             """,
             (run_id,),
         ).fetchone()
-        if inbound is not None and inbound["state"] == "completed":
-            conn.execute(
-                """
-                UPDATE daily_run_steps SET state = 'invalidated', completed_at = NULL,
-                    updated_at = ? WHERE run_id = ? AND step_key = 'inbound_reconciliation'
-                """,
-                (now_iso(), run_id),
-            )
+        if inbound is not None and inbound["state"] in {"completed", "invalidated"}:
+            if inbound["state"] == "completed":
+                conn.execute(
+                    """
+                    UPDATE daily_run_steps SET state = 'invalidated', completed_at = NULL,
+                        updated_at = ? WHERE run_id = ? AND step_key = 'inbound_reconciliation'
+                    """,
+                    (now_iso(), run_id),
+                )
             append_transition(
                 conn,
                 run_id=run_id,
                 entity_type="step",
                 entity_key="inbound_reconciliation",
-                event_type="invalidated",
-                from_state="completed",
+                event_type=(
+                    "invalidated"
+                    if inbound["state"] == "completed"
+                    else "freshness_requirement_extended"
+                ),
+                from_state=str(inbound["state"]),
                 to_state="invalidated",
                 reason="external_action_after_inbound_checkpoint",
-                details={"action_key": action_key, "state": latest_action["state"]},
+                details={
+                    "external_action_id": int(latest_action["id"]),
+                    "action_key": action_key,
+                    "state": latest_action["state"],
+                    "event_at": latest_action["event_at"],
+                    "next_safe_action": "reconcile_inbound_after_outbound",
+                },
             )
     item_key = stable_item_key("external", action_key)
     row = conn.execute(

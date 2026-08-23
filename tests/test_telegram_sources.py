@@ -12,8 +12,249 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 JOBCTL = ROOT / "scripts" / "jobctl.py"
+sys.path.insert(0, str(ROOT / "scripts"))
+
+from jobsearch_config import TelegramChannelSettings  # noqa: E402
+from telegram_source import (  # noqa: E402
+    TELEGRAM_COUNT_CONTRACT,
+    build_telegram_plan,
+    validate_telegram_manifest,
+)
+
+
 HANDLE = "example_exec_jobs"
 STREAM = f"telegram:{HANDLE}"
+
+
+class TelegramCountContractTests(unittest.TestCase):
+    channel = TelegramChannelSettings(
+        handle=HANDLE,
+        url=f"https://t.me/{HANDLE}",
+        preview_url=f"https://t.me/s/{HANDLE}",
+    )
+    checkpoints = {
+        STREAM: {
+            "cursor_value": "100",
+            "cursor_date": "2026-08-08",
+            "last_completed_run_date": "2026-08-08",
+        }
+    }
+
+    def validate(
+        self,
+        *,
+        pages: list[dict[str, object]],
+        posts: list[dict[str, object]],
+        boundary: dict[str, object],
+        found: int,
+        evidence: dict[str, dict[str, object]] | None = None,
+        unique: int = 0,
+        known: int = 0,
+        new: int = 0,
+    ) -> dict[str, object]:
+        plan = build_telegram_plan(
+            "2026-08-09",
+            [self.channel],
+            initial_lookback_days=30,
+            checkpoints=self.checkpoints,
+        )
+        stream = plan["streams"][0]
+        stream.update(
+            {
+                "status": "completed",
+                "pages": pages,
+                "posts": posts,
+                "boundary": boundary,
+                "found": found,
+                "unique": unique,
+                "known": known,
+                "new": new,
+            }
+        )
+        plan["totals"] = {"unique": unique, "known": known, "new": new}
+        return validate_telegram_manifest(
+            plan,
+            [self.channel],
+            initial_lookback_days=30,
+            checkpoints=self.checkpoints,
+            vacancy_evidence=evidence or {},
+        )
+
+    @staticmethod
+    def post(
+        post_id: int,
+        classification: str,
+        *,
+        external_ids: list[str] | None = None,
+        url: str | None = None,
+    ) -> dict[str, object]:
+        return {
+            "post_id": post_id,
+            "posted_at": "2026-08-09T09:00:00Z" if post_id > 100 else "2026-08-08T09:00:00Z",
+            "url": url or f"https://t.me/{HANDLE}/{post_id}",
+            "classification": classification,
+            "vacancy_external_ids": external_ids or [],
+        }
+
+    def assert_contract(
+        self,
+        result: dict[str, object],
+        *,
+        raw: int,
+        processed: int,
+        reconciled: int,
+    ) -> None:
+        stream = result["streams"][0]
+        self.assertEqual(stream["count_contract"], TELEGRAM_COUNT_CONTRACT)
+        self.assertEqual(
+            (stream["raw"], stream["processed"], stream["reconciled"]),
+            (raw, processed, reconciled),
+        )
+        self.assertGreaterEqual(raw, processed)
+        self.assertGreaterEqual(processed, reconciled)
+
+    def test_empty_delta_has_zero_source_units(self) -> None:
+        result = self.validate(
+            pages=[{"url": f"https://t.me/s/{HANDLE}", "post_ids": []}],
+            posts=[],
+            boundary={"reached": True, "kind": "channel_start", "value": ""},
+            found=0,
+        )
+        self.assertTrue(result["ok"], result["issues"])
+        self.assert_contract(result, raw=0, processed=0, reconciled=0)
+
+    def test_delta_boundary_is_raw_and_processed_but_not_found(self) -> None:
+        result = self.validate(
+            pages=[{"url": f"https://t.me/s/{HANDLE}", "post_ids": [100]}],
+            posts=[self.post(100, "out_of_scope")],
+            boundary={"reached": True, "kind": "post_id", "value": 100},
+            found=0,
+        )
+        self.assertTrue(result["ok"], result["issues"])
+        self.assertEqual(result["streams"][0]["found"], 0)
+        self.assert_contract(result, raw=1, processed=1, reconciled=0)
+
+    def test_boundary_plus_new_posts_preserves_actual_units(self) -> None:
+        result = self.validate(
+            pages=[{"url": f"https://t.me/s/{HANDLE}", "post_ids": [102, 101, 100]}],
+            posts=[
+                self.post(102, "non_vacancy"),
+                self.post(101, "non_vacancy"),
+                self.post(100, "out_of_scope"),
+            ],
+            boundary={"reached": True, "kind": "post_id", "value": 100},
+            found=2,
+        )
+        self.assertTrue(result["ok"], result["issues"])
+        self.assert_contract(result, raw=3, processed=3, reconciled=0)
+
+    def test_duplicate_page_observation_increases_raw_without_duplicate_processing(self) -> None:
+        result = self.validate(
+            pages=[
+                {"url": f"https://t.me/s/{HANDLE}", "post_ids": [101, 100]},
+                {"url": f"https://t.me/s/{HANDLE}?before=100", "post_ids": [100]},
+            ],
+            posts=[self.post(101, "non_vacancy"), self.post(100, "out_of_scope")],
+            boundary={"reached": True, "kind": "post_id", "value": 100},
+            found=1,
+        )
+        self.assertTrue(result["ok"], result["issues"])
+        self.assert_contract(result, raw=3, processed=2, reconciled=0)
+
+    def test_out_of_scope_evidence_remains_counted(self) -> None:
+        result = self.validate(
+            pages=[{"url": f"https://t.me/s/{HANDLE}", "post_ids": [101, 100, 99]}],
+            posts=[
+                self.post(101, "non_vacancy"),
+                self.post(100, "out_of_scope"),
+                self.post(99, "out_of_scope"),
+            ],
+            boundary={"reached": True, "kind": "post_id", "value": 100},
+            found=1,
+        )
+        self.assertTrue(result["ok"], result["issues"])
+        self.assert_contract(result, raw=3, processed=3, reconciled=0)
+
+    def test_malformed_post_is_raw_but_not_processed_or_reconciled(self) -> None:
+        external_id = f"telegram:{HANDLE}:101"
+        result = self.validate(
+            pages=[{"url": f"https://t.me/s/{HANDLE}", "post_ids": [101]}],
+            posts=[
+                self.post(
+                    101,
+                    "vacancy",
+                    external_ids=[external_id],
+                    url=f"https://t.me/{HANDLE}/wrong",
+                )
+            ],
+            boundary={"reached": True, "kind": "channel_start", "value": ""},
+            found=1,
+            unique=0,
+            evidence={
+                external_id: {
+                    "url": f"https://t.me/{HANDLE}/101",
+                    "score": 90,
+                    "source_streams": [STREAM],
+                    "vacancy_id": 1,
+                }
+            },
+        )
+        self.assertFalse(result["ok"])
+        self.assert_contract(result, raw=1, processed=0, reconciled=0)
+
+    def test_multiple_new_posts_and_multi_vacancy_post_reconcile_exactly(self) -> None:
+        first = f"telegram:{HANDLE}:103:first"
+        second = f"telegram:{HANDLE}:103:second"
+        third = f"telegram:{HANDLE}:102"
+        evidence = {
+            first: {
+                "url": f"https://t.me/{HANDLE}/103",
+                "score": 91,
+                "source_streams": [STREAM],
+                "vacancy_id": 1,
+            },
+            second: {
+                "url": f"https://t.me/{HANDLE}/103",
+                "score": 89,
+                "source_streams": [STREAM],
+                "vacancy_id": 2,
+            },
+            third: {
+                "url": f"https://t.me/{HANDLE}/102",
+                "score": 87,
+                "source_streams": [STREAM],
+                "vacancy_id": 3,
+            },
+        }
+        result = self.validate(
+            pages=[{"url": f"https://t.me/s/{HANDLE}", "post_ids": [103, 102, 100]}],
+            posts=[
+                self.post(103, "vacancy", external_ids=[first, second]),
+                self.post(102, "vacancy", external_ids=[third]),
+                self.post(100, "out_of_scope"),
+            ],
+            boundary={"reached": True, "kind": "post_id", "value": 100},
+            found=2,
+            unique=3,
+            new=3,
+            evidence=evidence,
+        )
+        self.assertTrue(result["ok"], result["issues"])
+        self.assert_contract(result, raw=4, processed=4, reconciled=3)
+        repeated = self.validate(
+            pages=[{"url": f"https://t.me/s/{HANDLE}", "post_ids": [103, 102, 100]}],
+            posts=[
+                self.post(103, "vacancy", external_ids=[first, second]),
+                self.post(102, "vacancy", external_ids=[third]),
+                self.post(100, "out_of_scope"),
+            ],
+            boundary={"reached": True, "kind": "post_id", "value": 100},
+            found=2,
+            unique=3,
+            new=3,
+            evidence=evidence,
+        )
+        self.assertEqual(repeated, result)
 
 
 class TelegramSourceIntegrationTests(unittest.TestCase):

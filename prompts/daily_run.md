@@ -94,6 +94,9 @@ authorized scope.
 - Record only what the external system visibly proves.
 - When an application form asks for an unknown fact, store `needs_input` and the
   exact question. Never infer or improvise the answer.
+- Завершите `inbound_reconciliation` манифестом с фактическим `observed_at`.
+  Если позднее в этом же запуске появится `attempted` или
+  `visibly_confirmed`, Engine корректно инвалидирует прежнюю контрольную точку.
 
 ## Process Gmail job mail
 
@@ -174,6 +177,12 @@ authorized scope.
   SQLite reconciliation. It advances a channel cursor only when the entire
   Telegram manifest passes. Preserve a failed manifest and report the exact
   channel blocker; never move the cursor manually.
+- Заполняйте счётчики по `telegram_source_units_v1`: граничная
+  `out_of_scope` публикация входит в `raw` и `processed`, но не в `found`;
+  повторное наблюдение ID на другой странице добавляется только в `raw`, а
+  неверная запись остаётся сырой и не считается обработанной. Не подгоняйте
+  значения: успешный канал обязан доказать
+  `raw >= processed >= reconciled`.
 
 ## Discover and screen
 
@@ -197,6 +206,67 @@ authorized scope.
   запроса или настройки безопасности отменяет право на `delta`; не берите
   отпечаток из текстового описания и не восстанавливайте его вручную после
   прерывания.
+- Если планирование остановилось на несовпадении прежней версии адаптера или
+  конфигурации, не обходите проверку и не меняйте JSON-снимок. Recovery разрешён
+  только для замороженного потока без единого доказательства источника:
+  `state = planned`, `next_page = 0`, `last_verified_page = -1`, нет снимков
+  страниц, карточек, очереди деталей, текущей контрольной точки, манифеста
+  завершения или любого другого прогресса. Сначала переоткройте точную единицу
+  P1 через `invalidate-daily-run-work --reason ...` (для обычного потока это
+  `hh_coverage/<item_key>`, для рекомендаций — шаг
+  `personal_recommendations`), затем выполните:
+
+  ```bash
+  python3 scripts/jobctl.py invalidate-hh-zero-evidence-plan \
+    --run-id <run_id> --stream-key <stream_key> \
+    --reason "явное перепланирование после обновления DOM-адаптера" \
+    --defer-render --run-lease <token> --json
+  python3 scripts/jobctl.py plan-hh-acquisition \
+    --run-id <run_id> --stream-key <stream_key> \
+    --source-kind ordinary_search --query-json tmp/<stream>-query.json \
+    --defer-render --run-lease <token> --json
+  ```
+
+  Для рекомендаций во второй команде используйте
+  `--source-kind personal_recommendations` и тот же прежний отпечаток запроса.
+  Audit-only blocker-манифест P1 и его переходы `blocked`, `reopened` и
+  `invalidated` сохраняются и сами по себе recovery не запрещают. Команда
+  включает их хеши/ID в новое audit-событие и подтверждает, что доказательства
+  источника не отбрасывались. Для пустого плана `hh-dom-v1.0.1` audit-only
+  blocker обязан точно подтверждать отсутствующий или непригодный
+  `MutationObserver`; другой последний существенный runtime blocker не
+  разрешает переход на v1.0.2. Более ранние superseded adapter blockers и
+  известные audit-only ошибки самого recovery сохраняются в истории, но не
+  подменяют доказанный MutationObserver blocker. Любая
+  страница, карточка, деталь, сессия, граница,
+  контрольная точка, завершение, source-bearing манифест или ненулевой счётчик
+  обязаны привести к отказу; не удаляйте их вручную. Успешная историческая
+  контрольная точка остаётся неизменной. Для personal recommendations старый
+  audit-only `captured_scope` может отличаться только отсутствием новых
+  аддитивных полей внутри `hh_acquisition`; stream identity и все прежние
+  значения должны совпасть, иначе recovery обязан завершиться отказом.
+  Проверьте append-only
+  события `zero_evidence_plan_invalidated` и `zero_evidence_plan_replanned`
+  через `inspect-hh-checkpoint`, затем продолжайте обычным `record-hh-page`.
+- Для semantic title рекламной карточки с точным redirect `adsrv.hh.ru/click`
+  принимайте identity только из единственного числового `vacancyId` в видимом
+  same-origin response URL той же карточки. Не переходите по redirect и не
+  угадывайте ID; отсутствие, неоднозначность или конфликт должны блокировать
+  capture.
+- Отсутствие `TextEncoder`, typed arrays или WebCrypto в ограниченном read-only
+  evaluator не является разрешением ослабить хеши. Используйте встроенный
+  fallback адаптера: эквивалентные UTF-8 bytes и pure-JS SHA-256 должны дать тот
+  же digest, что обычный browser runtime.
+- При count drift принимайте timed-sampling recapture только по требуемому
+  непрерывному хвосту полностью эквивалентных ID, navigation, ordering и
+  session. Это может закрыть persisted pre-fix checkpoint; обычный второй
+  несовпадающий снимок остаётся непроверенным конфликтом и требует следующий
+  независимый recapture; принимайте страницу только после непрерывного хвоста
+  полностью эквивалентных снимков требуемой длины.
+- При rollover rolling-окна HH semantic previous-control может относиться к
+  зажатой последней странице. Используйте только единственную видимую числовую
+  ссылку на точный ожидаемый предыдущий индекс и по-прежнему требуйте двойной
+  count-drift recapture пустой терминальной страницы.
 - Для рабочего сбора HH сначала используйте авторизованный встроенный браузер
   Codex. Не переключайтесь молча в Chrome, отдельный профиль Playwright, другой
   аккаунт, HTTP-сбор или скрытый API. Читайте только видимые данные DOM и
@@ -204,17 +274,25 @@ authorized scope.
   отсутствующий числовой ID или активный индикатор загрузки блокируют источник.
 - Получите путь и SHA-256 проверенного адаптера командой
   `python3 scripts/jobctl.py hh-browser-adapter --json`, выполните именно эту
-  версию на разрешённой странице и вызовите
-  `FindDreamJobHHAdapter.captureListPage(...)` для обычной выдачи либо
-  `capturePersonalRecommendations(...)` для отдельного персонального источника.
-  Передайте отпечаток запроса из плана, точный номер страницы с нуля,
-  настроенный размер страницы, `page_stability_samples` и
-  `page_stability_delay_ms`.
+  версию как выражение на разрешённой странице, сохраните возвращённый объект
+  локально и вызовите `adapter.captureListPage(...)` для обычной выдачи либо
+  `adapter.capturePersonalRecommendations(...)` для отдельного персонального
+  источника. Адаптер не устанавливает `globalThis.FindDreamJobHHAdapter` и не
+  требует глобальной мутации. Передайте отпечаток запроса из плана, точный
+  номер страницы с нуля, настроенный размер страницы,
+  `page_stability_samples`, `page_stability_delay_ms` и
+  `page_stability_timeout_ms`.
 - Страница считается полной только после повторяющихся одинаковых наборов
   канонических ID, стабильной высоты или явного признака конца, исчезновения
-  индикатора загрузки, отсутствия значимой мутации DOM после дополнительной
-  прокрутки вниз, валидных ID и согласованной навигации. Не принимайте 99/100
-  только потому, что страница перестала меняться. При предупреждении
+  индикатора загрузки, дополнительной прокрутки вниз, валидных ID и
+  согласованной навигации. Предпочтительный метод
+  `mutation_observer_visible_dom` дополнительно доказывает отсутствие значимой
+  мутации DOM; при отсутствующем или непригодном `MutationObserver` адаптер
+  использует `timed_visible_dom_sampling` и не выдумывает observer-evidence.
+  Оба метода обязаны вернуть непрерывное окно совпавших снимков и отдельный
+  финальный снимок; несовпадение, timeout, loader, отсутствующий или
+  неоднозначный results root блокируют capture. Не принимайте 99/100 только
+  потому, что страница перестала меняться. При предупреждении
   `source_reported_count_drift` запишите первый устойчивый снимок и следуйте
   `next-hh-work`, чтобы получить второй независимый снимок. Расхождение можно
   снять только при одинаковых хешах ID, навигации, порядке и данных сессии.
@@ -238,11 +316,18 @@ authorized scope.
   сверить без повторной передачи либо завершить поток.
 - Для каждого возвращённого `new` или `known_changed` ID откройте точную
   вакансию в той же сессии встроенного браузера, вызовите
-  `FindDreamJobHHAdapter.captureVacancyDetail()` и сохраните результат через
+  `adapter.captureVacancyDetail()` на том же возвращённом объекте и сохраните
+  результат через
   `record-hh-detail`. Текст и позиция из списка не перезаписывают более сильное
   доказательство со страницы вакансии или из жизненного цикла. В существующий
   путь нормализации, импорта и скоринга передаются только эти ограниченные
   детали; описания неизменившихся известных вакансий повторно не снимаются.
+  Если точный URL вакансии видимо перенаправлен на same-origin HH lead-gen
+  `/article/<id>` или `/vrsurvey/<slug>` и единственный
+  `utm_redirect_vacancy_id` совпадает с ID
+  очереди, сохраните возвращённое адаптером доказательство `unavailable`:
+  не извлекайте из статьи вымышленные поля вакансии. Любое расхождение host,
+  path или ID блокирует capture.
 - В режиме `shadow` после предсказанной границы продолжайте до фактического
   исчерпания источника. Режимы `full` и `audit` требуют полного обхода. В
   `delta` останавливайтесь только по доказанной границе известных результатов.
@@ -301,6 +386,56 @@ python3 scripts/jobctl.py ingest-json tmp/daily_scan_YYYY-MM-DD.json \
 - For sent rounds, first record the exact external action through
   `record-external-action`; then pass its `external_action_key` with exact text
   and visible delivery evidence to `record-followup --outreach-json`.
+- Если пользователь явно отменяет одно точное наступившее повторное обращение,
+  возьмите неизменный `item_key` из `daily-run-status --verbose` и выполните:
+
+  ```bash
+  python3 scripts/jobctl.py cancel-due-followup-obligation \
+    --run-id <run_id> --item-key <due:item:key> \
+    --reason "<точная причина пользователя>" \
+    --defer-render --run-lease <token> --json
+  ```
+
+  Это не отказ и не отзыв отклика. Команда очищает только даты follow-up у
+  вакансии и эффективного отклика, сохраняет их статусы/этапы и lifecycle,
+  пишет `user_cancelled_followup_obligation` и завершает frozen item. Не
+  подменяйте этой командой свежий входящий ответ, видимую доставку или
+  терминальный исход; другой run/item или изменившийся scope должны остановить
+  операцию.
+
+- Если due item фактически уже разрешён старым `human_reply`, не меняйте его
+  исходный `event_at` и не создавайте дубликат взаимодействия. Свежо откройте
+  точный исходный диалог, убедитесь, что это по-прежнему последнее сообщение,
+  после него нет исходящих действий и терминального перехода, а frozen identity
+  scope и дата follow-up не менялись. Уже синхронизированный нетерминальный
+  status допустим только когда точный отклик и вакансия согласованы; frozen
+  status остаётся в audit history и не переписывается. Подготовьте манифест
+  `reverified_historical_inbound_v1` с immutable dedupe/event/evidence hash,
+  точными vacancy/application/scope, каналом, target, remote boundary и
+  обязательными true-флагами проверки, затем выполните:
+
+  ```bash
+  python3 scripts/jobctl.py resolve-due-followup-from-reverified-inbound \
+    --run-id <run_id> --item-key <due:item:key> \
+    --interaction-id <original_interaction_id> \
+    --observed-at <current_iso_timestamp> --channel <exact_channel> \
+    --conversation-target <exact_target> \
+    --remote-evidence-reference <exact_remote_reference> \
+    --manifest tmp/reverified-inbound.json \
+    --defer-render --run-lease <token> --json
+  ```
+
+  Только эта команда пишет
+  `reverified_historical_inbound_due_resolution`. Она сохраняет исходное
+  взаимодействие, status/stage и lifecycle, строго отлична от
+  `user_cancelled_followup_obligation` и идемпотентна только для точного повтора.
+
+После последнего исходящего действия снова выполните `daily-run-status`. Если
+он возвращает `reconcile_inbound_after_outbound`, повторно проверьте все
+настроенные входящие источники и завершите только `inbound_reconciliation`
+новым манифестом. Его `observed_at` должен быть строго позже последнего
+`attempted`/`visibly_confirmed`. Не повторяйте отправку, не переоткрывайте уже
+проверенные независимые источники и не используйте старый манифест.
 
 ## Reusable answers
 
@@ -316,6 +451,20 @@ complete vacancy text.
 `refresh-daily-run-plan --reason ...`; Engine сохранит прежние требования,
 добавит новые и инвалидирует зависимые завершения. Не используйте `skipped` для
 обхода включённого обязательного условия.
+
+Завершённые `user_cancelled_followup_obligation` и
+`reverified_historical_inbound_due_resolution` переживают обычный
+`refresh-daily-run-plan`: очищенная дата не должна превращать их обратно в
+обязательную незавершённую работу. Если та же точная дата была назначена снова,
+Engine обязан инвалидировать прежнее resolution и заблокировать финализацию.
+
+Проверьте `external_action_scope` в статусе. Текущие действия и прежние
+`attempted` остаются обязательными; исторические `drafted`/`authorized` видны в
+`legacy_backlog`, но не означают отправку и не запускаются повторно. Если старый
+active plan уже зафиксировал такие элементы как обязательные, не удаляйте их
+обычным refresh. Их перенос требует отдельного
+`--reclassify-legacy-external-actions` с точной причиной и последующей проверки
+аудит-перехода.
 
 Для каждого P2-потока выполните `next-hh-work` и убедитесь, что он предлагает
 финализацию, а не продолжение страницы, повторную проверку расхождения счётчика,

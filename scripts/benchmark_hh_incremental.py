@@ -361,16 +361,25 @@ def page_capture(
         item.adapter_card(page_index * page_size + offset + 1)
         for offset, item in enumerate(cards)
     ]
-    ids = sorted({f"hh:{int(item['vacancy_id'])}" for item in adapter_cards})
+    ordered_ids = [f"hh:{int(item['vacancy_id'])}" for item in adapter_cards]
+    ids = sorted(set(ordered_ids))
     digest = hh.payload_hash(ids)
     samples = [
         {
+            "sample_index": index,
+            "sampled_at": captured_at,
+            "relative_offset_ms": index * settings.search.hh_acquisition.page_stability_delay_ms,
+            "canonical_ordered_ids": ordered_ids,
+            "canonical_ordered_id_hash": hh.payload_hash(ordered_ids),
             "canonical_id_set_hash": digest,
+            "visible_card_count": len(ordered_ids),
             "scroll_height": 1_000 + page_index * 100,
+            "scroll_position": 1_000 + page_index * 100,
+            "maximum_observed_card_position": len(ordered_ids) or None,
             "loader_active": False,
             "mutation_count": 0,
         }
-        for _ in range(settings.search.hh_acquisition.page_stability_samples)
+        for index in range(settings.search.hh_acquisition.page_stability_samples + 1)
     ]
     has_next = page_index + 1 < page_count
     return {
@@ -415,8 +424,26 @@ def page_capture(
         "loader": {"active": False, "evidence": []},
         "blocker": {"type": "none", "evidence": []},
         "stability": {
+            "stability_method": "mutation_observer_visible_dom",
+            "mutation_observer_available": True,
+            "adapter_version": hh.ADAPTER_VERSION,
+            "results_root_selector": "main",
+            "required_stable_sample_count": settings.search.hh_acquisition.page_stability_samples,
+            "actual_sample_count": len(samples),
+            "sampling_interval_ms": settings.search.hh_acquisition.page_stability_delay_ms,
+            "timeout_ms": settings.search.hh_acquisition.page_stability_timeout_ms,
             "samples": samples,
+            "stable_window_sample_indexes": list(
+                range(settings.search.hh_acquisition.page_stability_samples)
+            ),
+            "final_verification": {
+                "performed": True,
+                "matched": True,
+                "sample_index": len(samples) - 1,
+                "observer_mutation_count": 0,
+            },
             "bottom_scroll_attempted": True,
+            "observer_mutation_evidence_available": True,
             "no_relevant_dom_mutation_after_bottom": True,
             "end_of_list_evidence": not has_next,
         },
@@ -710,19 +737,60 @@ def adversarial_benchmark(parent: Path, page_size: int) -> dict[str, Any]:
             stream_key=streams[1],
             payload=drift_second,
         )
+        drift_third = page_capture(
+            settings=settings,
+            stream_key=streams[1],
+            cards=conflicting_cards,
+            page_index=0,
+            page_count=4,
+            page_size=page_size,
+            captured_at="2026-08-19T14:03:00Z",
+            source_reported_count=page_size,
+        )
+        converged_result = hh.record_page_capture(
+            conn,
+            settings,
+            run_id=run_id,
+            stream_key=streams[1],
+            payload=drift_third,
+        )
         conn.commit()
         if reorder_result["effective_mode"] != "full":
             raise RuntimeError("Ordering anomaly failed to force full fallback.")
-        if drift_result["stream_state"] != "blocked":
-            raise RuntimeError("Conflicting count-drift recapture failed to block.")
+        if not (
+            drift_result["stream_state"] == "checkpointed"
+            and drift_result["next_safe_action"].get("action")
+            == "verify_count_drift"
+        ):
+            raise RuntimeError(
+                "Conflicting count-drift recapture failed to remain checkpointed."
+            )
+        if not (
+            converged_result["verified"]
+            and converged_result["stream_state"] == "checkpointed"
+            and converged_result["next_safe_action"].get("action")
+            == "continue_from_page"
+        ):
+            raise RuntimeError(
+                "Independent matching count-drift recapture failed to converge: "
+                f"verified={converged_result['verified']}, "
+                f"state={converged_result['stream_state']}, "
+                f"next={converged_result['next_safe_action'].get('action', '')}."
+            )
         return {
             "reordered_source": {
                 "safe_result": "full_fallback",
                 "effective_mode": reorder_result["effective_mode"],
             },
             "changing_recapture": {
-                "safe_result": "blocked",
-                "blocker_code": drift_result["next_safe_action"].get("code", ""),
+                "safe_result": "checkpointed_until_independent_match",
+                "intermediate_action": drift_result["next_safe_action"].get(
+                    "action", ""
+                ),
+                "final_state": converged_result["stream_state"],
+                "final_action": converged_result["next_safe_action"].get(
+                    "action", ""
+                ),
             },
         }
 

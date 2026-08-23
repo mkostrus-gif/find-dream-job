@@ -179,10 +179,14 @@ Use [`prompts/daily_run.md`](../prompts/daily_run.md) as the canonical order:
    before any attempt—score and `auto_apply` are not authorization;
 10. append attempted/blocked/failed evidence and verify visible success before
     adding `visibly_confirmed`;
-11. сохранять каждую проверенную частичную единицу через
+11. после последнего `attempted`/`visibly_confirmed` проверить статус и, если
+    указано `reconcile_inbound_after_outbound`, повторно сверить только входящие
+    источники новым доказательством с более поздним `observed_at`; исходящее
+    действие не повторять;
+12. сохранять каждую проверенную частичную единицу через
     `checkpoint-daily-run-work`; при внешней блокировке чисто приостановить
     запуск;
-12. выполнить все включённые проверки источников с отказом при неполноте и теми
+13. выполнить все включённые проверки источников с отказом при неполноте и теми
     же флагами отложенного `render`, один раз вызвать
     `finalize-daily-run --run-lease <token>`, проверить точный запуск через
     `operational-doctor --run-id <run_id>` и подготовить отчёт.
@@ -202,6 +206,13 @@ Use [`prompts/daily_run.md`](../prompts/daily_run.md) as the canonical order:
 и не повторяет завершённую работу. Если изменился отпечаток конфигурации, только
 `refresh-daily-run-plan --reason ...` может создать новую аудируемую ревизию
 плана; молчаливое сокращение объёма запрещено.
+
+План сохраняет `external_action_id_floor`, поэтому новая запись текущего запуска
+и прежний неопределённый `attempted` требуют сверки, а старые
+`drafted`/`authorized` остаются видимым `legacy_backlog`. Обычный refresh не
+удаляет уже замороженное требование. Для миграции такого active plan используйте
+только явный `--reclassify-legacy-external-actions --reason ...`; это создаёт
+манифест и переход, не меняет append-only журнал и не подтверждает доставку.
 
 ### HH P2: рабочий сбор и безопасное продолжение
 
@@ -228,6 +239,57 @@ python3 scripts/jobctl.py record-hh-page \
 python3 scripts/jobctl.py next-hh-work \
   --run-id <run_id> --stream-key <stream_key> --json
 ```
+
+`hh-browser-adapter --json` возвращает контракт
+`returned_adapter_object_v1`. Выполните проверенный файл как выражение в
+авторизованном встроенном браузере, сохраните возвращённый объект локально и
+вызывайте `adapter.captureListPage(...)`,
+`adapter.capturePersonalRecommendations(...)` или
+`adapter.captureVacancyDetail()`. Адаптер не устанавливается в `globalThis`.
+Передавайте `page_stability_samples`, `page_stability_delay_ms` и
+`page_stability_timeout_ms`. Он предпочитает
+`mutation_observer_visible_dom`, а при отсутствующем или непригодном
+`MutationObserver` использует `timed_visible_dom_sampling`. Таймерный путь не
+выдумывает observer-evidence; оба пути требуют непрерывного стабильного окна и
+отдельного совпавшего финального снимка.
+
+Если `plan-hh-acquisition` сообщает, что прежние параметры уже начатого сбора
+не совпадают, сначала отличите пустой замороженный план от реально начатого
+источника. Для обычного потока переоткройте точный элемент
+`hh_coverage/<item_key>` через `invalidate-daily-run-work --reason ...`; для
+персональных рекомендаций переоткройте весь шаг `personal_recommendations`.
+Только если состояние всё ещё `planned`, `next_page = 0`,
+`last_verified_page = -1` и нет ни снимка, карточки, детали, текущей контрольной
+точки, завершающего манифеста или иного прогресса, выполните:
+
+```bash
+python3 scripts/jobctl.py invalidate-hh-zero-evidence-plan \
+  --run-id <run_id> --stream-key <stream_key> \
+  --reason "явное перепланирование после обновления DOM-адаптера" \
+  --defer-render --run-lease <token> --json
+python3 scripts/jobctl.py plan-hh-acquisition \
+  --run-id <run_id> --stream-key <stream_key> \
+  --source-kind ordinary_search --query-json tmp/<stream>-query.json \
+  --defer-render --run-lease <token> --json
+```
+
+Для `personal_recommendations` замените только `--source-kind`, сохранив тот же
+query fingerprint. Первая команда append-only фиксирует `run_id`,
+`stream_key`, прежнюю версию адаптера, прежний отпечаток конфигурации, причину и
+время оператора, а также подтверждение, что доказательства источника не
+отбрасывались. Audit-only blocker/reopen/invalidation манифесты и переходы P1
+остаются append-only; новое событие ссылается на их хеши и ID. Они не считаются
+доказательством HH, пока не содержат снимок, карточку, деталь, сессию, границу,
+контрольную точку, завершение или счётчик. Неизвестный либо source-bearing
+формат блокирует recovery. Для пустого плана `hh-dom-v1.0.1` audit-only blocker
+должен точно подтверждать отсутствующий или непригодный `MutationObserver`;
+иной blocker не разрешает recovery на v1.0.2. Команда удаляет только пустую
+текущую строку плана и
+никогда не изменяет успешную историческую `hh_stream_checkpoints`. Повтор
+команды идемпотентен. Любое обнаруженное доказательство означает отказ: не
+удаляйте его и расследуйте точное состояние потока. После нового плана проверьте события
+`zero_evidence_plan_invalidated` и `zero_evidence_plan_replanned` через
+`inspect-hh-checkpoint`, затем продолжайте обычным `record-hh-page`.
 
 Не используйте точное число карточек как единственное доказательство. Адаптер
 должен вернуть одинаковые снимки набора канонических ID, стабильную высоту или
@@ -262,6 +324,56 @@ python3 scripts/jobctl.py next-hh-work \
 идентификаторы аккаунта. Не удаляйте доказательства незавершённого запуска или
 неудачного аудита; старые завершённые артефакты архивируйте только по явно
 заданной локальной политике хранения.
+
+### Явная отмена frozen follow-up
+
+Если пользователь отменяет одно точное наступившее повторное обращение без
+отзыва отклика, найдите `due_followups/<item_key>` в
+`daily-run-status --verbose` и выполните:
+
+```bash
+python3 scripts/jobctl.py cancel-due-followup-obligation \
+  --run-id <run_id> --item-key <due:item:key> \
+  --reason "<точная причина пользователя>" \
+  --defer-render --run-lease <token> --json
+```
+
+Команда сверяет точный frozen scope, очищает только даты follow-up вакансии и
+эффективного отклика, сохраняет их status/stage и `lifecycle_events`, затем
+пишет append-only `user_cancelled_followup_obligation` и завершает item. Она не
+создаёт отказ, отзыв, входящий ответ или доказательство доставки. Точный повтор
+идемпотентен; другой run/item, пустая причина, новая эффективная запись отклика
+или другая текущая дата приводят к отказу. Обычный `refresh-daily-run-plan`
+сохраняет это завершение. Повторное появление той же даты инвалидирует его и
+блокирует `finalize-daily-run` до нового разрешения.
+
+### Повторная проверка старого human inbound
+
+Если frozen follow-up уже разрешён старым `human_reply`, чья правдивая дата
+предшествует запуску, не используйте пользовательскую отмену и не переписывайте
+время взаимодействия. Свежо откройте точный исходный диалог и подготовьте
+`reverified_historical_inbound_v1`, включив immutable dedupe/event/evidence
+hash, точный vacancy/application/follow-up scope, канал, target, remote boundary
+и обязательные true-флаги проверки. Затем выполните:
+
+```bash
+python3 scripts/jobctl.py resolve-due-followup-from-reverified-inbound \
+  --run-id <run_id> --item-key <due:item:key> \
+  --interaction-id <original_interaction_id> \
+  --observed-at <current_iso_timestamp> --channel <exact_channel> \
+  --conversation-target <exact_target> \
+  --remote-evidence-reference <exact_remote_reference> \
+  --manifest tmp/reverified-inbound.json \
+  --defer-render --run-lease <token> --json
+```
+
+Команда принимает только исходный effective `human_reply`, который остаётся
+последним взаимодействием и после которого нет исходящего действия,
+терминального перехода или повторно установленной due date. Она добавляет
+`reverified_historical_inbound_due_resolution`, не создаёт новый inbound, не
+меняет исходный `event_at`, status/stage или lifecycle и не смешивается с
+`user_cancelled_followup_obligation`. Точный повтор идемпотентен; изменение
+run/item/scope/hash/канала/target/remote boundary блокируется.
 
 Use [`prompts/scan_channel.md`](../prompts/scan_channel.md) when the task is
 limited to one company or source. Use
@@ -349,6 +461,11 @@ python3 scripts/jobctl.py check-telegram-coverage \
 The cursor is stored in `source_checkpoints` only after the whole manifest
 passes. Inspect `reports/source_checkpoints.md` when resuming; an incomplete
 attempt in `search_runs` is evidence of a blocker, not permission to skip it.
+Контракт `telegram_source_units_v1` считает граничную `out_of_scope` публикацию
+в `raw` и `processed`, но не в `found`; повторы наблюдений страниц добавляются
+только в `raw`, а неверная запись не считается обработанной. Не подгоняйте
+счётчики вручную: для успешного канала должны выполняться
+`raw >= processed >= reconciled` и проверенная граница.
 
 ### Reconcile downstream outcomes
 

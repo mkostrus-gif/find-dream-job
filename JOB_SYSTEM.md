@@ -294,6 +294,31 @@ SQLite alias/source hit, or missing 0–100 score. Incomplete attempts are kept 
 the entire Telegram manifest succeeds. This is read-only discovery authority;
 it never authorizes joining, messaging, applying, or another external action.
 
+### Контракт счётчиков Telegram
+
+Нормализованный поток использует явный контракт `telegram_source_units_v1`:
+
+- `raw` — число фактически заявленных исходных единиц: одна единица на каждую
+  запись `posts`, плюс повторные или не сопоставленные наблюдения ID на
+  загруженных страницах, плюс отдельная единица на каждую вакансию сверх первой
+  в публикации с несколькими вакансиями;
+- `processed` — число успешно нормализованных исходных единиц: одна для
+  классифицированной публикации без вакансий либо одна на каждую извлечённую
+  вакансию в публикации с вакансиями;
+- `unique` — число различных канонических вакансий SQLite, к которым разрешены
+  проверенные внешние ID этого канала;
+- `reconciled` — число проверенных внешних ID вакансий с точным URL публикации,
+  оценкой 0–100, попаданием нужного `source_stream` и каноническим `vacancy_id`.
+
+Граничная публикация `delta` с классификацией `out_of_scope` входит в `raw` и,
+если она нормализована, в `processed`, но не входит в `found`, `unique` или
+`reconciled`. Повтор одного ID на разных загруженных страницах остаётся отдельным
+наблюдением в `raw`, а его единственная запись `posts` обрабатывается один раз.
+Неверная или дублированная запись остаётся в `raw`, не попадает в `processed` и
+блокирует весь манифест. Значения не зажимаются и не пересчитываются задним
+числом: успешный поток обязан доказать `raw >= processed >= reconciled`, а курсор
+двигается только после успеха всех каналов.
+
 ## Search coverage contract
 
 Prepare a private plan whose stream keys match local
@@ -319,10 +344,28 @@ known/new totals. Its durable read model is `reports/search_coverage.md`.
 ### Безопасное инкрементальное получение HH (P2)
 
 Стандартный путь схемы v10 использует проверяемый DOM-адаптер только для чтения
-`scripts/hh_browser_adapter.js` версии `hh-dom-v1.0.0` и манифест покрытия v2.
+`scripts/hh_browser_adapter.js` версии `hh-dom-v1.0.2` и манифест покрытия v2.
 Старые манифесты v1 остаются валидными для обратной совместимости, но новый
 запуск должен записывать каждую страницу через P2, чтобы классификация ID и
 контрольная точка P1 создавались одной транзакцией.
+
+Если видимый semantic title рекламной карточки ведёт через точный
+`https://adsrv.hh.ru/click?...&clickType=link_to_vacancy`, адаптер разрешает
+identity только по единственному числовому `vacancyId` из видимого
+same-origin response URL внутри той же карточки. Ноль ID, несколько разных ID,
+другой redirect host/path или конфликт с `data-vacancy-id` блокируют снимок.
+Ограниченный read-only evaluator может не предоставлять `TextEncoder`, typed
+arrays и WebCrypto. Тогда адаптер кодирует строки в UTF-8 и вычисляет SHA-256
+локальными побитовыми операциями. Synthetic tests побайтно сверяют результат с
+`crypto.subtle.digest`; алгоритм и формат хешей не меняются.
+
+При count drift повторный `timed_visible_dom_sampling` считается стабильным по
+своему контракту: observer-поля должны быть `false`/`null`, а samples, финальная
+проверка, navigation, ordering, session и ID обязаны совпасть. Для persisted
+pre-fix истории разрешён только непрерывный хвост требуемого числа полностью
+эквивалентных снимков. Одиночный различающийся повтор сохраняется как
+непроверенный audit conflict и требует ещё один независимый снимок; поток
+продолжается только после непрерывного хвоста полностью эквивалентных снимков.
 
 ```bash
 python3 scripts/jobctl.py hh-browser-adapter --json
@@ -348,6 +391,89 @@ python3 scripts/jobctl.py next-hh-work \
 запуска требуют точные `run_id`, `lease`, `--defer-render` и блокировку записи
 P0; одинаковый хеш снимка обрабатывается идемпотентно.
 
+Если открытие точного `/vacancy/<id>` приводит к видимому HTTPS lead-gen URL
+`*.hh.ru/article/<id>` или `*.hh.ru/vrsurvey/<slug>` с единственным тем же
+`utm_redirect_vacancy_id`, адаптер
+возвращает терминальное `availability=unavailable`. Такой снимок закрывает
+только точный элемент detail-очереди, не создаёт title/company из статьи и не
+повышает list-evidence до detail; другой host, ID, path или неоднозначный query
+остаётся fail-closed.
+
+Если незавершённый поток был только запланирован старой версией адаптера или
+конфигурации, обычная инвалидация элемента P1 не меняет замороженный план P2.
+Для такого случая существует отдельный двухшаговый recovery. Сначала при
+необходимости переоткройте точную единицу P1, затем явно инвалидируйте только
+пустой план и повторите обычное планирование с тем же видом источника и тем же
+отпечатком запроса:
+
+```bash
+# Обычный поток: <item_key> возьмите из p1.item_key или daily-run-status --verbose.
+python3 scripts/jobctl.py invalidate-daily-run-work \
+  --run-id <run_id> --step-key hh_coverage --item-key <item_key> \
+  --reason "план HH заморожен на прежней версии адаптера" \
+  --defer-render --run-lease <token> --json
+
+# Для personal_recommendations вместо предыдущей команды:
+python3 scripts/jobctl.py invalidate-daily-run-work \
+  --run-id <run_id> --step-key personal_recommendations \
+  --reason "план рекомендаций заморожен на прежней версии адаптера" \
+  --defer-render --run-lease <token> --json
+
+python3 scripts/jobctl.py invalidate-hh-zero-evidence-plan \
+  --run-id <run_id> --stream-key <stream_key> \
+  --reason "явное перепланирование после обновления DOM-адаптера" \
+  --defer-render --run-lease <token> --json
+
+python3 scripts/jobctl.py plan-hh-acquisition \
+  --run-id <run_id> --stream-key <stream_key> \
+  --source-kind ordinary_search \
+  --query-json tmp/<stream>-query.json \
+  --defer-render --run-lease <token> --json
+```
+
+Для персональных рекомендаций в последней команде используйте
+`--source-kind personal_recommendations`.
+
+`invalidate-hh-zero-evidence-plan` проходит только для состояния `planned` с
+`next_page = 0`, `last_verified_page = -1`, пустым завершающим манифестом и
+нулём записей в `hh_page_captures`, `hh_page_items`, `hh_detail_queue`, текущей
+истории контрольных точек и source-bearing событиях P1. Здесь действует явная
+таксономия доказательств: созданные P1 записи `planned`/`started`, audit-only
+манифест блокировки, а также последующие `reopened`/`invalidated` и их
+инвалидационные манифесты сохраняются, но сами по себе не считаются
+доказательством источника. Неизвестный формат или любой манифест/переход со
+счётчиком, снимком, карточкой, деталью, сессией, границей, контрольной точкой или
+завершением считается source-bearing и останавливает recovery.
+
+Для замороженного плана `hh-dom-v1.0.1` recovery дополнительно требует, чтобы
+последний существенный runtime blocker однозначно относился к недоступному
+`MutationObserver`; посторонняя причина не может быть использована для
+перепланирования на `hh-dom-v1.0.2`. Более ранний blocker прежней версии
+адаптера остаётся в superseded audit history и не подменяет более позднюю
+причину. Известные audit-only ошибки самого zero-evidence recovery также
+сохраняются отдельно как bookkeeping и не превращаются в доказательство
+источника.
+
+У отдельного шага personal recommendations `captured_scope` старого audit-only
+blocker/invalidation может не содержать только новые аддитивные поля вложенного
+`hh_acquisition`. Идентичность шага, stream key и все ранее зафиксированные
+значения обязаны совпасть. Изменение значения, удаление старого поля, иной набор
+верхнеуровневых ключей или любой source-bearing payload по-прежнему запрещают
+recovery.
+
+Команда сохраняет append-only событие с прежними версией адаптера и отпечатком
+конфигурации, причиной оператора и временем. Оно содержит хеши superseded
+audit-only blocker-манифестов и ID связанных переходов, а также явное
+`no_source_evidence_discarded = true`. Исторические P1-манифесты и переходы не
+удаляются и не переписываются; удаляется только пустая текущая строка плана P2.
+Успешная историческая `hh_stream_checkpoints` не удаляется и не инвалидируется.
+Повтор команды идемпотентен; новый вызов
+`plan-hh-acquisition` разрешён только для прежних `source_kind` и
+`query_fingerprint` и записывает отдельное событие перепланирования. Схема
+SQLite остаётся v10. Полную пару событий
+`zero_evidence_plan_invalidated` / `zero_evidence_plan_replanned` показывает
+`inspect-hh-checkpoint`.
+
 Адаптер читает только видимый DOM уже разрешённой сессии встроенного браузера Codex.
 Он поддерживает обычную выдачу, личные рекомендации и страницу вакансии,
 сначала использует `data-qa`, `data-vacancy-id`, `rel=next/prev` и точные
@@ -358,15 +484,39 @@ URL вакансий, а затем документированные резе�
 сохраняются как блокировка; автоматического перехода в Chrome, Playwright,
 сбор через HTTP, скрытый API или другую сессию нет.
 
-Одна стабильная страница требует настроенное число одинаковых снимков набора
-канонических ID, стабильную высоту либо явный конец списка, отсутствие индикатора
-загрузки, отсутствие релевантной мутации DOM после дополнительной прокрутки вниз и
-согласованную навигацию. Несовпадение стабильного числа уникальных ID с числом
+Одна стабильная страница требует настроенное число одинаковых снимков
+упорядоченной последовательности канонических ID, числа видимых карточек и
+высоты, отсутствие индикатора загрузки, отдельную финальную проверку после
+новой задержки и согласованную навигацию. При доступном настоящем
+`MutationObserver` применяется `mutation_observer_visible_dom` и дополнительно
+требуется отсутствие релевантной мутации после финальной прокрутки. Если
+observer нельзя создать или запустить, адаптер честно фиксирует
+`timed_visible_dom_sampling`, `mutation_observer_available = false` и не
+создаёт observer evidence. Каждый sample содержит ordered/set hashes, число
+карточек, высоту, текущую позицию, максимальную позицию карточки, loader-state
+и время; evidence также включает требуемое окно, интервал и общий timeout.
+Несовпадение стабильного числа уникальных ID с числом
 источника не принимается по остановившейся загрузке: требуются две независимые
 стабильные записи с одинаковыми хешами ID, порядком, навигацией и доказательством
 сессии. Все стабильные ID сохраняются без обрезания, а
-`source_reported_count_drift` остаётся в истории. Различающиеся повторные
-записи блокируют поток.
+`source_reported_count_drift` остаётся в истории. Различающаяся повторная
+запись не создаёт успех, но остаётся checkpointed и требует следующий снимок;
+только непрерывный хвост требуемой длины разрешает страницу. Если живая выдача
+не сходится, поток остаётся незавершённым без ложной границы.
+
+Когда rolling-окно источника сокращается и HH зажимает запрошенный индекс к
+новой последней странице, видимый `pager-previous` может относиться уже к
+зажатой странице. Адаптер предпочитает ему только единственную видимую числовую
+ссылку на точный ожидаемый предыдущий индекс. Конфликтующие или неоднозначные
+URL не принимаются; пустая терминальная страница всё равно проходит обычный
+двойной count-drift recapture перед доказательством исчерпания.
+
+`hh-browser-adapter --json` возвращает контракт
+`returned_adapter_object_v1`. Точный исходник выполняется как одно выражение,
+а возвращённый adapter object сохраняется локально evaluator и вызывается
+через `captureListPage`, `capturePersonalRecommendations` или
+`captureVacancyDetail`. Запись в `window`/`globalThis`, surrogate global,
+`requestAnimationFrame`, `ResizeObserver` и Chrome для обычного пути не нужны.
 
 План строится отдельно для каждого `search.required_streams` и выбирает
 `full`, `shadow`, `delta`, `resume` или `audit`. `delta` разрешён только для
@@ -625,7 +775,9 @@ complete-daily-run-work --manifest FILE
 block-daily-run-work --code CODE --reason TEXT --retryable|--not-retryable
 mark-daily-run-work-uncertain --reason TEXT
 invalidate-daily-run-work --reason TEXT
-refresh-daily-run-plan --reason TEXT
+cancel-due-followup-obligation --run-id ID --item-key KEY --reason TEXT
+resolve-due-followup-from-reverified-inbound --run-id ID --item-key KEY --interaction-id ID --manifest FILE
+refresh-daily-run-plan --reason TEXT [--reclassify-legacy-external-actions]
 pause-daily-run --reason TEXT
 finalize-daily-run
 ```
@@ -662,10 +814,105 @@ SHA-256. Engine проверяет контракт, но не утвержда�
 переходит в `needs_verification`; безопасное продолжение по умолчанию — сверка,
 а не повторная отправка.
 
+При создании плана Engine сохраняет контракт
+`daily_run_external_action_scope_v1` и точный `external_action_id_floor` —
+максимальный ID append-only журнала на этот момент. Обязательными становятся:
+
+- нетерминальное действие, для ключа которого после границы добавлена новая
+  запись или чья запись явно помечена точным `daily_run_id`;
+- любое более раннее действие, чьё последнее состояние — `attempted`, потому
+  что его внешнее состояние действительно остаётся неопределённым.
+
+Более ранние `drafted` и `authorized` показываются в
+`daily-run-status.external_action_scope.legacy_backlog`, но не блокируют каждый
+новый запуск. Здесь нет произвольного временного окна. Журнал не удаляется и не
+переписывается, доставка не выводится из разрешения, старое действие не
+повторяется. Если такой элемент уже был обязательным в зафиксированном активном
+плане, обычный refresh сохраняет его. Только отдельная команда с точной причиной
+может аудируемо перевести доказанный legacy-элемент в необязательный backlog:
+
+```bash
+python3 scripts/jobctl.py refresh-daily-run-plan \
+  --run-id <run_id> --reason "<точная причина миграции>" \
+  --reclassify-legacy-external-actions \
+  --defer-render --run-lease <token> --json
+```
+
+Команда добавляет программный манифест и переход плана, но не меняет ни одной
+строки `external_actions`. Новое событие того же ключа после границы снова
+делает элемент обязательным.
+
+Пользователь может отдельно отменить точную frozen-обязанность наступившего
+повторного обращения, не отзывая отклик и не меняя его исход:
+
+```bash
+python3 scripts/jobctl.py cancel-due-followup-obligation \
+  --run-id <run_id> --item-key <due:item:key> \
+  --reason "пользователь явно отменил это повторное обращение" \
+  --defer-render --run-lease <token> --json
+```
+
+Команда требует точные `run_id`, `item_key` и непустую причину, сверяет frozen
+scope с текущей эффективной записью отклика и очищает только
+`vacancies.follow_up_date` и `applications.follow_up_date`. Статусы и этапы
+вакансии/отклика, `lifecycle_events`, входящие взаимодействия и доказательства
+внешних действий не меняются. В `daily_run_transitions` и программном
+манифесте сохраняется append-only resolution
+`user_cancelled_followup_obligation` с явными признаками, что доставка,
+входящий ответ, отказ и отзыв не выводились. Точный повтор с той же причиной
+идемпотентен; другой запуск, item, причина или изменившийся scope отклоняются.
+
+Если обязанность фактически разрешена старым человеческим входящим, чья
+правдивая дата предшествует запуску, пользовательская отмена не применяется.
+После свежего открытия точного исходного диалога подготовьте манифест
+`reverified_historical_inbound_v1` и выполните отдельную команду:
+
+```bash
+python3 scripts/jobctl.py resolve-due-followup-from-reverified-inbound \
+  --run-id <run_id> --item-key <due:item:key> \
+  --interaction-id <original_interaction_id> \
+  --observed-at <current_iso_timestamp> --channel <exact_channel> \
+  --conversation-target <exact_target> \
+  --remote-evidence-reference <exact_remote_reference> \
+  --manifest tmp/reverified-inbound.json \
+  --defer-render --run-lease <token> --json
+```
+
+Манифест повторяет immutable `dedupe_key`, исходный `event_at`, вычисленный
+evidence hash, точные vacancy/application/follow-up scope и удалённую границу;
+поля `remote_boundary_verified`, `latest_message_matches_interaction`,
+`no_new_outbound_after_inbound` и
+`original_interaction_timestamp_preserved` должны быть `true`. Engine
+отклоняет automated/outbound/ineffective interaction, другой канал или target,
+не свежую проверку, более позднее взаимодействие или исходящее действие,
+терминальный переход, повторно установленную дату и изменившийся identity
+scope. Если доказательная inbound-сверка уже синхронно изменила нетерминальный
+status точного отклика и вакансии, frozen status остаётся в audit scope, а
+текущий согласованный status сохраняется без переписывания.
+Успех добавляет `reverified_historical_inbound_due_resolution`, но не создаёт
+новый inbound и не меняет исходный `event_at`, status, stage или lifecycle.
+Точный повтор идемпотентен; изменение любого существенного поля блокируется.
+
+`refresh-daily-run-plan` сохраняет завершённое таким resolution требование,
+даже когда очищенная дата уменьшила текущую авторитетную очередь. Если та же
+точная дата снова появляется, динамический refresh инвалидирует прежнее
+завершение, а `finalize-daily-run` отказывает до нового доказательного решения.
+
+Если после завершённой сверки входящих записано `attempted` или
+`visibly_confirmed`, старая контрольная точка входящих аудируемо переходит в
+`invalidated`. `daily-run-status` показывает безопасное действие
+`reconcile_inbound_after_outbound`. Для повторного завершения нужен новый
+манифест `inbound_reconciliation` с `observed_at`, строго более поздним, чем
+последнее внешнее действие, расширившее границу свежести. Повторяется только
+сверка входящих: независимые завершённые источники сохраняются, а исходящее
+действие не запускается повторно.
+
 `finalize-daily-run` заново перечисляет всю обязательную очередь наступивших
 повторных обращений без ограничения WIP и квоты сообщений, сверяет
-нетерминальные внешние действия, покрытие источников, дополнительные условия,
-отпечаток конфигурации, `PRAGMA quick_check` и внешние ключи. Только после этого
+каждое завершённое resolution повторного обращения (включая точную
+пользовательскую отмену), нетерминальные внешние действия, покрытие источников,
+дополнительные условия, отпечаток конфигурации, `PRAGMA quick_check` и внешние
+ключи. Только после этого
 запуск входит в `finalizing`, публикует одно поколение P0 и становится
 `completed`. Если обязательные входные данные изменились во время прерванной
 финализации, код с записью в журнал возвращает запуск в `running`, `blocked` или
