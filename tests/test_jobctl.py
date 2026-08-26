@@ -63,7 +63,7 @@ class JobctlIntegrationTests(unittest.TestCase):
         self.assertFalse(doctor["archive_processed_linkedin"])
 
         with sqlite3.connect(self.workspace / "data" / "job_search.sqlite") as conn:
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 10)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 11)
             self.assertEqual(conn.execute("PRAGMA quick_check").fetchone()[0], "ok")
 
     def test_ingest_update_and_inline_json_escaping(self) -> None:

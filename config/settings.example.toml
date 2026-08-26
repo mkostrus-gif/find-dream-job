@@ -87,6 +87,11 @@ personal_minimum_stable_pages = 2
 personal_consecutive_known_pages = 2
 personal_max_pages = 10
 personal_max_is_completion_boundary = false
+# Narrow recovery for a repeatedly unavailable exact terminal page. Disabled
+# unless an operator explicitly opts in for a frozen daily-run plan.
+transient_error_tail_enabled = false
+transient_error_min_attempts = 5
+transient_error_max_tail_pages = 1
 
 [daily_run]
 # Приватная рабочая область может добавить непрозрачные обязательные условия без

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Safe, deterministic HeadHunter DOM acquisition for schema v10.
+"""Safe, deterministic HeadHunter DOM acquisition for schema v11.
 
 The module is deliberately browser-neutral and standard-library-only.  It
 accepts bounded evidence produced by the checked-in read-only DOM adapter,
@@ -25,7 +25,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from jobsearch_config import Settings
 
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 CAPTURE_CONTRACT_VERSION = 1
 MANIFEST_VERSION = 2
 ADAPTER_VERSION = "hh-dom-v1.0.2"
@@ -35,6 +35,8 @@ SOURCE_KINDS = {"ordinary_search", "personal_recommendations"}
 ACQUISITION_MODES = {"full", "shadow", "delta", "resume", "audit"}
 SESSION_STATES = {"exposed", "not_exposed"}
 BLOCKER_TYPES = {"none", "login", "captcha", "access_denied", "error", "loading_timeout"}
+TRANSIENT_TAIL_ERROR_CLASS = "hh_http_502"
+TRANSIENT_TAIL_STRATEGIES = {"accepted_unavailable_tail", "full_session_rollover"}
 HEX_64_RE = re.compile(r"^[0-9a-f]{64}$")
 VACANCY_ID_RE = re.compile(r"^[0-9]{1,32}$")
 FORBIDDEN_CAPTURE_KEYS = {
@@ -584,6 +586,973 @@ def schema_v10_issues(conn: sqlite3.Connection) -> list[str]:
         if missing:
             issues.append(f"{table}: отсутствуют столбцы {', '.join(missing)}")
     return issues
+
+
+def ensure_v11_schema(conn: sqlite3.Connection) -> None:
+    """Add append-only evidence for narrowly bounded transient HH recovery."""
+
+    ensure_v10_schema(conn)
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS hh_capture_audit_decisions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            capture_id INTEGER NOT NULL,
+            run_id TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'hh',
+            stream_key TEXT NOT NULL,
+            decision TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            resolution_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(capture_id) REFERENCES hh_page_captures(id) ON DELETE CASCADE,
+            UNIQUE(capture_id, decision, resolution_hash),
+            CHECK(decision = 'audit_only')
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_hh_capture_audit_decisions_lookup
+            ON hh_capture_audit_decisions(run_id, stream_key, capture_id);
+
+        CREATE TABLE IF NOT EXISTS hh_transient_error_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'hh',
+            stream_key TEXT NOT NULL,
+            source_kind TEXT NOT NULL,
+            page_index INTEGER NOT NULL,
+            query_fingerprint TEXT NOT NULL,
+            configuration_fingerprint TEXT NOT NULL,
+            error_class TEXT NOT NULL,
+            visible_status_code INTEGER NOT NULL,
+            visible_message_hash TEXT NOT NULL,
+            observed_at TEXT NOT NULL,
+            remote_evidence_reference TEXT NOT NULL,
+            attempt_hash TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(run_id, source, stream_key)
+                REFERENCES hh_stream_runs(run_id, source, stream_key) ON DELETE CASCADE,
+            UNIQUE(run_id, source, stream_key, page_index, observed_at, remote_evidence_reference),
+            CHECK(error_class = 'hh_http_502'),
+            CHECK(visible_status_code = 502)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_hh_transient_error_attempts_lookup
+            ON hh_transient_error_attempts(run_id, stream_key, page_index, observed_at);
+
+        CREATE TABLE IF NOT EXISTS hh_stream_recovery_resolutions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'hh',
+            stream_key TEXT NOT NULL,
+            strategy TEXT NOT NULL,
+            last_verified_page INTEGER NOT NULL,
+            missing_tail_json TEXT NOT NULL,
+            retry_count INTEGER NOT NULL,
+            error_class TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            details_json TEXT NOT NULL,
+            resolution_hash TEXT NOT NULL UNIQUE,
+            resolved_at TEXT NOT NULL,
+            FOREIGN KEY(run_id, source, stream_key)
+                REFERENCES hh_stream_runs(run_id, source, stream_key) ON DELETE CASCADE,
+            UNIQUE(run_id, source, stream_key),
+            CHECK(strategy IN ('accepted_unavailable_tail','full_session_rollover'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_hh_stream_recovery_resolutions_lookup
+            ON hh_stream_recovery_resolutions(run_id, stream_key, resolved_at);
+
+        CREATE TABLE IF NOT EXISTS hh_session_rollover_pages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'hh',
+            stream_key TEXT NOT NULL,
+            candidate_session_fingerprint TEXT NOT NULL,
+            page_index INTEGER NOT NULL,
+            capture_hash TEXT NOT NULL UNIQUE,
+            captured_at TEXT NOT NULL,
+            normalized_capture_json TEXT NOT NULL,
+            artifact_path TEXT NOT NULL,
+            artifact_sha256 TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(run_id, source, stream_key)
+                REFERENCES hh_stream_runs(run_id, source, stream_key) ON DELETE CASCADE,
+            UNIQUE(run_id, source, stream_key, candidate_session_fingerprint, page_index)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_hh_session_rollover_pages_lookup
+            ON hh_session_rollover_pages(run_id, stream_key, candidate_session_fingerprint, page_index);
+        """
+    )
+
+
+def schema_v11_issues(conn: sqlite3.Connection) -> list[str]:
+    issues = schema_v10_issues(conn)
+    required = {
+        "hh_capture_audit_decisions": {"capture_id", "decision", "resolution_hash"},
+        "hh_transient_error_attempts": {"page_index", "error_class", "attempt_hash"},
+        "hh_stream_recovery_resolutions": {"strategy", "missing_tail_json", "resolution_hash"},
+        "hh_session_rollover_pages": {"candidate_session_fingerprint", "page_index", "capture_hash"},
+    }
+    for table, columns in required.items():
+        present = {
+            str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        missing = sorted(columns - present)
+        if missing:
+            issues.append(f"{table}: отсутствуют столбцы {', '.join(missing)}")
+    return issues
+
+
+def _recovery_resolution(
+    conn: sqlite3.Connection, *, run_id: str, stream_key: str
+) -> dict[str, Any] | None:
+    row = conn.execute(
+        """
+        SELECT * FROM hh_stream_recovery_resolutions
+        WHERE run_id = ? AND source = 'hh' AND stream_key = ?
+        """,
+        (run_id, stream_key),
+    ).fetchone()
+    if row is None:
+        return None
+    details = json.loads(str(row["details_json"] or "{}"))
+    return {
+        "strategy": str(row["strategy"]),
+        "last_verified_page": int(row["last_verified_page"]),
+        "missing_tail_pages": json.loads(str(row["missing_tail_json"])),
+        "retry_count": int(row["retry_count"]),
+        "error_class": str(row["error_class"]),
+        "reason": str(row["reason"]),
+        "resolved_at": str(row["resolved_at"]),
+        "resolution_hash": str(row["resolution_hash"]),
+        **details,
+    }
+
+
+def record_transient_error_attempt(
+    conn: sqlite3.Connection,
+    settings: Settings,
+    *,
+    run_id: str,
+    stream_key: str,
+    page_index: int,
+    error_class: str,
+    visible_status_code: int,
+    visible_message: str,
+    observed_at: str,
+    remote_evidence_reference: str,
+) -> dict[str, Any]:
+    """Append one independently observed, browser-visible terminal 502."""
+
+    cfg = settings.search.hh_acquisition
+    if not cfg.transient_error_tail_enabled:
+        raise ValueError(
+            "Восстановление недоступного хвоста выключено конфигурацией."
+        )
+    stream = conn.execute(
+        """
+        SELECT * FROM hh_stream_runs
+        WHERE run_id = ? AND source = 'hh' AND stream_key = ?
+        """,
+        (run_id, stream_key),
+    ).fetchone()
+    if stream is None:
+        raise ValueError("Поток HH не найден.")
+    if str(stream["source_kind"]) != "personal_recommendations":
+        raise ValueError(
+            "Исключение недоступного хвоста разрешено только для отдельного потока персональных рекомендаций."
+        )
+    current_config = acquisition_configuration_fingerprint(
+        settings,
+        source_kind=str(stream["source_kind"]),
+        stream_key=stream_key,
+        query_fingerprint=str(stream["query_fingerprint"]),
+    )
+    if current_config != str(stream["configuration_fingerprint"]):
+        raise ValueError("Текущая acquisition-конфигурация не совпадает с зафиксированным потоком.")
+    if _recovery_resolution(conn, run_id=run_id, stream_key=stream_key):
+        raise ValueError("Восстановление потока уже разрешено; новые попытки запрещены.")
+    expected_page = int(stream["next_page"])
+    if page_index != expected_page:
+        raise ValueError(
+            f"Попытка должна относиться ровно к следующей странице {expected_page}; получена {page_index}."
+        )
+    error_class = _nonempty_string(error_class, "error_class", 64)
+    if error_class != TRANSIENT_TAIL_ERROR_CLASS:
+        raise ValueError(
+            "Поддерживается только доказанный transient error class hh_http_502; login, CAPTCHA, access denied и ошибки содержимого не допускаются."
+        )
+    if visible_status_code != 502:
+        raise ValueError("Для hh_http_502 требуется видимый HTTP status 502.")
+    message = _nonempty_string(visible_message, "visible_message", 1000)
+    lowered = message.casefold()
+    if not (
+        "502" in lowered
+        or "temporarily unavailable" in lowered
+        or "временно недоступ" in lowered
+    ):
+        raise ValueError("Видимое сообщение не подтверждает временную недоступность 502.")
+    timestamp = _parse_iso(observed_at, "observed_at")
+    evidence_ref = _nonempty_string(
+        remote_evidence_reference, "remote_evidence_reference", 1000
+    )
+    identity = {
+        "run_id": run_id,
+        "source": "hh",
+        "stream_key": stream_key,
+        "source_kind": str(stream["source_kind"]),
+        "page_index": page_index,
+        "query_fingerprint": str(stream["query_fingerprint"]),
+        "configuration_fingerprint": str(stream["configuration_fingerprint"]),
+        "error_class": error_class,
+        "visible_status_code": visible_status_code,
+        "visible_message_hash": sha256_text(message),
+        "observed_at": timestamp,
+        "remote_evidence_reference": evidence_ref,
+    }
+    digest = payload_hash(identity)
+    existing = conn.execute(
+        "SELECT id FROM hh_transient_error_attempts WHERE attempt_hash = ?",
+        (digest,),
+    ).fetchone()
+    duplicate_dimension = conn.execute(
+        """
+        SELECT id FROM hh_transient_error_attempts
+        WHERE run_id = ? AND source = 'hh' AND stream_key = ? AND page_index = ?
+          AND (observed_at = ? OR remote_evidence_reference = ?)
+        LIMIT 1
+        """,
+        (run_id, stream_key, page_index, timestamp, evidence_ref),
+    ).fetchone()
+    if existing is None and duplicate_dimension is not None:
+        raise ValueError(
+            "Каждая попытка должна иметь отдельные observed_at и remote evidence reference."
+        )
+    if existing is None:
+        conn.execute(
+            """
+            INSERT INTO hh_transient_error_attempts (
+                run_id, source, stream_key, source_kind, page_index,
+                query_fingerprint, configuration_fingerprint, error_class,
+                visible_status_code, visible_message_hash, observed_at,
+                remote_evidence_reference, attempt_hash, created_at
+            ) VALUES (?, 'hh', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                stream_key,
+                str(stream["source_kind"]),
+                page_index,
+                str(stream["query_fingerprint"]),
+                str(stream["configuration_fingerprint"]),
+                error_class,
+                visible_status_code,
+                sha256_text(message),
+                timestamp,
+                evidence_ref,
+                digest,
+                now_iso(),
+            ),
+        )
+    count = int(
+        conn.execute(
+            """
+            SELECT COUNT(*) FROM hh_transient_error_attempts
+            WHERE run_id = ? AND source = 'hh' AND stream_key = ?
+              AND page_index = ? AND error_class = ?
+              AND query_fingerprint = ? AND configuration_fingerprint = ?
+            """,
+            (
+                run_id,
+                stream_key,
+                page_index,
+                TRANSIENT_TAIL_ERROR_CLASS,
+                str(stream["query_fingerprint"]),
+                str(stream["configuration_fingerprint"]),
+            ),
+        ).fetchone()[0]
+    )
+    return {
+        "run_id": run_id,
+        "stream_key": stream_key,
+        "page_index": page_index,
+        "error_class": error_class,
+        "attempt_hash": digest,
+        "idempotent": existing is not None,
+        "retry_count": count,
+        "minimum_attempts": cfg.transient_error_min_attempts,
+        "resolution_available": count >= cfg.transient_error_min_attempts,
+    }
+
+
+def _accepted_tail_evidence(
+    conn: sqlite3.Connection,
+    settings: Settings,
+    *,
+    run_id: str,
+    stream_key: str,
+) -> tuple[sqlite3.Row, list[int], int]:
+    cfg = settings.search.hh_acquisition
+    if not cfg.transient_error_tail_enabled:
+        raise ValueError("Восстановление недоступного хвоста выключено конфигурацией.")
+    stream = conn.execute(
+        """
+        SELECT * FROM hh_stream_runs
+        WHERE run_id = ? AND source = 'hh' AND stream_key = ?
+        """,
+        (run_id, stream_key),
+    ).fetchone()
+    if stream is None:
+        raise ValueError("Поток HH не найден.")
+    if str(stream["source_kind"]) != "personal_recommendations":
+        raise ValueError("Недоступный хвост разрешён только для персональных рекомендаций.")
+    current_config = acquisition_configuration_fingerprint(
+        settings,
+        source_kind=str(stream["source_kind"]),
+        stream_key=stream_key,
+        query_fingerprint=str(stream["query_fingerprint"]),
+    )
+    if current_config != str(stream["configuration_fingerprint"]):
+        raise ValueError("Текущая acquisition-конфигурация не совпадает с зафиксированным потоком.")
+    if not cfg.personal_max_is_completion_boundary:
+        raise ValueError(
+            "Настроенный предел персональных рекомендаций не объявлен допустимой границей завершения."
+        )
+    if stream["unresolved_drift_page"] is not None:
+        raise ValueError("Неразрешённое расхождение счётчика блокирует восстановление.")
+    pending = int(
+        conn.execute(
+            """
+            SELECT COUNT(*) FROM hh_detail_queue
+            WHERE run_id = ? AND source = 'hh' AND stream_key = ? AND state <> 'captured'
+            """,
+            (run_id, stream_key),
+        ).fetchone()[0]
+    )
+    if pending:
+        raise ValueError("Неразрешённая очередь detail блокирует восстановление.")
+    blocker = str(stream["blocker_code"] or "")
+    if blocker not in {"", "session_identity_changed", TRANSIENT_TAIL_ERROR_CLASS}:
+        raise ValueError(f"Другая блокировка {blocker!r} запрещает transient recovery.")
+    if blocker == "session_identity_changed":
+        candidates = conn.execute(
+            """
+            SELECT capture.id, capture.session_id_state, capture.session_fingerprint,
+                   (SELECT COUNT(*) FROM hh_page_items item
+                    WHERE item.capture_id = capture.id) AS item_count,
+                   (SELECT COUNT(*) FROM hh_capture_audit_decisions audit
+                    WHERE audit.capture_id = capture.id
+                      AND audit.decision = 'audit_only') AS audit_count
+            FROM hh_page_captures capture
+            WHERE capture.run_id = ? AND capture.source = 'hh'
+              AND capture.stream_key = ? AND capture.page_index = ?
+            ORDER BY capture.id
+            """,
+            (run_id, stream_key, int(stream["next_page"])),
+        ).fetchall()
+        for candidate in candidates:
+            mismatched = bool(str(stream["session_id_state"] or "")) and (
+                str(candidate["session_id_state"]) != str(stream["session_id_state"])
+                or str(candidate["session_fingerprint"])
+                != str(stream["session_fingerprint"])
+            )
+            if not mismatched:
+                continue
+            if int(candidate["item_count"]):
+                raise ValueError(
+                    "Снимок новой сессии уже содержит source-bearing reconciliation и не может быть автоматически переведён в audit-only."
+                )
+            if int(candidate["audit_count"]):
+                conn.execute(
+                    "UPDATE hh_page_captures SET verified = 0 WHERE id = ?",
+                    (int(candidate["id"]),),
+                )
+                continue
+            capture_id = int(candidate["id"])
+            audit_reason = "legacy_session_identity_changed_before_reconciliation"
+            audit_hash = payload_hash(
+                {
+                    "capture_id": capture_id,
+                    "run_id": run_id,
+                    "stream_key": stream_key,
+                    "decision": "audit_only",
+                    "reason": audit_reason,
+                }
+            )
+            conn.execute(
+                "UPDATE hh_page_captures SET verified = 0 WHERE id = ?", (capture_id,)
+            )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO hh_capture_audit_decisions (
+                    capture_id, run_id, source, stream_key, decision, reason,
+                    resolution_hash, created_at
+                ) VALUES (?, ?, 'hh', ?, 'audit_only', ?, ?, ?)
+                """,
+                (capture_id, run_id, stream_key, audit_reason, audit_hash, now_iso()),
+            )
+    indexes = _validated_page_indexes(conn, run_id=run_id, stream_key=stream_key)
+    last_verified = int(stream["last_verified_page"])
+    if indexes != list(range(last_verified + 1)):
+        raise ValueError("Ранние проверенные страницы неполны или не непрерывны.")
+    expected_last = int(cfg.personal_max_pages) - 1
+    missing = list(range(last_verified + 1, expected_last + 1))
+    if not missing or missing[0] != int(stream["next_page"]):
+        raise ValueError("Восстановление допускает только точный следующий хвост.")
+    if len(missing) > int(cfg.transient_error_max_tail_pages):
+        raise ValueError("Недоступный хвост превышает настроенный безопасный предел.")
+    attempts = int(
+        conn.execute(
+            """
+            SELECT COUNT(*) FROM hh_transient_error_attempts
+            WHERE run_id = ? AND source = 'hh' AND stream_key = ?
+              AND page_index = ? AND error_class = ?
+              AND query_fingerprint = ? AND configuration_fingerprint = ?
+            """,
+            (
+                run_id,
+                stream_key,
+                missing[0],
+                TRANSIENT_TAIL_ERROR_CLASS,
+                str(stream["query_fingerprint"]),
+                str(stream["configuration_fingerprint"]),
+            ),
+        ).fetchone()[0]
+    )
+    if attempts < int(cfg.transient_error_min_attempts):
+        raise ValueError(
+            f"Недостаточно независимых видимых попыток: {attempts}; требуется {cfg.transient_error_min_attempts}."
+        )
+    rejected = int(
+        conn.execute(
+            """
+            SELECT COUNT(*) FROM hh_page_captures capture
+            JOIN hh_capture_audit_decisions audit ON audit.capture_id = capture.id
+            WHERE capture.run_id = ? AND capture.source = 'hh'
+              AND capture.stream_key = ? AND capture.page_index = ?
+              AND audit.decision = 'audit_only'
+            """,
+            (run_id, stream_key, missing[0]),
+        ).fetchone()[0]
+    )
+    if rejected < 1:
+        raise ValueError(
+            "Не найден сохранённый audit-only снимок новой сессии на точной недоступной хвостовой странице."
+        )
+    return stream, missing, attempts
+
+
+def resolve_stream_recovery(
+    conn: sqlite3.Connection,
+    settings: Settings,
+    *,
+    run_id: str,
+    stream_key: str,
+    strategy: str,
+    reason: str,
+) -> dict[str, Any]:
+    """Resolve one exact recovery decision, idempotently and fail closed."""
+
+    strategy = _nonempty_string(strategy, "strategy", 64)
+    if strategy not in TRANSIENT_TAIL_STRATEGIES:
+        raise ValueError("Неподдерживаемая стратегия восстановления HH.")
+    reason = _nonempty_string(reason, "reason", 1000)
+    existing = _recovery_resolution(conn, run_id=run_id, stream_key=stream_key)
+    if existing is not None:
+        if existing["strategy"] == strategy and existing["reason"] == reason:
+            return {"resolution": existing, "idempotent": True}
+        raise RuntimeError(
+            "Для потока уже существует иное решение восстановления; конфликтующее решение запрещено."
+        )
+    if strategy == "full_session_rollover":
+        return _resolve_full_session_rollover(
+            conn,
+            settings,
+            run_id=run_id,
+            stream_key=stream_key,
+            reason=reason,
+        )
+    stream, missing, attempts = _accepted_tail_evidence(
+        conn, settings, run_id=run_id, stream_key=stream_key
+    )
+    resolved_at = now_iso()
+    details = {
+        "degraded_completion": True,
+        "source_kind": str(stream["source_kind"]),
+        "query_fingerprint": str(stream["query_fingerprint"]),
+        "configuration_fingerprint": str(stream["configuration_fingerprint"]),
+    }
+    identity = {
+        "run_id": run_id,
+        "source": "hh",
+        "stream_key": stream_key,
+        "strategy": strategy,
+        "last_verified_page": int(stream["last_verified_page"]),
+        "missing_tail_pages": missing,
+        "retry_count": attempts,
+        "error_class": TRANSIENT_TAIL_ERROR_CLASS,
+        "reason": reason,
+        "details": details,
+    }
+    digest = payload_hash(identity)
+    conn.execute(
+        """
+        INSERT INTO hh_stream_recovery_resolutions (
+            run_id, source, stream_key, strategy, last_verified_page,
+            missing_tail_json, retry_count, error_class, reason,
+            details_json, resolution_hash, resolved_at
+        ) VALUES (?, 'hh', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            run_id,
+            stream_key,
+            strategy,
+            int(stream["last_verified_page"]),
+            canonical_json(missing),
+            attempts,
+            TRANSIENT_TAIL_ERROR_CLASS,
+            reason,
+            canonical_json(details),
+            digest,
+            resolved_at,
+        ),
+    )
+    conn.execute(
+        """
+        UPDATE hh_stream_runs
+        SET state = 'ready_to_finalize', blocker_code = NULL,
+            blocker_reason = NULL, updated_at = ?
+        WHERE run_id = ? AND source = 'hh' AND stream_key = ?
+        """,
+        (resolved_at, run_id, stream_key),
+    )
+    _append_event(
+        conn,
+        run_id=run_id,
+        stream_key=stream_key,
+        event_type="transient_tail_recovery_accepted",
+        severity="warning",
+        details={
+            "strategy": strategy,
+            "last_verified_page": int(stream["last_verified_page"]),
+            "missing_tail_pages": missing,
+            "retry_count": attempts,
+            "error_class": TRANSIENT_TAIL_ERROR_CLASS,
+            "reason": reason,
+        },
+    )
+    resolution = _recovery_resolution(conn, run_id=run_id, stream_key=stream_key)
+    return {"resolution": resolution, "idempotent": False}
+
+
+def record_rollover_page(
+    conn: sqlite3.Connection,
+    settings: Settings,
+    *,
+    run_id: str,
+    stream_key: str,
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Store a clean full recapture separately, never mixing live sessions."""
+
+    cfg = settings.search.hh_acquisition
+    if not cfg.transient_error_tail_enabled:
+        raise ValueError("Восстановление HH выключено конфигурацией.")
+    stream = conn.execute(
+        """
+        SELECT * FROM hh_stream_runs
+        WHERE run_id = ? AND source = 'hh' AND stream_key = ?
+        """,
+        (run_id, stream_key),
+    ).fetchone()
+    if stream is None:
+        raise ValueError("Поток HH не найден.")
+    if str(stream["state"]) != "blocked":
+        raise ValueError("Полная повторная выборка разрешена только для заблокированного потока.")
+    if str(stream["blocker_code"] or "") not in {
+        "session_identity_changed",
+        TRANSIENT_TAIL_ERROR_CLASS,
+    }:
+        raise ValueError("Текущая блокировка не допускает session rollover.")
+    current_config = acquisition_configuration_fingerprint(
+        settings,
+        source_kind=str(stream["source_kind"]),
+        stream_key=stream_key,
+        query_fingerprint=str(stream["query_fingerprint"]),
+    )
+    if current_config != str(stream["configuration_fingerprint"]):
+        raise ValueError("Текущая acquisition-конфигурация не совпадает с зафиксированным потоком.")
+    normalized = validate_page_capture(
+        payload,
+        settings,
+        expected_source_kind=str(stream["source_kind"]),
+        expected_query_fingerprint=str(stream["query_fingerprint"]),
+    )
+    if not normalized["stable"] or normalized["blockers"]:
+        raise ValueError("Rollover-страница должна быть устойчивой и без блокировок.")
+    if normalized["requires_count_drift_recapture"]:
+        raise ValueError("Расхождение счётчика на rollover-странице требует обычной повторной проверки.")
+    candidate = str(normalized["session"]["session_fingerprint"])
+    if (
+        str(normalized["session"]["session_id_state"]) == str(stream["session_id_state"] or "")
+        and candidate == str(stream["session_fingerprint"] or "")
+    ):
+        raise ValueError("Rollover должен использовать новую, отличную от исходной сессию.")
+    existing_candidates = conn.execute(
+        """
+        SELECT DISTINCT candidate_session_fingerprint
+        FROM hh_session_rollover_pages
+        WHERE run_id = ? AND source = 'hh' AND stream_key = ?
+        """,
+        (run_id, stream_key),
+    ).fetchall()
+    if existing_candidates and any(str(row[0]) != candidate for row in existing_candidates):
+        raise ValueError("Нельзя смешивать несколько кандидатных rollover-сессий.")
+    next_page = int(
+        conn.execute(
+            """
+            SELECT COUNT(*) FROM hh_session_rollover_pages
+            WHERE run_id = ? AND source = 'hh' AND stream_key = ?
+              AND candidate_session_fingerprint = ?
+            """,
+            (run_id, stream_key, candidate),
+        ).fetchone()[0]
+    )
+    if int(normalized["page_index"]) != next_page:
+        raise ValueError(
+            f"Полная новая сессия должна быть непрерывной от страницы 0; ожидалась {next_page}."
+        )
+    digest = str(normalized["capture_hash"])
+    existing = conn.execute(
+        "SELECT id FROM hh_session_rollover_pages WHERE capture_hash = ?", (digest,)
+    ).fetchone()
+    if existing is not None:
+        return {
+            "run_id": run_id,
+            "stream_key": stream_key,
+            "page_index": int(normalized["page_index"]),
+            "candidate_session_fingerprint": candidate,
+            "capture_hash": digest,
+            "idempotent": True,
+        }
+    artifact_path, artifact_sha = _write_gzip_artifact(
+        settings.workspace_root,
+        run_id=run_id,
+        stream_key=stream_key,
+        filename=f"rollover-page-{int(normalized['page_index']):04d}-{digest[:16]}.json.gz",
+        payload=normalized,
+    )
+    conn.execute(
+        """
+        INSERT INTO hh_session_rollover_pages (
+            run_id, source, stream_key, candidate_session_fingerprint,
+            page_index, capture_hash, captured_at, normalized_capture_json,
+            artifact_path, artifact_sha256, created_at
+        ) VALUES (?, 'hh', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            run_id,
+            stream_key,
+            candidate,
+            int(normalized["page_index"]),
+            digest,
+            normalized["captured_at"],
+            canonical_json(normalized),
+            artifact_path,
+            artifact_sha,
+            now_iso(),
+        ),
+    )
+    return {
+        "run_id": run_id,
+        "stream_key": stream_key,
+        "page_index": int(normalized["page_index"]),
+        "candidate_session_fingerprint": candidate,
+        "capture_hash": digest,
+        "idempotent": False,
+        "artifact": {"path": artifact_path, "sha256": artifact_sha},
+    }
+
+
+def _resolve_full_session_rollover(
+    conn: sqlite3.Connection,
+    settings: Settings,
+    *,
+    run_id: str,
+    stream_key: str,
+    reason: str,
+) -> dict[str, Any]:
+    cfg = settings.search.hh_acquisition
+    if not cfg.transient_error_tail_enabled:
+        raise ValueError("Восстановление HH выключено конфигурацией.")
+    stream = conn.execute(
+        """
+        SELECT * FROM hh_stream_runs
+        WHERE run_id = ? AND source = 'hh' AND stream_key = ?
+        """,
+        (run_id, stream_key),
+    ).fetchone()
+    if stream is None:
+        raise ValueError("Поток HH не найден.")
+    if stream["unresolved_drift_page"] is not None:
+        raise ValueError("Неразрешённое расхождение счётчика блокирует rollover.")
+    pending = int(
+        conn.execute(
+            """
+            SELECT COUNT(*) FROM hh_detail_queue
+            WHERE run_id = ? AND source = 'hh' AND stream_key = ? AND state <> 'captured'
+            """,
+            (run_id, stream_key),
+        ).fetchone()[0]
+    )
+    if pending:
+        raise ValueError("Неразрешённая detail-очередь блокирует rollover.")
+    candidates = conn.execute(
+        """
+        SELECT candidate_session_fingerprint, COUNT(*) AS page_count
+        FROM hh_session_rollover_pages
+        WHERE run_id = ? AND source = 'hh' AND stream_key = ?
+        GROUP BY candidate_session_fingerprint
+        """,
+        (run_id, stream_key),
+    ).fetchall()
+    if len(candidates) != 1:
+        raise ValueError("Требуется ровно одна полная кандидатная rollover-сессия.")
+    candidate = str(candidates[0]["candidate_session_fingerprint"])
+    rows = conn.execute(
+        """
+        SELECT * FROM hh_session_rollover_pages
+        WHERE run_id = ? AND source = 'hh' AND stream_key = ?
+          AND candidate_session_fingerprint = ?
+        ORDER BY page_index
+        """,
+        (run_id, stream_key, candidate),
+    ).fetchall()
+    indexes = [int(row["page_index"]) for row in rows]
+    if indexes != list(range(len(rows))):
+        raise ValueError("Rollover-сессия должна быть непрерывной от страницы 0.")
+    captures = [json.loads(str(row["normalized_capture_json"])) for row in rows]
+    if not captures:
+        raise ValueError("Rollover-сессия пуста.")
+    last = captures[-1]
+    source_exhausted = not bool(last["navigation"]["next"]["present"])
+    configured_boundary = bool(
+        str(stream["source_kind"]) == "personal_recommendations"
+        and cfg.personal_max_is_completion_boundary
+        and len(captures) == int(cfg.personal_max_pages)
+    )
+    if not (source_exhausted or configured_boundary):
+        raise ValueError("Полная новая сессия не достигла доказанного конца или настроенной границы.")
+    timestamp = now_iso()
+    old_rows = conn.execute(
+        """
+        SELECT id FROM hh_page_captures
+        WHERE run_id = ? AND source = 'hh' AND stream_key = ?
+        """,
+        (run_id, stream_key),
+    ).fetchall()
+    for old in old_rows:
+        capture_id = int(old["id"])
+        audit_reason = "superseded_by_full_session_rollover"
+        audit_hash = payload_hash(
+            {
+                "capture_id": capture_id,
+                "run_id": run_id,
+                "stream_key": stream_key,
+                "decision": "audit_only",
+                "reason": audit_reason,
+                "candidate": candidate,
+            }
+        )
+        conn.execute("UPDATE hh_page_captures SET verified = 0 WHERE id = ?", (capture_id,))
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO hh_capture_audit_decisions (
+                capture_id, run_id, source, stream_key, decision, reason,
+                resolution_hash, created_at
+            ) VALUES (?, ?, 'hh', ?, 'audit_only', ?, ?, ?)
+            """,
+            (capture_id, run_id, stream_key, audit_reason, audit_hash, timestamp),
+        )
+    conn.execute(
+        """
+        UPDATE hh_stream_runs SET state = 'capturing', blocker_code = NULL,
+            blocker_reason = NULL, unresolved_drift_page = NULL,
+            session_id_state = ?, session_fingerprint = ?, next_page = 0,
+            last_verified_page = -1, boundary_candidate_page = NULL,
+            boundary_proven_page = NULL, source_exhausted = 0, updated_at = ?
+        WHERE run_id = ? AND source = 'hh' AND stream_key = ?
+        """,
+        (
+            captures[0]["session"]["session_id_state"],
+            candidate,
+            timestamp,
+            run_id,
+            stream_key,
+        ),
+    )
+    for rollover_row, normalized in zip(rows, captures):
+        page_index = int(normalized["page_index"])
+        recapture_no = int(
+            conn.execute(
+                """
+                SELECT COALESCE(MAX(recapture_no), 0) + 1 FROM hh_page_captures
+                WHERE run_id = ? AND source = 'hh' AND stream_key = ? AND page_index = ?
+                """,
+                (run_id, stream_key, page_index),
+            ).fetchone()[0]
+        )
+        cursor = conn.execute(
+            """
+            INSERT INTO hh_page_captures (
+                run_id, source, stream_key, source_kind, page_index, recapture_no,
+                capture_hash, adapter_version, query_fingerprint, canonical_url_hash,
+                captured_at, canonical_id_set_hash, source_reported_count,
+                source_expected_page_count, raw_card_count, canonical_unique_count,
+                stability_json, navigation_json, ordering_json, session_id_state,
+                session_fingerprint, warnings_json, blockers_json, count_drift_state,
+                verified, artifact_path, artifact_sha256, reconciliation_json, created_at
+            ) VALUES (?, 'hh', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'none', 1, ?, ?, '{}', ?)
+            """,
+            (
+                run_id,
+                stream_key,
+                normalized["source_kind"],
+                page_index,
+                recapture_no,
+                normalized["capture_hash"],
+                normalized["adapter_version"],
+                normalized["query_fingerprint"],
+                normalized["canonical_url_hash"],
+                normalized["captured_at"],
+                normalized["canonical_id_set_hash"],
+                normalized["source_reported_result_count"],
+                normalized["source_expected_page_count"],
+                normalized["raw_card_count"],
+                normalized["canonical_unique_count"],
+                canonical_json(normalized["stability"]),
+                canonical_json(normalized["navigation"]),
+                canonical_json(normalized["ordering"]),
+                normalized["session"]["session_id_state"],
+                normalized["session"]["session_fingerprint"],
+                canonical_json(normalized["warnings"]),
+                canonical_json(normalized["blockers"]),
+                rollover_row["artifact_path"],
+                rollover_row["artifact_sha256"],
+                timestamp,
+            ),
+        )
+        capture_id = int(cursor.lastrowid)
+        reconciliation = _reconcile_cards(
+            conn,
+            capture_id=capture_id,
+            capture_hash=normalized["capture_hash"],
+            run_id=run_id,
+            stream_key=stream_key,
+            page_index=page_index,
+            captured_at=normalized["captured_at"],
+            cards=normalized["cards"],
+        )
+        conn.execute(
+            "UPDATE hh_page_captures SET reconciliation_json = ? WHERE id = ?",
+            (canonical_json(reconciliation), capture_id),
+        )
+    _recompute_stream_counts(conn, run_id=run_id, stream_key=stream_key)
+    rollover_pending = int(
+        conn.execute(
+            """
+            SELECT COUNT(*) FROM hh_detail_queue
+            WHERE run_id = ? AND source = 'hh' AND stream_key = ? AND state <> 'captured'
+            """,
+            (run_id, stream_key),
+        ).fetchone()[0]
+    )
+    if rollover_pending:
+        raise ValueError(
+            "Полная новая сессия содержит новые или изменённые ID; сначала требуется обычная detail-сверка."
+        )
+    last_page = len(captures) - 1
+    conn.execute(
+        """
+        UPDATE hh_stream_runs SET state = 'ready_to_finalize', next_page = ?,
+            last_verified_page = ?, boundary_proven_page = ?, source_exhausted = ?,
+            source_reported_count = ?, blocker_code = NULL, blocker_reason = NULL,
+            updated_at = ?
+        WHERE run_id = ? AND source = 'hh' AND stream_key = ?
+        """,
+        (
+            last_page + 1,
+            last_page,
+            last_page if configured_boundary and not source_exhausted else None,
+            1 if source_exhausted else 0,
+            last["source_reported_result_count"],
+            timestamp,
+            run_id,
+            stream_key,
+        ),
+    )
+    attempts = int(
+        conn.execute(
+            """
+            SELECT COUNT(*) FROM hh_transient_error_attempts
+            WHERE run_id = ? AND source = 'hh' AND stream_key = ?
+            """,
+            (run_id, stream_key),
+        ).fetchone()[0]
+    )
+    details = {
+        "degraded_completion": False,
+        "source_kind": str(stream["source_kind"]),
+        "candidate_session_fingerprint": candidate,
+        "page_count": len(captures),
+    }
+    identity = {
+        "run_id": run_id,
+        "source": "hh",
+        "stream_key": stream_key,
+        "strategy": "full_session_rollover",
+        "last_verified_page": last_page,
+        "missing_tail_pages": [],
+        "retry_count": attempts,
+        "error_class": "session_identity_changed",
+        "reason": reason,
+        "details": details,
+    }
+    digest = payload_hash(identity)
+    conn.execute(
+        """
+        INSERT INTO hh_stream_recovery_resolutions (
+            run_id, source, stream_key, strategy, last_verified_page,
+            missing_tail_json, retry_count, error_class, reason,
+            details_json, resolution_hash, resolved_at
+        ) VALUES (?, 'hh', ?, 'full_session_rollover', ?, '[]', ?,
+                  'session_identity_changed', ?, ?, ?, ?)
+        """,
+        (
+            run_id,
+            stream_key,
+            last_page,
+            attempts,
+            reason,
+            canonical_json(details),
+            digest,
+            timestamp,
+        ),
+    )
+    _append_event(
+        conn,
+        run_id=run_id,
+        stream_key=stream_key,
+        event_type="full_session_rollover_accepted",
+        severity="info",
+        details={"page_count": len(captures), "last_verified_page": last_page},
+    )
+    return {
+        "resolution": _recovery_resolution(
+            conn, run_id=run_id, stream_key=stream_key
+        ),
+        "idempotent": False,
+    }
 
 
 def _append_event(
@@ -3690,6 +4659,29 @@ def record_page_capture(
         normalized=normalized,
     )
     if session_changed and not navigation_session_enrichment:
+        audit_reason = "session_identity_changed_before_reconciliation"
+        audit_hash = payload_hash(
+            {
+                "capture_id": capture_id,
+                "run_id": run_id,
+                "stream_key": stream_key,
+                "decision": "audit_only",
+                "reason": audit_reason,
+            }
+        )
+        conn.execute(
+            "UPDATE hh_page_captures SET verified = 0 WHERE id = ?",
+            (capture_id,),
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO hh_capture_audit_decisions (
+                capture_id, run_id, source, stream_key, decision, reason,
+                resolution_hash, created_at
+            ) VALUES (?, ?, 'hh', ?, 'audit_only', ?, ?, ?)
+            """,
+            (capture_id, run_id, stream_key, audit_reason, audit_hash, now_iso()),
+        )
         _set_stream_blocked(
             conn,
             run_id=run_id,
@@ -4745,6 +5737,7 @@ def finalize_stream(
             "checkpoint_version": int(history[0]) if history else None,
             "manifest": stored_manifest,
         }
+    recovery = _recovery_resolution(conn, run_id=run_id, stream_key=stream_key)
     if str(row["state"]) == "blocked":
         raise ValueError("Заблокированный поток нельзя завершить.")
     if row["unresolved_drift_page"] is not None:
@@ -4779,7 +5772,14 @@ def finalize_stream(
         if rule_mode == "delta" and row["boundary_proven_page"] is None:
             raise ValueError("Режим delta требует полного доказательства границы v2.")
     else:
-        if not bool(row["source_exhausted"]) and row["boundary_proven_page"] is None:
+        accepted_tail = bool(
+            recovery and recovery["strategy"] == "accepted_unavailable_tail"
+        )
+        if (
+            not bool(row["source_exhausted"])
+            and row["boundary_proven_page"] is None
+            and not accepted_tail
+        ):
             raise ValueError("Персональные рекомендации не достигли настроенной границы остановки.")
     predicted = row["predicted_boundary_page"]
     missed = _items_beyond_boundary(
@@ -4911,6 +5911,8 @@ def finalize_stream(
     stop_reason = "source_exhausted"
     if rule_mode == "delta":
         stop_reason = "proven_known_boundary"
+    elif recovery and recovery["strategy"] == "accepted_unavailable_tail":
+        stop_reason = "transient_error_tail_exception"
     elif source_kind == "personal_recommendations" and not bool(row["source_exhausted"]):
         stop_reason = "personal_novelty_or_configured_boundary"
     elif row["fallback_reason"]:
@@ -4940,6 +5942,15 @@ def finalize_stream(
         anomaly_state=anomaly_state,
         boundary_sample=sample,
     )
+    if recovery:
+        snapshot["cursor"]["recovery_resolution"] = {
+            "strategy": recovery["strategy"],
+            "last_verified_page": recovery["last_verified_page"],
+            "missing_tail_pages": recovery["missing_tail_pages"],
+            "retry_count": recovery["retry_count"],
+            "error_class": recovery["error_class"],
+            "resolved_at": recovery["resolved_at"],
+        }
     version = _persist_checkpoint(
         conn,
         snapshot=snapshot,
@@ -5008,6 +6019,21 @@ def build_completion_manifest(
             if row["source_exhausted"]
             else "personal_novelty_or_configured_boundary"
         )
+    recovery = _recovery_resolution(conn, run_id=run_id, stream_key=stream_key)
+    recovery_warning = None
+    if recovery:
+        recovery_warning = {
+            "code": "hh_transient_tail_recovery",
+            "severity": "warning" if recovery.get("degraded_completion") else "info",
+            "strategy": recovery["strategy"],
+            "source_kind": row["source_kind"],
+            "last_verified_page": recovery["last_verified_page"],
+            "missing_tail_pages": recovery["missing_tail_pages"],
+            "retry_count": recovery["retry_count"],
+            "error_class": recovery["error_class"],
+            "resolved_at": recovery["resolved_at"],
+            "reason": recovery["reason"],
+        }
     manifest.update(
         {
             "stop_reason": stop_reason,
@@ -5018,8 +6044,11 @@ def build_completion_manifest(
             "cursor_candidate": dict(cursor_candidate or {}),
             "remote_boundary_verified": True,
             "blockers": [],
+            "degraded_completion": recovery_warning,
         }
     )
+    if recovery_warning:
+        manifest["warnings"] = [*manifest.get("warnings", []), recovery_warning]
     return manifest
 
 
@@ -5146,15 +6175,23 @@ def validate_manifest_v2(
         personal_boundary = bool(
             source_kind == "personal_recommendations" and boundary_proven
         )
+        degraded = normalized.get("degraded_completion")
+        accepted_tail = bool(
+            isinstance(degraded, dict)
+            and degraded.get("strategy") == "accepted_unavailable_tail"
+            and degraded.get("error_class") == TRANSIENT_TAIL_ERROR_CLASS
+            and degraded.get("missing_tail_pages")
+        )
         if (
             mode in {"full", "shadow", "audit"}
             and not source_exhausted
             and not personal_boundary
+            and not accepted_tail
         ):
             raise ValueError("Манифест v2 для full, shadow и audit требует полного обхода пагинации.")
         if mode == "delta" and not boundary_proven:
             raise ValueError("Манифест v2 для delta требует доказанной границы известных результатов.")
-        if mode == "resume" and not (source_exhausted or boundary_proven):
+        if mode == "resume" and not (source_exhausted or boundary_proven or accepted_tail):
             raise ValueError("Манифест v2 для resume требует исчерпания источника или доказанной границы.")
         if source_kind == "ordinary_search" and stop_reason.startswith("personal_"):
             raise ValueError("Причину остановки персональных рекомендаций нельзя использовать для обычного потока HH.")
@@ -5322,10 +6359,113 @@ def inspect_checkpoint_state(
             ((stream_key, max(1, min(history_limit, 200))) if stream_key else (max(1, min(history_limit, 200)),)),
         ).fetchall()
     ]
-    result = {"checkpoints": checkpoints, "runs": runs, "history": history, "events": events}
+    recovery_clauses: list[str] = []
+    recovery_params: list[Any] = []
+    if run_id:
+        recovery_clauses.append("run_id = ?")
+        recovery_params.append(run_id)
+    if stream_key:
+        recovery_clauses.append("stream_key = ?")
+        recovery_params.append(stream_key)
+    recovery_where = (
+        " WHERE " + " AND ".join(recovery_clauses) if recovery_clauses else ""
+    )
+    attempts = [
+        {
+            "id": int(row["id"]),
+            "run_id": row["run_id"],
+            "stream_key": row["stream_key"],
+            "source_kind": row["source_kind"],
+            "page_index": int(row["page_index"]),
+            "error_class": row["error_class"],
+            "visible_status_code": int(row["visible_status_code"]),
+            "observed_at": row["observed_at"],
+            "remote_evidence_reference": row["remote_evidence_reference"],
+            "attempt_hash": row["attempt_hash"],
+        }
+        for row in conn.execute(
+            "SELECT * FROM hh_transient_error_attempts"
+            + recovery_where
+            + " ORDER BY id DESC LIMIT ?",
+            (*recovery_params, max(1, min(history_limit, 200))),
+        ).fetchall()
+    ]
+    resolution_rows = conn.execute(
+        "SELECT run_id, stream_key FROM hh_stream_recovery_resolutions"
+        + recovery_where
+        + " ORDER BY id DESC LIMIT ?",
+        (*recovery_params, max(1, min(history_limit, 200))),
+    ).fetchall()
+    resolutions = [
+        _recovery_resolution(
+            conn, run_id=str(row["run_id"]), stream_key=str(row["stream_key"])
+        )
+        for row in resolution_rows
+    ]
+    audit_decisions = [
+        dict(row)
+        for row in conn.execute(
+            """
+            SELECT audit.id, audit.run_id, audit.stream_key, capture.page_index,
+                   capture.capture_hash, audit.decision, audit.reason,
+                   audit.resolution_hash, audit.created_at
+            FROM hh_capture_audit_decisions audit
+            JOIN hh_page_captures capture ON capture.id = audit.capture_id
+            """
+            + recovery_where.replace("run_id", "audit.run_id").replace(
+                "stream_key", "audit.stream_key"
+            )
+            + " ORDER BY audit.id DESC LIMIT ?",
+            (*recovery_params, max(1, min(history_limit, 200))),
+        ).fetchall()
+    ]
+    result = {
+        "checkpoints": checkpoints,
+        "runs": runs,
+        "history": history,
+        "events": events,
+        "transient_error_attempts": attempts,
+        "recovery_resolutions": [item for item in resolutions if item],
+        "audit_only_captures": audit_decisions,
+    }
     if run_id:
         result["run_totals"] = run_reconciliation_totals(conn, run_id=run_id)
     return result
+
+
+def recovery_warnings(
+    conn: sqlite3.Connection, *, run_id: str | None = None
+) -> list[dict[str, Any]]:
+    params: tuple[Any, ...] = (run_id,) if run_id else ()
+    where = " WHERE run_id = ?" if run_id else ""
+    rows = conn.execute(
+        """
+        SELECT run_id, stream_key, strategy, last_verified_page,
+               missing_tail_json, retry_count, error_class, reason, resolved_at
+        FROM hh_stream_recovery_resolutions
+        """
+        + where
+        + " ORDER BY id",
+        params,
+    ).fetchall()
+    return [
+        {
+            "code": "hh_transient_tail_recovery",
+            "severity": "warning"
+            if str(row["strategy"]) == "accepted_unavailable_tail"
+            else "info",
+            "run_id": row["run_id"],
+            "stream_key": row["stream_key"],
+            "strategy": row["strategy"],
+            "last_verified_page": int(row["last_verified_page"]),
+            "missing_tail_pages": json.loads(str(row["missing_tail_json"])),
+            "retry_count": int(row["retry_count"]),
+            "error_class": row["error_class"],
+            "reason": row["reason"],
+            "resolved_at": row["resolved_at"],
+        }
+        for row in rows
+    ]
 
 
 def invalidate_checkpoint(
