@@ -425,6 +425,9 @@ def _config_snapshot(settings: Settings, timezone: str) -> dict[str, Any]:
             "personal_consecutive_known_pages": settings.search.hh_acquisition.personal_consecutive_known_pages,
             "personal_max_pages": settings.search.hh_acquisition.personal_max_pages,
             "personal_max_is_completion_boundary": settings.search.hh_acquisition.personal_max_is_completion_boundary,
+            "transient_error_tail_enabled": settings.search.hh_acquisition.transient_error_tail_enabled,
+            "transient_error_min_attempts": settings.search.hh_acquisition.transient_error_min_attempts,
+            "transient_error_max_tail_pages": settings.search.hh_acquisition.transient_error_max_tail_pages,
         },
         "telegram": {
             "enabled": settings.telegram.enabled,

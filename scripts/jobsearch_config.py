@@ -124,6 +124,9 @@ class HHAcquisitionSettings:
     personal_consecutive_known_pages: int
     personal_max_pages: int
     personal_max_is_completion_boundary: bool
+    transient_error_tail_enabled: bool
+    transient_error_min_attempts: int
+    transient_error_max_tail_pages: int
 
 
 @dataclass(frozen=True)
@@ -725,6 +728,15 @@ def load_settings(code_root: Path, config_path: Path | None = None) -> Settings:
                     "personal_max_is_completion_boundary",
                     False,
                 ),
+                transient_error_tail_enabled=_boolean(
+                    hh_acquisition, "transient_error_tail_enabled", False
+                ),
+                transient_error_min_attempts=_integer(
+                    hh_acquisition, "transient_error_min_attempts", 5, 5
+                ),
+                transient_error_max_tail_pages=_integer(
+                    hh_acquisition, "transient_error_max_tail_pages", 1, 1
+                ),
             ),
         ),
         decision=DecisionSettings(
@@ -777,6 +789,8 @@ def load_settings(code_root: Path, config_path: Path | None = None) -> Settings:
         ("personal_minimum_stable_pages", acquisition.personal_minimum_stable_pages, 25),
         ("personal_consecutive_known_pages", acquisition.personal_consecutive_known_pages, 25),
         ("personal_max_pages", acquisition.personal_max_pages, 1_000),
+        ("transient_error_min_attempts", acquisition.transient_error_min_attempts, 20),
+        ("transient_error_max_tail_pages", acquisition.transient_error_max_tail_pages, 10),
     )
     for key, value, maximum in bounded_acquisition_limits:
         if value > maximum:
