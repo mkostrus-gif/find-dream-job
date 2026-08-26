@@ -191,7 +191,7 @@ def detail_capture(vacancy_id: int) -> dict[str, object]:
 
 def unavailable_detail_capture(vacancy_id: int) -> dict[str, object]:
     observed_url = (
-        "https://spb.hh.ru/article/32027?utm_source=hh_lead_gen"
+        "https://spb.hh.ru/article/910027?utm_source=hh_lead_gen"
         f"&utm_redirect_vacancy_id={vacancy_id}"
     )
     return {
@@ -3733,7 +3733,7 @@ class SafeIncrementalHHTests(unittest.TestCase):
 
     def test_45_same_origin_lead_gen_redirect_resolves_detail_without_fake_fields(self) -> None:
         run_id = "lead-gen-detail-unavailable"
-        vacancy_id = 135672541
+        vacancy_id = 910541
         lease, _ = self.begin(run_id)
         self.complete_inbound(run_id, lease)
         self.plan(run_id, lease)
@@ -3766,7 +3766,7 @@ class SafeIncrementalHHTests(unittest.TestCase):
         self.assertEqual(result["next_safe_action"]["action"], "finalize_stream")
         mismatched = unavailable_detail_capture(vacancy_id)
         mismatched["availability"]["observed_url"] = (
-            "https://spb.hh.ru/article/32027?utm_redirect_vacancy_id=999999999"
+            "https://spb.hh.ru/article/910027?utm_redirect_vacancy_id=999999999"
         )
         with self.assertRaisesRegex(ValueError, "same-origin HH lead-gen redirect"):
             hh.validate_detail_capture(

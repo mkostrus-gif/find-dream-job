@@ -75,12 +75,13 @@ It provides:
 - canonical external-ID plus persisted repost aliases, conservative
   semantic-repost deduplication, and source/evaluation history;
 - deterministic HH query plans and fail-closed stream/page/lazy-load coverage;
-- безопасное инкрементальное получение вакансий HH в схеме v10: версионированный
+- безопасное инкрементальное получение вакансий HH в схемах v10–v11: версионированный
   DOM-адаптер только для чтения, режимы `full`, `shadow`, `delta`, `resume` и
   `audit`, observer- или timer-based доказательство стабильности видимого DOM
   в авторизованном встроенном браузере Codex, программная сверка канонических
   ID и псевдонимов в SQLite, отдельные персональные рекомендации, ограниченная
-  очередь деталей и периодические полные аудиты;
+  очередь деталей, периодические полные аудиты и выключенное по умолчанию
+  доказательное восстановление точного повторяющегося transient-хвоста;
 - configurable public Telegram channels with a per-channel 30-day first
   backfill, success-gated post cursors, incremental daily deltas, and
   fail-closed post/ingest reconciliation;
@@ -230,6 +231,9 @@ next-hh-work              Показать точное безопасное п�
 finalize-hh-stream        Завершить обычный поток HH по манифесту v2
 finalize-hh-personal-recommendations Завершить отдельный персональный источник
 inspect-hh-checkpoint     Показать курсор и доказательства shadow/audit
+record-hh-transient-error Сохранить независимую попытку точной хвостовой ошибки
+record-hh-rollover-page   Сохранить страницу полной новой HH-сессии от page 0
+resolve-hh-recovery       Зафиксировать точное проверенное решение восстановления
 invalidate-hh-zero-evidence-plan Перепланировать только пустой frozen HH-план
 invalidate-hh-checkpoint  Явно отключить небезопасный инкрементальный курсор
 ingest-json FILE          Import structured vacancy/evaluation rows
