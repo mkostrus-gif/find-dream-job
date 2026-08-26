@@ -848,8 +848,9 @@ def vacancy_external_id(channel: str, url: str, title: str, company: str) -> str
     # This is a compatibility-stable record identifier, not a password,
     # credential, signature, or other security boundary. Existing workspaces
     # persist this exact digest, so changing algorithms would break identity.
-    digest = hashlib.sha1(  # lgtm[py/weak-sensitive-data-hashing]
-        basis.encode("utf-8"), usedforsecurity=False
+    digest = hashlib.sha1(
+        basis.encode("utf-8"),  # lgtm[py/weak-sensitive-data-hashing]
+        usedforsecurity=False,
     ).hexdigest()[:16]
     return f"{channel}:{digest}"
 
