@@ -11,15 +11,15 @@ import {
 test("same-origin HH lead-gen redirect closes the exact vacancy as unavailable", async () => {
   const capture = await captureDetailFixture({
     baseUrl:
-      "https://spb.hh.ru/article/32027?utm_source=hh_lead_gen&utm_redirect_vacancy_id=135672541#apply",
+      "https://spb.hh.ru/article/910027?utm_source=hh_lead_gen&utm_redirect_vacancy_id=910541#apply",
   });
-  assert.equal(capture.vacancy_id, "135672541");
-  assert.equal(capture.canonical_url, "https://spb.hh.ru/vacancy/135672541");
+  assert.equal(capture.vacancy_id, "910541");
+  assert.equal(capture.canonical_url, "https://spb.hh.ru/vacancy/910541");
   assert.equal(capture.availability.state, "unavailable");
   assert.equal(capture.availability.reason, "same_origin_lead_gen_redirect");
   assert.equal(
     capture.availability.observed_url,
-    "https://spb.hh.ru/article/32027?utm_source=hh_lead_gen&utm_redirect_vacancy_id=135672541"
+    "https://spb.hh.ru/article/910027?utm_source=hh_lead_gen&utm_redirect_vacancy_id=910541"
   );
   assert.equal(capture.blocker.type, "none");
   assert.equal(capture.loader.active, false);
@@ -30,14 +30,14 @@ test("lead-gen redirect identity remains fail closed for another host or ID", as
   await assert.rejects(
     captureDetailFixture({
       baseUrl:
-        "https://example.test/article/32027?utm_redirect_vacancy_id=135672541",
+        "https://example.test/article/910027?utm_redirect_vacancy_id=910541",
     }),
     /visible URL does not contain a confirmed vacancy identity/
   );
   await assert.rejects(
     captureDetailFixture({
       baseUrl:
-        "https://spb.hh.ru/article/32027?utm_redirect_vacancy_id=not-a-number",
+        "https://spb.hh.ru/article/910027?utm_redirect_vacancy_id=not-a-number",
     }),
     /visible URL does not contain a confirmed vacancy identity/
   );
@@ -46,9 +46,9 @@ test("lead-gen redirect identity remains fail closed for another host or ID", as
 test("same-origin HH vrsurvey redirect closes only its exact vacancy", async () => {
   const capture = await captureDetailFixture({
     baseUrl:
-      "https://spb.hh.ru/vrsurvey/inter_rao_elektroslesar?utm_source=hh_lead_gen&utm_redirect_vacancy_id=136301729",
+      "https://spb.hh.ru/vrsurvey/synthetic_role_survey?utm_source=hh_lead_gen&utm_redirect_vacancy_id=910729",
   });
-  assert.equal(capture.vacancy_id, "136301729");
+  assert.equal(capture.vacancy_id, "910729");
   assert.equal(capture.availability.state, "unavailable");
   assert.equal(capture.availability.reason, "same_origin_lead_gen_redirect");
 });
