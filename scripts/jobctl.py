@@ -102,6 +102,8 @@ create_durable_daily_run = _lazy_daily_run("create_run")
 ensure_v9_schema = _lazy_daily_run("ensure_v9_schema")
 ensure_v10_schema = _lazy_hh_acquisition("ensure_v10_schema")
 schema_v10_contract_issues = _lazy_hh_acquisition("schema_v10_issues")
+ensure_v11_schema = _lazy_hh_acquisition("ensure_v11_schema")
+schema_v11_contract_issues = _lazy_hh_acquisition("schema_v11_issues")
 enter_daily_run_finalizing = _lazy_daily_run("enter_finalizing")
 final_render_already_published = _lazy_daily_run("final_render_already_published")
 get_durable_daily_run = _lazy_daily_run("get_run")
@@ -123,7 +125,7 @@ start_daily_run_work = _lazy_daily_run("start_work")
 
 
 CODE_ROOT = Path(__file__).resolve().parents[1]
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 DEFAULT_LOCK_TIMEOUT_SECONDS = 30.0
 DEFAULT_DAILY_RUN_LEASE_SECONDS = 4 * 60 * 60
 MAX_DAILY_RUN_LEASE_SECONDS = 24 * 60 * 60
@@ -381,6 +383,10 @@ EXPECTED_TABLES = {
     "hh_vacancy_snapshots",
     "hh_detail_queue",
     "hh_incremental_events",
+    "hh_capture_audit_decisions",
+    "hh_transient_error_attempts",
+    "hh_stream_recovery_resolutions",
+    "hh_session_rollover_pages",
     "migration_log",
     "outreach_messages",
     "policy_versions",
@@ -418,6 +424,10 @@ EXPECTED_INDEXES = {
     "idx_hh_page_items_external",
     "idx_hh_detail_queue_state",
     "idx_hh_incremental_events_lookup",
+    "idx_hh_capture_audit_decisions_lookup",
+    "idx_hh_transient_error_attempts_lookup",
+    "idx_hh_stream_recovery_resolutions_lookup",
+    "idx_hh_session_rollover_pages_lookup",
     "idx_employer_account_signals_account",
     "idx_employer_interaction_invalidations_vacancy",
     "idx_employer_interactions_identity",
@@ -1872,6 +1882,11 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             raise RuntimeError(
                 "Нарушен контракт схемы базы данных v10: " + "; ".join(v10_issues)
             )
+        v11_issues = schema_v11_contract_issues(conn)
+        if v11_issues:
+            raise RuntimeError(
+                "Нарушен контракт схемы базы данных v11: " + "; ".join(v11_issues)
+            )
 
 
 def reset_schema(conn: sqlite3.Connection) -> None:
@@ -1880,6 +1895,10 @@ def reset_schema(conn: sqlite3.Connection) -> None:
         DROP VIEW IF EXISTS effective_applications;
         DROP VIEW IF EXISTS effective_employer_interactions;
         DROP TABLE IF EXISTS hh_incremental_events;
+        DROP TABLE IF EXISTS hh_session_rollover_pages;
+        DROP TABLE IF EXISTS hh_stream_recovery_resolutions;
+        DROP TABLE IF EXISTS hh_transient_error_attempts;
+        DROP TABLE IF EXISTS hh_capture_audit_decisions;
         DROP TABLE IF EXISTS hh_detail_queue;
         DROP TABLE IF EXISTS hh_vacancy_snapshots;
         DROP TABLE IF EXISTS hh_page_items;
@@ -2299,6 +2318,7 @@ def reset_schema(conn: sqlite3.Connection) -> None:
     ensure_v8_schema(conn)
     ensure_v9_schema(conn)
     ensure_v10_schema(conn)
+    ensure_v11_schema(conn)
     ensure_active_policy(conn)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
@@ -2586,6 +2606,7 @@ def ensure_auxiliary_schema(conn: sqlite3.Connection) -> None:
     ensure_v8_schema(conn)
     ensure_v9_schema(conn)
     ensure_v10_schema(conn)
+    ensure_v11_schema(conn)
     ensure_active_policy(conn)
     conn.commit()
 
@@ -5991,6 +6012,7 @@ def build_snapshot(
         for vacancy in vacancies
         if vacancy["latest_stage"] in {"interview_1", "interview_2", "interview_3"}
     )
+    hh_recovery_warnings = _hh_acquisition_api().recovery_warnings(conn)
 
     return {
         "generated_at": now_iso(),
@@ -6081,6 +6103,7 @@ def build_snapshot(
         "vacancy_factors": vacancy_factors,
         "interview_summaries": interview_summaries,
         "employer_contacts": employer_contacts,
+        "hh_recovery_warnings": hh_recovery_warnings,
         "vacancies": vacancies,
     }
 
@@ -7212,6 +7235,7 @@ def compact_dashboard_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
         ],
         "followups": snapshot["followups"][:DASHBOARD_VACANCY_LIMIT],
         "wip_queue": snapshot["wip_queue"],
+        "hh_recovery_warnings": snapshot.get("hh_recovery_warnings", []),
         "employer_accounts": [
             select_fields(item, account_fields)
             for item in snapshot["employer_accounts"][:200]
@@ -9088,6 +9112,7 @@ _SAFE_ACTION_LABELS = {
     "continue_stable_page_capture": "снять следующую устойчивую страницу",
     "capture_stable_page": "снять устойчивую страницу",
     "stream_complete": "поток завершён",
+    "resolve_transient_tail": "разрешить доказанный временно недоступный хвост",
 }
 
 
@@ -9106,6 +9131,10 @@ def daily_run_status_command(args: argparse.Namespace) -> None:
             verbose=bool(args.verbose),
             history_limit=int(args.history_limit),
         )
+        if status is not None:
+            status["hh_recovery_warnings"] = _hh_acquisition_api().recovery_warnings(
+                conn, run_id=str(status["run_id"])
+            )
     result = status or {"open_run": None, "message": "Незавершённый долговечный ежедневный запуск не найден."}
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -9127,6 +9156,13 @@ def daily_run_status_command(args: argparse.Namespace) -> None:
     )
     if status["configuration_drift"]:
         print("  конфигурация изменилась: требуется аудируемый refresh-daily-run-plan")
+    for warning in status.get("hh_recovery_warnings", []):
+        print(
+            "  предупреждение HH: "
+            f"{warning['strategy']}; последняя проверенная страница "
+            f"{warning['last_verified_page']}; пропущено "
+            f"{warning['missing_tail_pages']}; попыток {warning['retry_count']}."
+        )
     for item in status["next_safe_work"][:5]:
         suffix = f"/{item['item_key']}" if item["item_key"] else ""
         print(f"  дальше: {_safe_action_label(str(item['action']))} · {item['step_key']}{suffix}")
@@ -9922,6 +9958,95 @@ def record_hh_detail_command(args: argparse.Namespace) -> None:
     _daily_run_mutation_result(args, result)
 
 
+def record_hh_transient_error_command(args: argparse.Namespace) -> None:
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        run_id, _ = _require_exact_durable_lease(conn, args)
+        before = conn.total_changes
+        result = _hh_acquisition_api().record_transient_error_attempt(
+            conn,
+            SETTINGS,
+            run_id=run_id,
+            stream_key=args.stream_key,
+            page_index=int(args.page_index),
+            error_class=args.error_class,
+            visible_status_code=int(args.visible_status_code),
+            visible_message=args.visible_message,
+            observed_at=args.observed_at,
+            remote_evidence_reference=args.remote_evidence_reference,
+        )
+        integration = _p2_checkpoint_or_block(
+            conn,
+            run_id=run_id,
+            stream_key=args.stream_key,
+            result=result,
+        )
+        changed = conn.total_changes > before or bool(integration.get("changed"))
+        revision = (
+            commit_projection_write(conn)
+            if changed
+            else projection_state_data(conn)["dirty_revision"]
+        )
+    result["p1_integration"] = integration
+    result["projection_revision"] = revision
+    result["message"] = "Видимая transient-ошибка HH добавлена в append-only журнал."
+    _daily_run_mutation_result(args, result)
+
+
+def record_hh_rollover_page_command(args: argparse.Namespace) -> None:
+    payload = _load_workspace_json(args.capture, label="JSON-снимок новой сессии")
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        run_id, _ = _require_exact_durable_lease(conn, args)
+        before = conn.total_changes
+        result = _hh_acquisition_api().record_rollover_page(
+            conn,
+            SETTINGS,
+            run_id=run_id,
+            stream_key=args.stream_key,
+            payload=payload,
+        )
+        revision = (
+            commit_projection_write(conn)
+            if conn.total_changes > before
+            else projection_state_data(conn)["dirty_revision"]
+        )
+    result["projection_revision"] = revision
+    result["message"] = "Страница полной новой сессии сохранена отдельно; сессии не смешаны."
+    _daily_run_mutation_result(args, result)
+
+
+def resolve_hh_recovery_command(args: argparse.Namespace) -> None:
+    with connect_db(args.db) as conn:
+        ensure_schema(conn)
+        run_id, _ = _require_exact_durable_lease(conn, args)
+        before = conn.total_changes
+        result = _hh_acquisition_api().resolve_stream_recovery(
+            conn,
+            SETTINGS,
+            run_id=run_id,
+            stream_key=args.stream_key,
+            strategy=args.strategy,
+            reason=args.reason,
+        )
+        integration = _p2_checkpoint_or_block(
+            conn,
+            run_id=run_id,
+            stream_key=args.stream_key,
+            result={"idempotent": bool(result.get("idempotent"))},
+        )
+        changed = conn.total_changes > before or bool(integration.get("changed"))
+        revision = (
+            commit_projection_write(conn)
+            if changed
+            else projection_state_data(conn)["dirty_revision"]
+        )
+    result["p1_integration"] = integration
+    result["projection_revision"] = revision
+    result["message"] = "Точное решение восстановления HH сохранено и поток готов к завершению."
+    _daily_run_mutation_result(args, result)
+
+
 def _finalize_hh_acquisition(args: argparse.Namespace, *, personal: bool) -> None:
     with connect_db(args.db) as conn:
         ensure_schema(conn)
@@ -9947,6 +10072,30 @@ def _finalize_hh_acquisition(args: argparse.Namespace, *, personal: bool) -> Non
             stream_key=args.stream_key,
             source_kind=expected,
         )
+        target_row = conn.execute(
+            """
+            SELECT state FROM daily_run_work_items
+            WHERE run_id = ? AND step_key = ? AND item_key = ?
+            """,
+            (run_id, target["step_key"], target["item_key"]),
+        ).fetchone()
+        if (
+            bool(result.get("idempotent"))
+            and target_row is not None
+            and str(target_row["state"]) == "invalidated"
+        ):
+            prior_manifest = dict(result["manifest"])
+            result["manifest"] = {
+                **prior_manifest,
+                "observed_at": now_iso(),
+                "revalidation": {
+                    "reason": "p1_plan_refresh",
+                    "prior_manifest_hash": _hh_acquisition_api().payload_hash(
+                        prior_manifest
+                    ),
+                },
+            }
+            result["p1_revalidated"] = True
         if result.get("audit_failure"):
             changed = block_daily_run_work(
                 conn,
@@ -10121,7 +10270,7 @@ def migrate_schema(args: argparse.Namespace) -> None:
             "employer_accounts",
             "source_checkpoints",
         )
-        if current_version in {8, 9}:
+        if current_version in {8, 9, 10}:
             preserved_tables += (
                 "lifecycle_events",
                 "action_events",
@@ -10139,6 +10288,17 @@ def migrate_schema(args: argparse.Namespace) -> None:
                 "daily_run_work_items",
                 "daily_run_manifests",
                 "daily_run_transitions",
+            )
+        if current_version == 10:
+            preserved_tables += (
+                "hh_stream_checkpoints",
+                "hh_stream_checkpoint_history",
+                "hh_stream_runs",
+                "hh_page_captures",
+                "hh_page_items",
+                "hh_vacancy_snapshots",
+                "hh_detail_queue",
+                "hh_incremental_events",
             )
         present_before = {
             str(row[0])
@@ -10180,6 +10340,10 @@ def migrate_schema(args: argparse.Namespace) -> None:
                     db_label(backup_path) if backup_path else "",
                     json.dumps(row_counts_before, ensure_ascii=False, sort_keys=True),
                     (
+                        "Добавлены append-only попытки и решения восстановления transient-хвоста HH схемы v11; "
+                        "все P2-доказательства схемы v10 сохранены без переписывания."
+                        if current_version == 10
+                        else
                         "Добавлен безопасный инкрементальный контур HH P2 схемы v10; "
                         "доказательства P0/P1 и опубликованные поколения проекций сохранены "
                         "без переписывания."
@@ -13447,6 +13611,31 @@ def operational_doctor(args: argparse.Namespace) -> None:
                     blocks_closeout=True,
                     technical=True,
                 )
+                recovery_warnings = _hh_acquisition_api().recovery_warnings(
+                    conn,
+                    run_id=clean_cell(getattr(args, "run_id", "")) or None,
+                )
+                degraded = [
+                    item
+                    for item in recovery_warnings
+                    if item["strategy"] == "accepted_unavailable_tail"
+                ]
+                add(
+                    "hh_transient_tail_recovery",
+                    "warn" if degraded else "pass",
+                    (
+                        "Завершение содержит ограниченное исключение HH: "
+                        + "; ".join(
+                            f"{item['stream_key']}: last={item['last_verified_page']}, "
+                            f"missing={item['missing_tail_pages']}, retries={item['retry_count']}, "
+                            f"class={item['error_class']}"
+                            for item in degraded
+                        )
+                    )
+                    if degraded
+                    else "Ограниченных исключений недоступного хвоста HH нет.",
+                    blocks_closeout=False,
+                )
 
                 orphan_applications = int(
                     conn.execute(
@@ -14220,6 +14409,40 @@ def build_parser() -> argparse.ArgumentParser:
     hh_detail_parser.add_argument("--capture", type=Path, required=True)
     hh_detail_parser.set_defaults(func=record_hh_detail_command)
 
+    hh_transient_parser = sub.add_parser(
+        "record-hh-transient-error",
+        help="Добавить независимое видимое доказательство временной 502 на точной хвостовой странице",
+    )
+    add_hh_run_stream_target(hh_transient_parser)
+    hh_transient_parser.add_argument("--page-index", type=int, required=True)
+    hh_transient_parser.add_argument("--error-class", required=True)
+    hh_transient_parser.add_argument("--visible-status-code", type=int, required=True)
+    hh_transient_parser.add_argument("--visible-message", required=True)
+    hh_transient_parser.add_argument("--observed-at", required=True)
+    hh_transient_parser.add_argument("--remote-evidence-reference", required=True)
+    hh_transient_parser.set_defaults(func=record_hh_transient_error_command)
+
+    hh_rollover_parser = sub.add_parser(
+        "record-hh-rollover-page",
+        help="Сохранить страницу полной повторной выборки в отдельной новой сессии",
+    )
+    add_hh_run_stream_target(hh_rollover_parser)
+    hh_rollover_parser.add_argument("--capture", type=Path, required=True)
+    hh_rollover_parser.set_defaults(func=record_hh_rollover_page_command)
+
+    hh_recovery_parser = sub.add_parser(
+        "resolve-hh-recovery",
+        help="Аудируемо разрешить доказанный хвост 502 или полную повторную выборку одной сессии",
+    )
+    add_hh_run_stream_target(hh_recovery_parser)
+    hh_recovery_parser.add_argument(
+        "--strategy",
+        choices=("accepted_unavailable_tail", "full_session_rollover"),
+        required=True,
+    )
+    hh_recovery_parser.add_argument("--reason", required=True)
+    hh_recovery_parser.set_defaults(func=resolve_hh_recovery_command)
+
     hh_next_parser = sub.add_parser(
         "next-hh-work",
         help="Показать следующий безопасный шаг сбора, детализации или завершения HH",
@@ -14852,6 +15075,9 @@ def mutating_command_functions() -> set[Any]:
         plan_hh_acquisition_command,
         record_hh_page_command,
         record_hh_detail_command,
+        record_hh_transient_error_command,
+        record_hh_rollover_page_command,
+        resolve_hh_recovery_command,
         finalize_hh_stream_command,
         finalize_hh_personal_command,
         invalidate_hh_zero_evidence_plan_command,

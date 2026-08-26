@@ -193,7 +193,7 @@ authorized scope.
   отдельное приватное JSON-описание запроса. Обычный поток рекомендаций не
   закрывает независимый шаг `personal_recommendations`. Старые
   `build-coverage-plan` и манифест v1 остаются совместимыми, но стандартный
-  запуск схемы v10 сначала фиксирует точный план P2:
+  запуск схемы v11 сначала фиксирует точный план P2:
 
   ```bash
   python3 scripts/jobctl.py plan-hh-acquisition \
@@ -248,6 +248,15 @@ authorized scope.
   Проверьте append-only
   события `zero_evidence_plan_invalidated` и `zero_evidence_plan_replanned`
   через `inspect-hh-checkpoint`, затем продолжайте обычным `record-hh-page`.
+- Если ровно следующая хвостовая страница персональных рекомендаций не менее
+  пяти раз независимо показала видимую 502, используйте только включённую в
+  конфигурации узкую политику: `record-hh-transient-error`, затем
+  `resolve-hh-recovery --strategy accepted_unavailable_tail`. Средняя или
+  пропущенная ранняя страница, другая блокировка, query/config/source/stream
+  mismatch и незакрытая detail-очередь обязаны завершиться отказом. Снимок
+  другой сессии остаётся audit-only. Если выбран `full_session_rollover`,
+  сначала переснимите одной новой сессией все страницы от 0 до доказанного
+  конца через `record-hh-rollover-page`; страницы разных сессий не смешивайте.
 - Для semantic title рекламной карточки с точным redirect `adsrv.hh.ru/click`
   принимайте identity только из единственного числового `vacancyId` в видимом
   same-origin response URL той же карточки. Не переходите по redirect и не

@@ -19,6 +19,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import daily_run_orchestration as orchestration  # noqa: E402
 import hh_acquisition as hh  # noqa: E402
+import jobctl  # noqa: E402
 from jobsearch_config import load_settings  # noqa: E402
 
 
@@ -545,6 +546,128 @@ class SafeIncrementalHHTests(unittest.TestCase):
             check=check,
         )
 
+    def record_transient_attempt(
+        self,
+        run_id: str,
+        lease: str,
+        *,
+        stream: str,
+        page_index: int,
+        attempt: int,
+        error_class: str = "hh_http_502",
+        status_code: int = 502,
+        check: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        return self.run_cli(
+            "record-hh-transient-error",
+            "--run-id",
+            run_id,
+            "--stream-key",
+            stream,
+            "--page-index",
+            str(page_index),
+            "--error-class",
+            error_class,
+            "--visible-status-code",
+            str(status_code),
+            "--visible-message",
+            "Page temporarily unavailable",
+            "--observed-at",
+            f"2026-08-18T14:{attempt:02d}:00Z",
+            "--remote-evidence-reference",
+            f"synthetic-visible-502-{run_id}-{attempt}",
+            "--defer-render",
+            "--run-lease",
+            lease,
+            "--json",
+            check=check,
+        )
+
+    def record_rollover_page(
+        self,
+        run_id: str,
+        lease: str,
+        payload: dict[str, object],
+        *,
+        stream: str,
+        check: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        path = self.write_json(
+            f"{run_id}-{stream}-rollover-{payload['page_index']}-{payload['captured_at'].replace(':', '')}.json",
+            payload,
+        )
+        return self.run_cli(
+            "record-hh-rollover-page",
+            "--run-id",
+            run_id,
+            "--stream-key",
+            stream,
+            "--capture",
+            str(path),
+            "--defer-render",
+            "--run-lease",
+            lease,
+            "--json",
+            check=check,
+        )
+
+    def prepare_transient_tail(
+        self,
+        run_id: str,
+        *,
+        total_pages: int = 3,
+        include_mismatched_tail: bool = True,
+    ) -> tuple[str, str, list[int]]:
+        stream = f"synthetic_personal_{run_id[-8:]}"
+        self.enable_personal(stream)
+        self.set_acquisition(
+            personal_initial_depth_pages=total_pages,
+            personal_max_pages=total_pages,
+            personal_max_is_completion_boundary=True,
+            transient_error_tail_enabled=True,
+        )
+        vacancy_ids = list(range(820000, 820000 + total_pages))
+        self.seed_known(vacancy_ids)
+        lease, _ = self.begin(run_id)
+        self.complete_inbound(run_id, lease)
+        self.plan(
+            run_id,
+            lease,
+            stream=stream,
+            source_kind="personal_recommendations",
+        )
+        for page_index, vacancy_id in enumerate(vacancy_ids[:-1]):
+            self.record_page(
+                run_id,
+                lease,
+                page_capture(
+                    [card(vacancy_id)],
+                    page_index=page_index,
+                    source_kind="personal_recommendations",
+                    captured_at=f"2026-08-18T12:{page_index:02d}:00Z",
+                    has_next=True,
+                    session_state="exposed",
+                    session_value=SESSION_A,
+                ),
+                stream=stream,
+            )
+        if include_mismatched_tail:
+            self.record_page(
+                run_id,
+                lease,
+                page_capture(
+                    [card(vacancy_ids[-1])],
+                    page_index=total_pages - 1,
+                    source_kind="personal_recommendations",
+                    captured_at="2026-08-18T13:00:00Z",
+                    has_next=False,
+                    session_state="exposed",
+                    session_value=SESSION_B,
+                ),
+                stream=stream,
+            )
+        return lease, stream, vacancy_ids
+
     def seed_known(self, vacancy_ids: list[int], *, title: str = "Synthetic Product Role") -> None:
         with self.connect() as conn:
             timestamp = "2026-08-01T09:00:00"
@@ -709,14 +832,14 @@ class SafeIncrementalHHTests(unittest.TestCase):
                 """
             )
         migrated = json.loads(self.run_cli("migrate-schema", "--defer-render", "--json").stdout)
-        self.assertEqual((migrated["from_version"], migrated["to_version"]), (9, 10))
+        self.assertEqual((migrated["from_version"], migrated["to_version"]), (9, 11))
         self.assertTrue(migrated["backup"])
         backup = self.workspace / migrated["backup"]
         self.assertTrue(backup.is_file())
         with sqlite3.connect(backup) as old:
             self.assertEqual(old.execute("PRAGMA user_version").fetchone()[0], 9)
         with self.connect() as conn:
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 10)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 11)
             self.assertEqual(
                 {
                     table: int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
@@ -1523,6 +1646,80 @@ class SafeIncrementalHHTests(unittest.TestCase):
                     "SELECT COUNT(*) FROM hh_stream_checkpoints WHERE stream_key='stream_beta'"
                 ).fetchone()[0],
                 0,
+            )
+
+    def test_22d_completed_stream_can_revalidate_invalidated_p1_item(self) -> None:
+        lease, _ = self.begin("completed-stream-revalidation")
+        self.complete_inbound("completed-stream-revalidation", lease)
+        self.plan("completed-stream-revalidation", lease)
+        self.record_page(
+            "completed-stream-revalidation",
+            lease,
+            page_capture([card(761900)], has_next=False),
+        )
+        self.complete_new_details("completed-stream-revalidation", lease)
+        first = json.loads(
+            self.finalize_stream("completed-stream-revalidation", lease).stdout
+        )
+        self.assertTrue(first["completed"])
+
+        with self.connect() as conn:
+            old_manifest_hash = conn.execute(
+                """
+                SELECT manifest_hash FROM daily_run_work_items
+                WHERE run_id = ? AND step_key = 'hh_coverage'
+                """,
+                ("completed-stream-revalidation",),
+            ).fetchone()[0]
+
+        self.set_acquisition(transient_error_tail_enabled=True)
+        self.run_cli(
+            "refresh-daily-run-plan",
+            "--run-id",
+            "completed-stream-revalidation",
+            "--reason",
+            "synthetic recovery configuration refresh",
+            "--defer-render",
+            "--run-lease",
+            lease,
+            "--json",
+        )
+        with self.connect() as conn:
+            invalidated = conn.execute(
+                """
+                SELECT state FROM daily_run_work_items
+                WHERE run_id = ? AND step_key = 'hh_coverage'
+                """,
+                ("completed-stream-revalidation",),
+            ).fetchone()[0]
+            self.assertEqual(invalidated, "invalidated")
+
+        second = json.loads(
+            self.finalize_stream("completed-stream-revalidation", lease).stdout
+        )
+        self.assertTrue(second["idempotent"])
+        self.assertTrue(second["p1_revalidated"])
+        self.assertTrue(second["p1_integration"]["changed"])
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT state, manifest_hash FROM daily_run_work_items
+                WHERE run_id = ? AND step_key = 'hh_coverage'
+                """,
+                ("completed-stream-revalidation",),
+            ).fetchone()
+            self.assertEqual(row["state"], "completed")
+            self.assertNotEqual(row["manifest_hash"], old_manifest_hash)
+            manifest = conn.execute(
+                """
+                SELECT payload_json FROM daily_run_manifests
+                WHERE payload_hash = ?
+                """,
+                (row["manifest_hash"],),
+            ).fetchone()
+            self.assertEqual(
+                json.loads(str(manifest["payload_json"]))["revalidation"]["reason"],
+                "p1_plan_refresh",
             )
 
     def test_23_personal_recommendations_are_a_separate_p1_source(self) -> None:
@@ -3600,3 +3797,713 @@ class SafeIncrementalHHTests(unittest.TestCase):
             ).fetchone()
             self.assertEqual(tuple(snapshot), ("list", None))
         self.finalize_stream(run_id, lease)
+
+    def test_46_repeated_visible_502_tail_can_recover_without_mixing_sessions(self) -> None:
+        run_id = "personal-transient-tail-recovery"
+        stream = "synthetic_personal"
+        self.enable_personal(stream)
+        self.set_acquisition(
+            personal_initial_depth_pages=19,
+            personal_max_pages=19,
+            personal_max_is_completion_boundary=True,
+            transient_error_tail_enabled=True,
+        )
+        vacancy_ids = list(range(810000, 810019))
+        self.seed_known(vacancy_ids)
+        lease, _ = self.begin(run_id)
+        self.complete_inbound(run_id, lease)
+        self.plan(
+            run_id,
+            lease,
+            stream=stream,
+            source_kind="personal_recommendations",
+        )
+        for page_index, vacancy_id in enumerate(vacancy_ids[:18]):
+            self.record_page(
+                run_id,
+                lease,
+                page_capture(
+                    [card(vacancy_id)],
+                    page_index=page_index,
+                    source_kind="personal_recommendations",
+                    captured_at=f"2026-08-18T12:{page_index:02d}:00Z",
+                    has_next=True,
+                    session_state="exposed",
+                    session_value=SESSION_A,
+                ),
+                stream=stream,
+            )
+        _, changed = self.record_page(
+            run_id,
+            lease,
+            page_capture(
+                [card(vacancy_ids[18])],
+                page_index=18,
+                source_kind="personal_recommendations",
+                captured_at="2026-08-18T13:00:00Z",
+                has_next=False,
+                session_state="exposed",
+                session_value=SESSION_B,
+            ),
+            stream=stream,
+        )
+        self.assertEqual(changed["next_safe_action"]["code"], "session_identity_changed")
+        for attempt in range(5):
+            self.run_cli(
+                "record-hh-transient-error",
+                "--run-id",
+                run_id,
+                "--stream-key",
+                stream,
+                "--page-index",
+                "18",
+                "--error-class",
+                "hh_http_502",
+                "--visible-status-code",
+                "502",
+                "--visible-message",
+                "Page temporarily unavailable",
+                "--observed-at",
+                f"2026-08-18T13:0{attempt}:00Z",
+                "--remote-evidence-reference",
+                f"synthetic-visible-502-{attempt}",
+                "--defer-render",
+                "--run-lease",
+                lease,
+                "--json",
+            )
+        resolved = json.loads(
+            self.run_cli(
+                "resolve-hh-recovery",
+                "--run-id",
+                run_id,
+                "--stream-key",
+                stream,
+                "--strategy",
+                "accepted_unavailable_tail",
+                "--reason",
+                "five independently observed synthetic visible 502 pages",
+                "--defer-render",
+                "--run-lease",
+                lease,
+                "--json",
+            ).stdout
+        )
+        self.assertEqual(resolved["resolution"]["strategy"], "accepted_unavailable_tail")
+        self.assertEqual(resolved["resolution"]["retry_count"], 5)
+        finalized = json.loads(
+            self.finalize_stream(run_id, lease, stream=stream, personal=True).stdout
+        )
+        self.assertTrue(finalized["completed"])
+        with self.connect() as conn:
+            capture = conn.execute(
+                """
+                SELECT verified FROM hh_page_captures
+                WHERE run_id = ? AND stream_key = ? AND page_index = 18
+                """,
+                (run_id, stream),
+            ).fetchone()
+            self.assertEqual(int(capture["verified"]), 0)
+            audit_count = conn.execute(
+                """
+                SELECT COUNT(*) FROM hh_capture_audit_decisions
+                WHERE run_id = ? AND stream_key = ? AND decision = 'audit_only'
+                """,
+                (run_id, stream),
+            ).fetchone()[0]
+            self.assertEqual(audit_count, 1)
+            manifest = json.loads(
+                conn.execute(
+                    """
+                    SELECT completion_manifest_json FROM hh_stream_runs
+                    WHERE run_id = ? AND stream_key = ?
+                    """,
+                    (run_id, stream),
+                ).fetchone()[0]
+            )
+            self.assertEqual(manifest["stop_reason"], "transient_error_tail_exception")
+            self.assertEqual(
+                manifest["degraded_completion"]["missing_tail_pages"], [18]
+            )
+
+    def test_47_four_transient_attempts_remain_blocked(self) -> None:
+        run_id = "transient-four-attempts"
+        lease, stream, _ = self.prepare_transient_tail(run_id)
+        latest: dict[str, object] = {}
+        for attempt in range(4):
+            latest = json.loads(
+                self.record_transient_attempt(
+                    run_id,
+                    lease,
+                    stream=stream,
+                    page_index=2,
+                    attempt=attempt,
+                ).stdout
+            )
+        self.assertEqual(latest["retry_count"], 4)
+        self.assertFalse(latest["resolution_available"])
+        failed = self.run_cli(
+            "resolve-hh-recovery",
+            "--run-id",
+            run_id,
+            "--stream-key",
+            stream,
+            "--strategy",
+            "accepted_unavailable_tail",
+            "--reason",
+            "only four attempts",
+            "--defer-render",
+            "--run-lease",
+            lease,
+            "--json",
+            check=False,
+        )
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("Недостаточно", failed.stderr)
+
+    def test_48_fifth_attempt_makes_exact_resolution_available(self) -> None:
+        run_id = "transient-fifth-attempt"
+        lease, stream, _ = self.prepare_transient_tail(run_id)
+        latest: dict[str, object] = {}
+        for attempt in range(5):
+            latest = json.loads(
+                self.record_transient_attempt(
+                    run_id,
+                    lease,
+                    stream=stream,
+                    page_index=2,
+                    attempt=attempt,
+                ).stdout
+            )
+        self.assertTrue(latest["resolution_available"])
+        inspected = json.loads(
+            self.run_cli(
+                "inspect-hh-checkpoint",
+                "--run-id",
+                run_id,
+                "--stream-key",
+                stream,
+                "--json",
+            ).stdout
+        )
+        self.assertEqual(len(inspected["transient_error_attempts"]), 5)
+
+    def test_49_middle_page_transient_error_is_rejected(self) -> None:
+        run_id = "transient-middle-page"
+        lease, stream, _ = self.prepare_transient_tail(run_id)
+        failed = self.record_transient_attempt(
+            run_id,
+            lease,
+            stream=stream,
+            page_index=1,
+            attempt=0,
+            check=False,
+        )
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("ровно к следующей странице 2", failed.stderr)
+
+    def test_50_missing_earlier_page_blocks_tail_resolution(self) -> None:
+        run_id = "transient-missing-earlier"
+        lease, stream, _ = self.prepare_transient_tail(run_id)
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE hh_page_captures SET verified = 0
+                WHERE run_id = ? AND stream_key = ? AND page_index = 0
+                """,
+                (run_id, stream),
+            )
+        for attempt in range(5):
+            self.record_transient_attempt(
+                run_id,
+                lease,
+                stream=stream,
+                page_index=2,
+                attempt=attempt,
+            )
+        failed = self.run_cli(
+            "resolve-hh-recovery",
+            "--run-id",
+            run_id,
+            "--stream-key",
+            stream,
+            "--strategy",
+            "accepted_unavailable_tail",
+            "--reason",
+            "synthetic missing earlier page",
+            "--defer-render",
+            "--run-lease",
+            lease,
+            "--json",
+            check=False,
+        )
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("Проверенные страницы должны образовывать непрерывный диапазон", failed.stderr)
+
+    def test_51_login_captcha_access_denied_and_malformed_errors_are_rejected(self) -> None:
+        run_id = "transient-unsupported-errors"
+        lease, stream, _ = self.prepare_transient_tail(run_id)
+        for attempt, error_class in enumerate(
+            ("login", "captcha", "access_denied", "malformed_content")
+        ):
+            failed = self.record_transient_attempt(
+                run_id,
+                lease,
+                stream=stream,
+                page_index=2,
+                attempt=attempt,
+                error_class=error_class,
+                check=False,
+            )
+            self.assertNotEqual(failed.returncode, 0)
+        wrong_status = self.record_transient_attempt(
+            run_id,
+            lease,
+            stream=stream,
+            page_index=2,
+            attempt=9,
+            status_code=503,
+            check=False,
+        )
+        self.assertNotEqual(wrong_status.returncode, 0)
+        with self.connect() as conn:
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM hh_transient_error_attempts WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()[0],
+                0,
+            )
+
+    def test_52_mismatched_query_configuration_source_and_stream_are_rejected(self) -> None:
+        run_id = "transient-identity-mismatch"
+        lease, stream, _ = self.prepare_transient_tail(run_id)
+        missing_stream = self.record_transient_attempt(
+            run_id,
+            lease,
+            stream="missing_stream",
+            page_index=2,
+            attempt=0,
+            check=False,
+        )
+        self.assertNotEqual(missing_stream.returncode, 0)
+        self.plan(run_id, lease, stream="stream_alpha", source_kind="ordinary_search")
+        wrong_source = self.record_transient_attempt(
+            run_id,
+            lease,
+            stream="stream_alpha",
+            page_index=0,
+            attempt=1,
+            check=False,
+        )
+        self.assertNotEqual(wrong_source.returncode, 0)
+        with self.connect() as conn:
+            for attempt in range(5):
+                identity = f"tampered-{attempt}"
+                conn.execute(
+                    """
+                    INSERT INTO hh_transient_error_attempts (
+                        run_id, source, stream_key, source_kind, page_index,
+                        query_fingerprint, configuration_fingerprint, error_class,
+                        visible_status_code, visible_message_hash, observed_at,
+                        remote_evidence_reference, attempt_hash, created_at
+                    ) VALUES (?, 'hh', ?, 'personal_recommendations', 2, ?, ?,
+                              'hh_http_502', 502, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        run_id,
+                        stream,
+                        "0" * 64,
+                        "1" * 64,
+                        "2" * 64,
+                        f"2026-08-18T15:0{attempt}:00Z",
+                        identity,
+                        hh.sha256_text(identity),
+                        "2026-08-18T15:10:00+00:00",
+                    ),
+                )
+        failed = self.run_cli(
+            "resolve-hh-recovery",
+            "--run-id",
+            run_id,
+            "--stream-key",
+            stream,
+            "--strategy",
+            "accepted_unavailable_tail",
+            "--reason",
+            "tampered attempt identities",
+            "--defer-render",
+            "--run-lease",
+            lease,
+            "--json",
+            check=False,
+        )
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("Недостаточно", failed.stderr)
+
+    def test_53_unresolved_detail_queue_blocks_tail_resolution(self) -> None:
+        run_id = "transient-detail-blocker"
+        lease, stream, _ = self.prepare_transient_tail(run_id)
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO hh_detail_queue (
+                    run_id, source, stream_key, external_id, vacancy_id,
+                    canonical_url, reason, first_page, last_page,
+                    material_fingerprint, state, created_at, updated_at
+                ) VALUES (?, 'hh', ?, 'hh:999999', NULL,
+                          'https://example.test/vacancy/999999', 'new', 0, 0,
+                          ?, 'pending', ?, ?)
+                """,
+                (run_id, stream, "a" * 64, hh.now_iso(), hh.now_iso()),
+            )
+        for attempt in range(5):
+            self.record_transient_attempt(
+                run_id,
+                lease,
+                stream=stream,
+                page_index=2,
+                attempt=attempt,
+            )
+        failed = self.run_cli(
+            "resolve-hh-recovery",
+            "--run-id",
+            run_id,
+            "--stream-key",
+            stream,
+            "--strategy",
+            "accepted_unavailable_tail",
+            "--reason",
+            "pending detail must block",
+            "--defer-render",
+            "--run-lease",
+            lease,
+            "--json",
+            check=False,
+        )
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("detail", failed.stderr)
+
+    def test_54_full_session_rollover_from_page_zero_succeeds_without_mixing(self) -> None:
+        run_id = "transient-full-rollover"
+        lease, stream, vacancy_ids = self.prepare_transient_tail(run_id)
+        for page_index, vacancy_id in enumerate(vacancy_ids):
+            self.record_rollover_page(
+                run_id,
+                lease,
+                page_capture(
+                    [card(vacancy_id)],
+                    page_index=page_index,
+                    source_kind="personal_recommendations",
+                    captured_at=f"2026-08-18T16:{page_index:02d}:00Z",
+                    has_next=page_index < len(vacancy_ids) - 1,
+                    session_state="exposed",
+                    session_value=SESSION_B,
+                ),
+                stream=stream,
+            )
+        resolved = json.loads(
+            self.run_cli(
+                "resolve-hh-recovery",
+                "--run-id",
+                run_id,
+                "--stream-key",
+                stream,
+                "--strategy",
+                "full_session_rollover",
+                "--reason",
+                "complete synthetic Session B recapture from page zero",
+                "--defer-render",
+                "--run-lease",
+                lease,
+                "--json",
+            ).stdout
+        )
+        self.assertEqual(resolved["resolution"]["strategy"], "full_session_rollover")
+        self.finalize_stream(run_id, lease, stream=stream, personal=True)
+        with self.connect() as conn:
+            verified = conn.execute(
+                """
+                SELECT page_index, session_fingerprint FROM hh_page_captures
+                WHERE run_id = ? AND stream_key = ? AND verified = 1
+                ORDER BY page_index
+                """,
+                (run_id, stream),
+            ).fetchall()
+            self.assertEqual([int(row["page_index"]) for row in verified], [0, 1, 2])
+            self.assertEqual(len({str(row["session_fingerprint"]) for row in verified}), 1)
+
+    def test_55_partial_session_rollover_fails_closed(self) -> None:
+        run_id = "transient-partial-rollover"
+        lease, stream, vacancy_ids = self.prepare_transient_tail(run_id)
+        for page_index, vacancy_id in enumerate(vacancy_ids[:2]):
+            self.record_rollover_page(
+                run_id,
+                lease,
+                page_capture(
+                    [card(vacancy_id)],
+                    page_index=page_index,
+                    source_kind="personal_recommendations",
+                    captured_at=f"2026-08-18T17:{page_index:02d}:00Z",
+                    has_next=True,
+                    session_state="exposed",
+                    session_value=SESSION_B,
+                ),
+                stream=stream,
+            )
+        failed = self.run_cli(
+            "resolve-hh-recovery",
+            "--run-id",
+            run_id,
+            "--stream-key",
+            stream,
+            "--strategy",
+            "full_session_rollover",
+            "--reason",
+            "partial recapture",
+            "--defer-render",
+            "--run-lease",
+            lease,
+            "--json",
+            check=False,
+        )
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("не достигла", failed.stderr)
+
+    def test_56_repeated_exact_resolution_is_idempotent(self) -> None:
+        run_id = "transient-idempotent-resolution"
+        lease, stream, _ = self.prepare_transient_tail(run_id)
+        for attempt in range(5):
+            self.record_transient_attempt(
+                run_id, lease, stream=stream, page_index=2, attempt=attempt
+            )
+        command = (
+            "resolve-hh-recovery",
+            "--run-id",
+            run_id,
+            "--stream-key",
+            stream,
+            "--strategy",
+            "accepted_unavailable_tail",
+            "--reason",
+            "exact idempotent decision",
+            "--defer-render",
+            "--run-lease",
+            lease,
+            "--json",
+        )
+        first = json.loads(self.run_cli(*command).stdout)
+        second = json.loads(self.run_cli(*command).stdout)
+        self.assertFalse(first["idempotent"])
+        self.assertTrue(second["idempotent"])
+        self.assertEqual(
+            first["resolution"]["resolution_hash"],
+            second["resolution"]["resolution_hash"],
+        )
+
+    def test_57_conflicting_resolution_is_rejected(self) -> None:
+        run_id = "transient-conflicting-resolution"
+        lease, stream, _ = self.prepare_transient_tail(run_id)
+        for attempt in range(5):
+            self.record_transient_attempt(
+                run_id, lease, stream=stream, page_index=2, attempt=attempt
+            )
+        base = [
+            "resolve-hh-recovery",
+            "--run-id",
+            run_id,
+            "--stream-key",
+            stream,
+            "--strategy",
+            "accepted_unavailable_tail",
+        ]
+        self.run_cli(
+            *base,
+            "--reason",
+            "first exact decision",
+            "--defer-render",
+            "--run-lease",
+            lease,
+            "--json",
+        )
+        failed = self.run_cli(
+            *base,
+            "--reason",
+            "materially different decision",
+            "--defer-render",
+            "--run-lease",
+            lease,
+            "--json",
+            check=False,
+        )
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("конфликтующее решение запрещено", failed.stderr)
+
+    def test_58_resolution_survives_process_boundary_before_finalize(self) -> None:
+        run_id = "transient-interrupted-finalize"
+        lease, stream, _ = self.prepare_transient_tail(run_id)
+        for attempt in range(5):
+            self.record_transient_attempt(
+                run_id, lease, stream=stream, page_index=2, attempt=attempt
+            )
+        self.run_cli(
+            "resolve-hh-recovery",
+            "--run-id",
+            run_id,
+            "--stream-key",
+            stream,
+            "--strategy",
+            "accepted_unavailable_tail",
+            "--reason",
+            "persist across process boundary",
+            "--defer-render",
+            "--run-lease",
+            lease,
+            "--json",
+        )
+        inspected = json.loads(
+            self.run_cli(
+                "inspect-hh-checkpoint",
+                "--run-id",
+                run_id,
+                "--stream-key",
+                stream,
+                "--json",
+            ).stdout
+        )
+        self.assertEqual(
+            inspected["recovery_resolutions"][0]["strategy"],
+            "accepted_unavailable_tail",
+        )
+        completed = json.loads(
+            self.finalize_stream(run_id, lease, stream=stream, personal=True).stdout
+        )
+        self.assertTrue(completed["completed"])
+
+    def test_59_recovery_warning_propagates_to_status_doctor_manifest_and_dashboard(self) -> None:
+        run_id = "transient-warning-propagation"
+        lease, stream, _ = self.prepare_transient_tail(run_id)
+        for attempt in range(5):
+            self.record_transient_attempt(
+                run_id, lease, stream=stream, page_index=2, attempt=attempt
+            )
+        self.run_cli(
+            "resolve-hh-recovery",
+            "--run-id",
+            run_id,
+            "--stream-key",
+            stream,
+            "--strategy",
+            "accepted_unavailable_tail",
+            "--reason",
+            "warning propagation fixture",
+            "--defer-render",
+            "--run-lease",
+            lease,
+            "--json",
+        )
+        self.finalize_stream(run_id, lease, stream=stream, personal=True)
+        status = json.loads(
+            self.run_cli("daily-run-status", "--run-id", run_id, "--json").stdout
+        )
+        self.assertEqual(status["hh_recovery_warnings"][0]["retry_count"], 5)
+        doctor = json.loads(
+            self.run_cli(
+                "operational-doctor",
+                "--run-id",
+                run_id,
+                "--as-of",
+                "2026-08-18",
+                "--json",
+            ).stdout
+        )
+        recovery_check = next(
+            item for item in doctor["checks"] if item["name"] == "hh_transient_tail_recovery"
+        )
+        self.assertEqual(recovery_check["status"], "warn")
+        with self.connect() as conn:
+            snapshot = jobctl.build_snapshot(conn, self.database)
+            compact = jobctl.compact_dashboard_snapshot(snapshot)
+            self.assertEqual(compact["hh_recovery_warnings"][0]["retry_count"], 5)
+            manifest = json.loads(
+                conn.execute(
+                    "SELECT completion_manifest_json FROM hh_stream_runs WHERE run_id = ? AND stream_key = ?",
+                    (run_id, stream),
+                ).fetchone()[0]
+            )
+            self.assertEqual(manifest["degraded_completion"]["error_class"], "hh_http_502")
+
+    def test_60_v10_migration_and_replay_preserve_existing_evidence(self) -> None:
+        with self.connect() as conn:
+            before = conn.execute("SELECT COUNT(*) FROM vacancies").fetchone()[0]
+            conn.executescript(
+                """
+                DROP TABLE hh_session_rollover_pages;
+                DROP TABLE hh_stream_recovery_resolutions;
+                DROP TABLE hh_transient_error_attempts;
+                DROP TABLE hh_capture_audit_decisions;
+                PRAGMA user_version = 10;
+                """
+            )
+        migrated = json.loads(
+            self.run_cli("migrate-schema", "--defer-render", "--json").stdout
+        )
+        self.assertEqual((migrated["from_version"], migrated["to_version"]), (10, 11))
+        with self.connect() as conn:
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 11)
+            self.assertEqual(conn.execute("PRAGMA quick_check").fetchone()[0], "ok")
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM vacancies").fetchone()[0], before)
+            for table in (
+                "hh_capture_audit_decisions",
+                "hh_transient_error_attempts",
+                "hh_stream_recovery_resolutions",
+                "hh_session_rollover_pages",
+            ):
+                self.assertIsNotNone(
+                    conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+                        (table,),
+                    ).fetchone()
+                )
+        replay = json.loads(
+            self.run_cli("migrate-schema", "--defer-render", "--json").stdout
+        )
+        self.assertTrue(replay["already_current"])
+
+    def test_61_transient_tail_recovery_is_disabled_by_default(self) -> None:
+        run_id = "transient-default-disabled"
+        stream = "synthetic_personal_default_disabled"
+        self.enable_personal(stream)
+        self.set_acquisition(
+            personal_initial_depth_pages=2,
+            personal_max_pages=2,
+            personal_max_is_completion_boundary=True,
+        )
+        self.seed_known([830000, 830001])
+        lease, _ = self.begin(run_id)
+        self.complete_inbound(run_id, lease)
+        self.plan(run_id, lease, stream=stream, source_kind="personal_recommendations")
+        self.record_page(
+            run_id,
+            lease,
+            page_capture(
+                [card(830000)],
+                page_index=0,
+                source_kind="personal_recommendations",
+                captured_at="2026-08-18T18:00:00Z",
+                has_next=True,
+                session_state="exposed",
+                session_value=SESSION_A,
+            ),
+            stream=stream,
+        )
+        failed = self.record_transient_attempt(
+            run_id,
+            lease,
+            stream=stream,
+            page_index=1,
+            attempt=0,
+            check=False,
+        )
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("выключено конфигурацией", failed.stderr)
