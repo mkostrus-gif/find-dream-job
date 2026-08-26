@@ -439,9 +439,11 @@ EXPECTED_INDEXES = {
     "idx_source_checkpoints_source",
     "idx_source_hit_labels_label",
     "idx_vacancy_external_aliases_external_id",
+    "idx_vacancy_external_aliases_channel_url",
     "idx_vacancy_external_aliases_vacancy",
     "idx_vacancy_employer_accounts_account",
     "idx_vacancy_factors_vacancy",
+    "idx_vacancies_channel_url",
 }
 
 STAGE_ALIASES = {
@@ -845,13 +847,7 @@ def vacancy_external_id(channel: str, url: str, title: str, company: str) -> str
     if match and (host == "linkedin.com" or host.endswith(".linkedin.com")):
         return f"linkedin:{match.group(1)}"
     basis = url or f"{channel}:{title}:{company}"
-    # This is a compatibility-stable record identifier, not a password,
-    # credential, signature, or other security boundary. Existing workspaces
-    # persist this exact digest, so changing algorithms would break identity.
-    digest = hashlib.sha1(
-        basis.encode("utf-8"),  # lgtm[py/weak-sensitive-data-hashing]
-        usedforsecurity=False,
-    ).hexdigest()[:16]
+    digest = hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
     return f"{channel}:{digest}"
 
 
@@ -1979,6 +1975,9 @@ def reset_schema(conn: sqlite3.Connection) -> None:
             updated_at TEXT
         );
 
+        CREATE INDEX idx_vacancies_channel_url
+            ON vacancies(channel, url);
+
         CREATE TABLE source_hits (
             id INTEGER PRIMARY KEY,
             vacancy_id INTEGER NOT NULL,
@@ -2025,6 +2024,9 @@ def reset_schema(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX idx_vacancy_external_aliases_external_id
             ON vacancy_external_aliases(external_id);
+
+        CREATE INDEX idx_vacancy_external_aliases_channel_url
+            ON vacancy_external_aliases(channel, url, vacancy_id);
 
         CREATE TABLE search_runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2338,6 +2340,9 @@ def ensure_auxiliary_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE source_hits ADD COLUMN canonical_source_stream TEXT")
     conn.executescript(
         """
+        CREATE INDEX IF NOT EXISTS idx_vacancies_channel_url
+            ON vacancies(channel, url);
+
         CREATE TABLE IF NOT EXISTS vacancy_fingerprints (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             vacancy_id INTEGER NOT NULL,
@@ -2368,6 +2373,9 @@ def ensure_auxiliary_schema(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_vacancy_external_aliases_external_id
             ON vacancy_external_aliases(external_id);
+
+        CREATE INDEX IF NOT EXISTS idx_vacancy_external_aliases_channel_url
+            ON vacancy_external_aliases(channel, url, vacancy_id);
 
         CREATE TABLE IF NOT EXISTS search_runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3316,6 +3324,28 @@ def upsert_vacancy(
             """,
             (channel, external_id),
         ).fetchone()
+    if not row and norm_url:
+        # Workspaces created before SHA-256 identifiers can retain their
+        # canonical IDs. Match their stored URL without recomputing a legacy
+        # digest; the new SHA-256 ID is persisted below as an alias.
+        matching_ids = conn.execute(
+            """
+            SELECT id AS vacancy_id
+            FROM vacancies
+            WHERE channel = ? AND url = ?
+            UNION
+            SELECT vacancy_id
+            FROM vacancy_external_aliases
+            WHERE channel = ? AND url = ?
+            LIMIT 2
+            """,
+            (channel, norm_url, channel, norm_url),
+        ).fetchall()
+        if len(matching_ids) == 1:
+            row = conn.execute(
+                "SELECT * FROM vacancies WHERE id = ?",
+                (int(matching_ids[0]["vacancy_id"]),),
+            ).fetchone()
     if not row and semantic_fingerprint:
         row = conn.execute(
             """
