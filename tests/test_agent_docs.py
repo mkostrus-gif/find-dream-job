@@ -249,6 +249,37 @@ class AgentDocumentationTests(unittest.TestCase):
                 f"({result.returncode})\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
             )
 
+    def test_v11_public_release_docs_and_fixtures_are_current(self) -> None:
+        readme = self.read("README.md")
+        system = self.read("JOB_SYSTEM.md")
+        changelog = self.read("CHANGELOG.md")
+        contributing = self.read("CONTRIBUTING.md")
+        node_tests = self.read("tests/test_hh_browser_adapter.mjs")
+        python_tests = self.read("tests/test_p2_hh_acquisition.py")
+
+        for document_name, document in (
+            ("readme", readme),
+            ("system", system),
+        ):
+            for command in (
+                "record-hh-transient-error",
+                "record-hh-rollover-page",
+                "resolve-hh-recovery",
+            ):
+                with self.subTest(document=document_name, command=command):
+                    self.assertIn(command, document)
+        self.assertIn("схема v11", changelog)
+        self.assertIn("схемы v11", contributing)
+        self.assertIn("Реализация не использует", changelog)
+        for synthetic_literal in (
+            "910541",
+            "910729",
+            "synthetic_role_survey",
+            "article/910027",
+        ):
+            with self.subTest(literal=synthetic_literal):
+                self.assertIn(synthetic_literal, node_tests + python_tests)
+
     def test_daily_run_requires_complete_linkedin_mail_processing(self) -> None:
         daily = self.read("prompts/daily_run.md")
         mail_workflow = self.read("prompts/gmail_hh_digest.md")
