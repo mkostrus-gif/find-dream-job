@@ -105,7 +105,18 @@ class JobctlIntegrationTests(unittest.TestCase):
         self.run_cli("ingest-json", str(payload_path), "--json")
 
         with sqlite3.connect(self.workspace / "data" / "job_search.sqlite") as conn:
-            vacancy_id = conn.execute("SELECT id FROM vacancies").fetchone()[0]
+            external_ids = {
+                row[0] for row in conn.execute("SELECT external_id FROM vacancies")
+            }
+            self.assertEqual(
+                external_ids,
+                {
+                    "company_site:5164bd4c94255a3d",
+                },
+            )
+            vacancy_id = conn.execute(
+                "SELECT id FROM vacancies WHERE title LIKE '</script>%'"
+            ).fetchone()[0]
         self.run_cli(
             "update-vacancy",
             "--id",

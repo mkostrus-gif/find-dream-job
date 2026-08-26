@@ -845,7 +845,12 @@ def vacancy_external_id(channel: str, url: str, title: str, company: str) -> str
     if match and (host == "linkedin.com" or host.endswith(".linkedin.com")):
         return f"linkedin:{match.group(1)}"
     basis = url or f"{channel}:{title}:{company}"
-    digest = hashlib.sha1(basis.encode("utf-8")).hexdigest()[:16]
+    # This is a compatibility-stable record identifier, not a password,
+    # credential, signature, or other security boundary. Existing workspaces
+    # persist this exact digest, so changing algorithms would break identity.
+    digest = hashlib.sha1(  # lgtm[py/weak-sensitive-data-hashing]
+        basis.encode("utf-8"), usedforsecurity=False
+    ).hexdigest()[:16]
     return f"{channel}:{digest}"
 
 
